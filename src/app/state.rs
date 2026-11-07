@@ -95,6 +95,32 @@ impl SessionMeta {
         self.path().join("workspace")
     }
 
+    pub fn chat_history_path(&self) -> PathBuf {
+        self.path().join("chat_history.json")
+    }
+
+    pub fn load_chat_history(&self) -> Vec<ChatMessage> {
+        let p = self.chat_history_path();
+        if p.exists() {
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                if let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&content) {
+                    return msgs;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn save_chat_history(&self, messages: &[ChatMessage]) -> Result<()> {
+        if self.name.is_empty() || self.name == "None" {
+            return Ok(());
+        }
+        let p = self.chat_history_path();
+        let content = serde_json::to_string_pretty(messages)?;
+        std::fs::write(p, content)?;
+        Ok(())
+    }
+
     pub fn list_sessions() -> Vec<SessionMeta> {
         let dir = Self::sessions_dir();
         if !dir.exists() {
@@ -279,7 +305,45 @@ impl App {
         self.llm_request_id
     }
 
+    pub fn save_chat_history(&self) {
+        let _ = self.session_meta.save_chat_history(&self.chat_log);
+    }
+
+    pub fn append_chat_message(&mut self, msg: ChatMessage) {
+        self.chat_log.push(msg);
+        self.save_chat_history();
+    }
+
+    pub async fn delete_session(&mut self, session_name: &str) -> Result<()> {
+        let is_current = self.session_meta.name == session_name;
+        if is_current {
+            // Drop connection to session.db before removing folder on Windows
+            self.db = Database::in_memory()?;
+            self.session_meta = SessionMeta::new("None".to_string());
+            self.chat_log.clear();
+            self.tabs.clear();
+            self.sidebar_nodes.clear();
+            self.active_target_id = None;
+        }
+
+        let dir = SessionMeta::sessions_dir().join(session_name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+
+        self.ui_state.session_list = SessionMeta::list_sessions();
+        let total_rows = 1 + self.ui_state.session_list.len();
+        if self.ui_state.session_picker_selected >= total_rows {
+            self.ui_state.session_picker_selected = total_rows.saturating_sub(1);
+        }
+        self.add_notification(format!("Deleted session: {}", session_name), NotifLevel::Info);
+        Ok(())
+    }
+
     pub async fn switch_session(&mut self, session_name: String) -> Result<()> {
+        // Save current session chat history before switching
+        self.save_chat_history();
+
         let meta_path = SessionMeta::sessions_dir().join(&session_name).join("session.json");
         let session_meta = if meta_path.exists() {
             let mut meta = SessionMeta::load(&meta_path)?;
@@ -297,15 +361,22 @@ impl App {
         };
 
         self.db = Database::new(&session_meta.db_path())?;
+        self.chat_log = session_meta.load_chat_history();
         self.session_meta = session_meta;
-        self.chat_log.clear();
         self.tabs.clear();
         self.active_tab = 0;
         self.active_target_id = None;
+        self.ui_state.log_at_bottom = true;
         self.reload_sidebar().await?;
         self.ui_state.session_list = SessionMeta::list_sessions();
         self.add_notification(format!("Active session: {}", self.session_meta.name), NotifLevel::Info);
         Ok(())
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.save_chat_history();
     }
 }
 
@@ -332,6 +403,7 @@ pub struct UiState {
     pub is_initial_session_select: bool,
     pub session_naming_mode: bool,
     pub session_name_input: String,
+    pub session_delete_confirm: Option<String>,
     pub session_picker_selected: usize,
     pub session_list: Vec<SessionMeta>,
     pub show_api_key_prompt: bool,

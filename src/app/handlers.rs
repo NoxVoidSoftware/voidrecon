@@ -172,7 +172,7 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.pending_exploit_approval = None;
                     self.spawn_listener_tab(approval.lport).await?;
-                    self.chat_log.push(ChatMessage {
+                    self.append_chat_message(ChatMessage {
                         role: "tool".to_string(),
                         content: serde_json::json!({
                             "status": "approved",
@@ -190,7 +190,7 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.pending_exploit_approval = None;
-                    self.chat_log.push(ChatMessage {
+                    self.append_chat_message(ChatMessage {
                         role: "tool".to_string(),
                         content: serde_json::json!({
                             "status": "rejected",
@@ -335,6 +335,20 @@ impl App {
     }
 
     async fn handle_session_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        if let Some(to_delete) = self.ui_state.session_delete_confirm.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.delete_session(&to_delete).await?;
+                    self.ui_state.session_delete_confirm = None;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.ui_state.session_delete_confirm = None;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.ui_state.session_naming_mode {
             match key.code {
                 KeyCode::Esc => {
@@ -395,6 +409,14 @@ impl App {
             KeyCode::Down => {
                 if self.ui_state.session_picker_selected + 1 < total_rows {
                     self.ui_state.session_picker_selected += 1;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let selected = self.ui_state.session_picker_selected;
+                if selected == 0 {
+                    self.add_notification("Cannot delete '+ Create New Session' option".to_string(), NotifLevel::Warning);
+                } else if let Some(s) = self.ui_state.session_list.get(selected - 1) {
+                    self.ui_state.session_delete_confirm = Some(s.name.clone());
                 }
             }
             KeyCode::Enter => {
@@ -950,6 +972,7 @@ impl App {
                 self.ui_state.session_picker_selected = 0;
                 self.ui_state.session_naming_mode = false;
                 self.ui_state.session_name_input.clear();
+                self.ui_state.session_delete_confirm = None;
                 self.ui_state.is_initial_session_select = false;
                 self.ui_state.show_session_picker = true;
             }
@@ -981,7 +1004,7 @@ impl App {
         let start = Instant::now();
         
         // Add to chat log
-        self.chat_log.push(ChatMessage {
+        self.append_chat_message(ChatMessage {
             role: "user".to_string(),
             content: format!("$ {}", cmd),
             tool_calls: None,
@@ -1008,7 +1031,7 @@ impl App {
         )?;
         
         // Add output to chat log
-        self.chat_log.push(ChatMessage {
+        self.append_chat_message(ChatMessage {
             role: "output".to_string(),
             content: output.clone(),
             tool_calls: None,
@@ -1062,7 +1085,7 @@ impl App {
         }
 
         // Add user question to visible chat log
-        self.chat_log.push(ChatMessage {
+        self.append_chat_message(ChatMessage {
             role: "user".to_string(),
             content: format!("? {}", query),
             tool_calls: None,
@@ -1210,7 +1233,7 @@ impl App {
         if request_id == self.llm_request_id {
             self.llm_request_state = LlmRequestState::Failed;
             self.add_notification(format!("LLM request failed: {}", error), NotifLevel::Error);
-            self.chat_log.push(ChatMessage {
+            self.append_chat_message(ChatMessage {
                 role: "system".to_string(),
                 content: format!("⚠️ LLM Request Failed: {}", error),
                 tool_calls: None,
@@ -1231,7 +1254,7 @@ impl App {
         if !self.pending_tool_calls.is_empty() {
             // Push assistant message with tool calls into chat log first (required by LLM APIs)
             let tool_calls = std::mem::take(&mut self.pending_tool_calls);
-            self.chat_log.push(ChatMessage {
+            self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
                 content: self.llm_response_buffer.clone(),
                 tool_calls: Some(tool_calls.clone()),
@@ -1270,7 +1293,7 @@ impl App {
                         );
                         return Ok(());
                     } else {
-                        self.chat_log.push(ChatMessage {
+                        self.append_chat_message(ChatMessage {
                             role: "tool".to_string(),
                             content: serde_json::json!({
                                 "error": format!("Target ID {} is not within current assessment scope", target_id)
@@ -1283,7 +1306,7 @@ impl App {
                 }
                 
                 // Add tool result to conversation for next LLM call
-                self.chat_log.push(ChatMessage {
+                self.append_chat_message(ChatMessage {
                     role: "tool".to_string(),
                     content: result.to_string(),
                     tool_calls: None,
@@ -1300,7 +1323,7 @@ impl App {
             // Post-execution analysis complete
             self.post_exec_mode = false;
             // Add LLM comment to chat log
-            self.chat_log.push(ChatMessage {
+            self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
                 content: self.llm_response_buffer.clone(),
                 tool_calls: None,
@@ -1319,7 +1342,7 @@ impl App {
             } else {
                 self.llm_response_buffer.clone()
             };
-            self.chat_log.push(ChatMessage {
+            self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
                 content: content_display,
                 tool_calls: None,
@@ -1550,7 +1573,7 @@ impl App {
             let findings_count = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?.len();
             table.push_str(&format!("{} | {} | {} | {}\n", target.id, target.ip_host, ports_count, findings_count));
         }
-        self.chat_log.push(ChatMessage {
+        self.append_chat_message(ChatMessage {
             role: "assistant".to_string(),
             content: table,
             tool_calls: None,
@@ -1567,7 +1590,7 @@ impl App {
             for f in findings {
                 output.push_str(&format!("[{}] {}: {} (from: {})\n", f.severity, f.title, f.description, f.source_cmd.unwrap_or_default()));
             }
-            self.chat_log.push(ChatMessage {
+            self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
                 content: output,
                 tool_calls: None,

@@ -461,13 +461,59 @@ pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
         return;
     }
 
+    if let Some(target_session) = &app.ui_state.session_delete_confirm {
+        let area = centered_rect(58, 25, f.size());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .title(" ⚠️ Confirm Delete Session ");
+        let inner_area = block.inner(area);
+        f.render_widget(block, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Question
+                Constraint::Length(1), // Session name
+                Constraint::Length(2), // Warning
+                Constraint::Min(0),    // Space
+                Constraint::Length(1), // Buttons
+            ])
+            .split(inner_area);
+
+        let question = Paragraph::new(Line::from(vec![
+            Span::styled("Are you sure you want to delete session:", Style::default().fg(Color::White)),
+        ]));
+        f.render_widget(question, chunks[0]);
+
+        let name_p = Paragraph::new(Line::from(vec![
+            Span::styled(format!("  \"{}\"", target_session), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+        f.render_widget(name_p, chunks[1]);
+
+        let warn = Paragraph::new(Line::from(vec![
+            Span::styled("  All scan logs, database targets, findings and artifacts will be permanently erased.", Style::default().fg(Color::DarkGray)),
+        ]));
+        f.render_widget(warn, chunks[2]);
+
+        let buttons = Paragraph::new(Line::from(vec![
+            Span::styled(" [y / Enter] Yes, Delete ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw("     "),
+            Span::styled(" [n / Esc] No, Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        ]));
+        f.render_widget(buttons, chunks[4]);
+        return;
+    }
+
     let area = centered_rect(75, 60, f.size());
     f.render_widget(Clear, area);
 
     let title = if app.ui_state.is_initial_session_select {
-        " 🎯 Select or Create Assessment Session (Enter: Select | Esc: Quit) "
+        " 🎯 Select or Create Assessment Session (Enter: Select | D: Delete | Esc: Quit) "
     } else {
-        " 🎯 Assessment Sessions (Enter: Select | Esc: Close) "
+        " 🎯 Assessment Sessions (Enter: Select | D: Delete | Esc: Close) "
     };
 
     let block = Block::default()
@@ -563,9 +609,11 @@ pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
 
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" [↑/↓] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" Navigate    "),
+        Span::raw(" Navigate   "),
         Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black)),
-        Span::raw(" Select / Create    "),
+        Span::raw(" Select / Create   "),
+        Span::styled(" [D] ", Style::default().bg(Color::Red).fg(Color::White)),
+        Span::raw(" Delete Session   "),
         Span::styled(" [Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::raw(esc_label),
     ]));
