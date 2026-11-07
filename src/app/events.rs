@@ -16,5 +16,6 @@ pub enum AppEvent {
     Tick,
     Resize(u16, u16),
     SidebarReload,
+    SetActiveTarget(i64),
     ModelsLoadedForProvider(crate::config::ProviderKind, Vec<crate::config::ModelInfo>),
 }

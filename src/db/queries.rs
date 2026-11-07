@@ -97,6 +97,16 @@ impl DatabaseQueries {
         .context("Failed to query target")
     }
 
+    pub fn get_target_by_ip(conn: &Connection, ip_host: &str) -> Result<Option<Target>> {
+        conn.query_row(
+            "SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets WHERE ip_host = ?1",
+            params![ip_host],
+            |row| Self::row_to_target(row),
+        )
+        .optional()
+        .context("Failed to query target by IP")
+    }
+
     pub fn get_all_targets(conn: &Connection) -> Result<Vec<Target>> {
         let mut stmt = conn
             .prepare("SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets ORDER BY created_at DESC")
@@ -167,6 +177,20 @@ impl DatabaseQueries {
             .context("Failed to query findings")?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to collect findings")?;
+        Ok(findings)
+    }
+
+    pub fn get_all_findings(conn: &Connection) -> Result<Vec<Finding>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, target_id, title, description, severity, source_cmd, confidence, evidence_path, created_at FROM findings ORDER BY created_at DESC",
+            )
+            .context("Failed to prepare query")?;
+        let findings = stmt
+            .query_map([], |row| Self::row_to_finding(row))
+            .context("Failed to query all findings")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to collect all findings")?;
         Ok(findings)
     }
 

@@ -86,6 +86,11 @@ impl App {
                 self.reload_sidebar().await?;
                 Ok(true)
             }
+            AppEvent::SetActiveTarget(target_id) => {
+                self.active_target_id = Some(target_id);
+                self.reload_sidebar().await?;
+                Ok(true)
+            }
             AppEvent::ModelsLoadedForProvider(provider, models) => {
                 let count = models.len();
                 self.config.update_models_cache_for_provider(provider, models);
@@ -268,6 +273,19 @@ impl App {
                                         tool_calls: None,
                                         tool_call_id: None,
                                     });
+
+                                    // Record command and output artifact in database
+                                    let _ = DatabaseQueries::add_command(
+                                        self.db.conn(),
+                                        &self.session_meta.path(),
+                                        Some(approval.target_id),
+                                        command_line,
+                                        Some(&out),
+                                        Some(0),
+                                        Some(duration_ms),
+                                    );
+                                    let _ = DatabaseQueries::add_chat_message(self.db.conn(), Some(approval.target_id), "user", &format!("$ {}", command_line));
+                                    let _ = DatabaseQueries::add_chat_message(self.db.conn(), Some(approval.target_id), "assistant", &out);
 
                                     let tool_out = if lines.len() > 30 {
                                         let top = lines[..25].join("\n");
@@ -1040,6 +1058,32 @@ impl App {
     async fn handle_special_command(&mut self, cmd: &str) -> Result<()> {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         match parts[0] {
+            ":target" => {
+                if parts.len() > 1 {
+                    let input = parts[1].trim();
+                    let target = if let Ok(id) = input.parse::<i64>() {
+                        DatabaseQueries::get_target(self.db.conn(), id)?
+                    } else {
+                        DatabaseQueries::get_target_by_ip(self.db.conn(), input)?
+                    };
+                    if let Some(target) = target {
+                        self.active_target_id = Some(target.id);
+                        self.reload_sidebar().await?;
+                        self.add_notification(format!("Active target: {} (ID: {})", target.ip_host, target.id), NotifLevel::Info);
+                    } else {
+                        let new_id = DatabaseQueries::add_target(self.db.conn(), input, None, None)?;
+                        self.active_target_id = Some(new_id);
+                        self.reload_sidebar().await?;
+                        self.add_notification(format!("Added & activated target: {} (ID: {})", input, new_id), NotifLevel::Info);
+                    }
+                } else if let Some(target_id) = self.active_target_id {
+                    if let Some(target) = DatabaseQueries::get_target(self.db.conn(), target_id)? {
+                        self.add_notification(format!("Active target: {} (ID: {})", target.ip_host, target.id), NotifLevel::Info);
+                    }
+                } else {
+                    self.add_notification("No active target. Usage: :target <ip_or_id>".to_string(), NotifLevel::Warning);
+                }
+            }
             ":targets" => self.show_targets_table().await?,
             ":findings" => {
                 let target_id = if parts.len() > 1 {
@@ -1266,11 +1310,13 @@ impl App {
             (Vec::new(), Vec::new(), 0)
         };
         let targets_count = DatabaseQueries::get_targets_count(self.db.conn())?;
+        let all_targets = DatabaseQueries::get_all_targets(self.db.conn())?;
         
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),
             targets_count,
+            &all_targets,
             active_target.as_ref(),
             &findings,
             &recent_commands,
@@ -1354,7 +1400,7 @@ impl App {
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are a security analyst. Analyze command output for interesting findings.".to_string(),
+                content: "You are an automated security recon engine in voidrecon. Analyze the command output. If you identify new targets, open ports, services, operating system details, or security findings, invoke the appropriate tools (set_target, update_target, add_finding, add_target, save_workspace_file) to record them into the session database. Provide a concise 1-2 sentence summary.".to_string(),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -1465,6 +1511,23 @@ impl App {
                             format!("Saved exploit to {}", path),
                             NotifLevel::Info,
                         );
+                    }
+                }
+
+                if tool_call.function.name == "save_workspace_file" {
+                    if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
+                        self.add_notification(
+                            format!("Saved file: {}", path),
+                            NotifLevel::Info,
+                        );
+                    }
+                }
+
+                if tool_call.function.name == "set_target" || tool_call.function.name == "add_target" {
+                    if let Some(target_id) = result.get("id").and_then(|v| v.as_i64()).or_else(|| result.get("target_id").and_then(|v| v.as_i64())) {
+                        self.active_target_id = Some(target_id);
+                        let ip = result.get("ip_host").and_then(|v| v.as_str()).unwrap_or("target");
+                        self.add_notification(format!("Active target: {} (ID: {})", ip, target_id), NotifLevel::Info);
                     }
                 }
                 
@@ -1613,10 +1676,12 @@ impl App {
             (Vec::new(), Vec::new(), 0)
         };
         let targets_count = DatabaseQueries::get_targets_count(self.db.conn()).unwrap_or(0);
+        let all_targets = DatabaseQueries::get_all_targets(self.db.conn()).unwrap_or_default();
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),
             targets_count,
+            &all_targets,
             active_target.as_ref(),
             &findings,
             &recent_commands,

@@ -8,6 +8,7 @@ pub fn build_system_prompt(
     session_name: &str,
     session_created: &str,
     targets_count: i64,
+    all_targets: &[Target],
     active_target: Option<&Target>,
     findings: &[Finding],
     _recent_commands: &[Command],
@@ -27,6 +28,15 @@ If answering a general question or explaining concepts, provide clear direct ass
     prompt.push_str(session_created);
     prompt.push_str("\nTargets in scope: ");
     prompt.push_str(&targets_count.to_string());
+
+    if !all_targets.is_empty() {
+        prompt.push_str("\nAll targets in scope:");
+        for t in all_targets {
+            let is_act = active_target.map(|a| a.id == t.id).unwrap_or(false);
+            let marker = if is_act { " [ACTIVE]" } else { "" };
+            prompt.push_str(&format!("\n  - ID {}: {}{}", t.id, t.ip_host, marker));
+        }
+    }
 
     if let Some(ws) = workspace_path {
         prompt.push_str("\n\n## Session Workspace: ");
@@ -62,13 +72,50 @@ Workspace structure:
             prompt.push_str("\n\n## Saved Exploits:\n  (None saved yet. Use `save_exploit_script` when you identify or write an exploit).");
         }
 
+        let evidence_dir = ws.join("evidence");
+        let mut evidence_list = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(evidence_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        evidence_list.push(format!("  - evidence/{} ({} bytes)", fname, meta.len()));
+                    }
+                }
+            }
+        }
+        if !evidence_list.is_empty() {
+            prompt.push_str("\n\n## Saved Evidence in Workspace:\n");
+            prompt.push_str(&evidence_list.join("\n"));
+        }
+
+        let artifacts_dir = ws.join("artifacts");
+        let mut artifacts_list = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(artifacts_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        artifacts_list.push(format!("  - artifacts/{} ({} bytes)", fname, meta.len()));
+                    }
+                }
+            }
+        }
+        if !artifacts_list.is_empty() {
+            prompt.push_str("\n\n## Saved Artifacts in Workspace:\n");
+            prompt.push_str(&artifacts_list.join("\n"));
+        }
+
         prompt.push_str(
             r#"
 
-Exploit Workflow:
-1. To inspect already-saved exploits, call `read_exploit_script` with its filename.
-2. To create or refine an exploit, call `save_exploit_script`. Voidrecon automatically runs a Python syntax check (`py_compile`).
-3. To test or execute an exploit, call `execute_exploit_script`. Voidrecon will ask the user for Action Approval before running."#,
+Tools & Workspace Workflow:
+1. `set_target`: Set or switch the active target in scope (e.g. `set_target(ip_host="192.168.1.1")`).
+2. `list_targets` / `get_target_info` / `get_findings`: Query targets, ports, and findings stored in the database.
+3. `update_target` / `add_finding`: Record discovered ports, OS details, and vulnerabilities into the database so they persist.
+4. `save_workspace_file`: Save evidence into `workspace/evidence/` (automatically linked as finding in DB) or artifacts into `workspace/artifacts/`.
+5. `read_workspace_file`: Read full raw command outputs (`workspace/outputs/<uuid>.txt`) or saved evidence/artifacts.
+6. `save_exploit_script` / `execute_exploit_script`: Save Python exploits with automatic syntax validation and execute with user Action Approval."#,
         );
     }
 

@@ -10,59 +10,92 @@ use crate::llm::types::{ToolCall, ToolDefinition};
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new_function(
-            "get_target_info",
-            "Get full info for the active target: ports, OS, metadata, all findings.",
+            "set_target",
+            "Set or switch the active target in scope. If the target exists in the database, sets it as active; if not, inserts it and sets it as active.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "target_id": {"type": "integer", "description": "ID of the target to query"}
+                    "ip_host": {"type": "string", "description": "Target IP address or hostname"},
+                    "ports_json": {"type": "string", "description": "Optional JSON array of ports [{port,proto,service,version}]"},
+                    "metadata_json": {"type": "string", "description": "Optional JSON metadata {os, hostnames, tags}"},
+                    "notes": {"type": "string", "description": "Optional analyst notes"}
                 },
-                "required": ["target_id"]
+                "required": ["ip_host"]
+            }),
+        ),
+        ToolDefinition::new_function(
+            "list_targets",
+            "List all targets currently recorded in the session database with IDs, IPs, open ports count, findings count, and notes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        ToolDefinition::new_function(
+            "get_target_info",
+            "Get full info for a target (or active target if omitted): open ports, OS, metadata, and all findings.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target_id": {"type": "integer", "description": "ID of the target to query (defaults to active target)"},
+                    "ip_host": {"type": "string", "description": "Optional IP/hostname to look up"}
+                }
+            }),
+        ),
+        ToolDefinition::new_function(
+            "get_findings",
+            "Query security findings recorded in the database for a target or across all targets, optionally filtered by severity.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target_id": {"type": "integer", "description": "Target ID to query (defaults to active target if omitted)"},
+                    "severity": {"type": "string", "enum": ["info","low","medium","high","critical"], "description": "Filter by severity"}
+                }
             }),
         ),
         ToolDefinition::new_function(
             "get_recent_commands",
-            "Get the last N commands run against a target, with outputs.",
+            "Get the last N commands run against a target (or active target if omitted), with output previews and workspace output paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "target_id": {"type": "integer"},
+                    "target_id": {"type": "integer", "description": "Target ID (defaults to active target)"},
                     "limit": {"type": "integer", "default": 5}
-                },
-                "required": ["target_id"]
+                }
             }),
         ),
         ToolDefinition::new_function(
             "update_target",
-            "Update ports, OS or metadata for a target after a scan reveals new info.",
+            "Update ports, OS or metadata for a target in the database after a scan reveals new info.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "target_id": {"type": "integer"},
+                    "target_id": {"type": "integer", "description": "Target ID (defaults to active target if omitted)"},
                     "ports_json": {"type": "string", "description": "JSON array of {port,proto,service,version}"},
                     "metadata_json": {"type": "string", "description": "JSON object: {os, hostnames, tags}"}
-                },
-                "required": ["target_id"]
+                }
             }),
         ),
         ToolDefinition::new_function(
             "add_finding",
-            "Record a security finding discovered in command output.",
+            "Record a security finding discovered in command or scan output into the database.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "target_id": {"type": "integer"},
+                    "target_id": {"type": "integer", "description": "Target ID (defaults to active target if omitted)"},
                     "title": {"type": "string"},
                     "description": {"type": "string"},
                     "severity": {"type": "string", "enum": ["info","low","medium","high","critical"]},
-                    "source_cmd": {"type": "string"}
+                    "source_cmd": {"type": "string"},
+                    "confidence": {"type": "integer", "description": "Confidence percentage (0-100)", "default": 100},
+                    "evidence_path": {"type": "string", "description": "Relative path to evidence file in workspace"}
                 },
-                "required": ["target_id", "title", "severity"]
+                "required": ["title", "severity"]
             }),
         ),
         ToolDefinition::new_function(
             "add_target",
-            "Add a newly discovered host to the session targets.",
+            "Add a newly discovered host to the session targets in the database.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -71,6 +104,69 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     "notes": {"type": "string"}
                 },
                 "required": ["ip_host"]
+            }),
+        ),
+        ToolDefinition::new_function(
+            "save_workspace_file",
+            "Save reconnaissance evidence or assessment artifacts into the session workspace (workspace/evidence/ or workspace/artifacts/). Automatically records evidence as findings in the database.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "folder": {
+                        "type": "string",
+                        "enum": ["evidence", "artifacts", "exploits"],
+                        "description": "Destination subfolder in workspace"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Filename, e.g. 'nmap_scan_full.txt', 'admin_creds.txt', 'notes.md'"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File text content"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the file or evidence"
+                    },
+                    "target_id": {
+                        "type": "integer",
+                        "description": "Target ID associated with this file (defaults to active target)"
+                    }
+                },
+                "required": ["folder", "filename", "content"]
+            }),
+        ),
+        ToolDefinition::new_function(
+            "read_workspace_file",
+            "Read lines from any workspace file (in outputs/, evidence/, artifacts/, or exploits/), such as inspecting full raw scan outputs from workspace/outputs/.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to file, e.g. 'workspace/outputs/abc.txt' or 'evidence/scan.txt'"
+                    },
+                    "folder": {
+                        "type": "string",
+                        "enum": ["outputs", "evidence", "artifacts", "exploits"],
+                        "description": "Workspace folder if path is not specified"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Filename within folder"
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Line number to start reading from (1-based, default 1)",
+                        "default": 1
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Maximum number of lines to read (default 120)",
+                        "default": 120
+                    }
+                }
             }),
         ),
         ToolDefinition::new_function(
@@ -206,53 +302,182 @@ pub async fn execute_tool_call(
     let conn = db.conn();
 
     match name.as_str() {
-        "get_target_info" => {
-            let target_id = args.get("target_id").and_then(|v| v.as_i64())
-                .context("Missing target_id")?;
-            let (target, findings) = DatabaseQueries::get_target_with_findings(conn, target_id)?
-                .context("Target not found")?;
+        "set_target" => {
+            let ip_host = args.get("ip_host").and_then(|v| v.as_str()).context("Missing ip_host")?;
+            let ports_json = args.get("ports_json").and_then(|v| v.as_str());
+            let metadata_json = args.get("metadata_json").and_then(|v| v.as_str());
+            let notes = args.get("notes").and_then(|v| v.as_str());
+
+            let target = DatabaseQueries::get_target_by_ip(conn, ip_host)?;
+            let (target_id, is_new) = if let Some(t) = target {
+                if ports_json.is_some() || metadata_json.is_some() {
+                    DatabaseQueries::update_target(conn, t.id, ports_json, metadata_json)?;
+                }
+                (t.id, false)
+            } else {
+                let id = DatabaseQueries::add_target(conn, ip_host, ports_json, notes)?;
+                if metadata_json.is_some() {
+                    DatabaseQueries::update_target(conn, id, None, metadata_json)?;
+                }
+                (id, true)
+            };
+
+            let _ = app_tx.send(crate::app::AppEvent::SetActiveTarget(target_id));
             Ok(serde_json::json!({
-                "ip_host": target.ip_host,
-                "ports_json": target.ports_json,
-                "metadata_json": target.metadata_json,
-                "notes": target.notes,
-                "findings": findings
+                "status": "active_target_set",
+                "id": target_id,
+                "target_id": target_id,
+                "ip_host": ip_host,
+                "is_new": is_new,
+                "message": format!("Target {} (ID: {}) set as active in session scope", ip_host, target_id)
+            }))
+        }
+        "list_targets" => {
+            let targets = DatabaseQueries::get_all_targets(conn)?;
+            let mut list = Vec::new();
+            for t in targets {
+                let findings_count = DatabaseQueries::get_findings_for_target(conn, t.id)
+                    .map(|f| f.len())
+                    .unwrap_or(0);
+                let ports_count = t.ports_json.as_ref()
+                    .and_then(|p| serde_json::from_str::<Vec<crate::db::models::PortInfo>>(p).ok())
+                    .map(|ports| ports.len())
+                    .unwrap_or(0);
+                list.push(serde_json::json!({
+                    "id": t.id,
+                    "ip_host": t.ip_host,
+                    "is_active": active_target_id == Some(t.id),
+                    "open_ports_count": ports_count,
+                    "findings_count": findings_count,
+                    "notes": t.notes
+                }));
+            }
+            Ok(serde_json::json!({
+                "targets_count": list.len(),
+                "active_target_id": active_target_id,
+                "targets": list
+            }))
+        }
+        "get_target_info" => {
+            let target_id_arg = args.get("target_id").and_then(|v| v.as_i64());
+            let ip_host_arg = args.get("ip_host").and_then(|v| v.as_str());
+
+            let target = if let Some(id) = target_id_arg {
+                DatabaseQueries::get_target(conn, id)?
+            } else if let Some(ip) = ip_host_arg {
+                DatabaseQueries::get_target_by_ip(conn, ip)?
+            } else if let Some(active_id) = active_target_id {
+                DatabaseQueries::get_target(conn, active_id)?
+            } else {
+                let all = DatabaseQueries::get_all_targets(conn)?;
+                all.into_iter().next()
+            };
+
+            if let Some(t) = target {
+                let (_, findings) = DatabaseQueries::get_target_with_findings(conn, t.id)?
+                    .unwrap_or((t.clone(), Vec::new()));
+                Ok(serde_json::json!({
+                    "id": t.id,
+                    "ip_host": t.ip_host,
+                    "is_active": active_target_id == Some(t.id),
+                    "ports_json": t.ports_json,
+                    "metadata_json": t.metadata_json,
+                    "notes": t.notes,
+                    "findings": findings
+                }))
+            } else {
+                Ok(serde_json::json!({
+                    "status": "not_found",
+                    "message": "No targets found in database. Use set_target to add one."
+                }))
+            }
+        }
+        "get_findings" => {
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id);
+            let severity_filter = args.get("severity").and_then(|v| v.as_str());
+
+            let findings = if let Some(tid) = target_id {
+                DatabaseQueries::get_findings_for_target(conn, tid)?
+            } else {
+                DatabaseQueries::get_all_findings(conn)?
+            };
+
+            let filtered: Vec<_> = findings.into_iter()
+                .filter(|f| {
+                    if let Some(sev) = severity_filter {
+                        f.severity.eq_ignore_ascii_case(sev)
+                    } else {
+                        true
+                    }
+                })
+                .map(|f| serde_json::json!({
+                    "id": f.id,
+                    "target_id": f.target_id,
+                    "title": f.title,
+                    "description": f.description,
+                    "severity": f.severity,
+                    "source_cmd": f.source_cmd,
+                    "confidence": f.confidence,
+                    "evidence_path": f.evidence_path
+                }))
+                .collect();
+
+            Ok(serde_json::json!({
+                "findings_count": filtered.len(),
+                "target_id": target_id,
+                "findings": filtered
             }))
         }
         "get_recent_commands" => {
-            let target_id = args.get("target_id").and_then(|v| v.as_i64())
-                .context("Missing target_id")?;
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id);
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-            let commands = DatabaseQueries::get_recent_commands(conn, target_id, limit)?;
-            Ok(serde_json::json!(commands))
+
+            if let Some(tid) = target_id {
+                let commands = DatabaseQueries::get_recent_commands(conn, tid, limit)?;
+                let cmd_json: Vec<_> = commands.into_iter().map(|c| serde_json::json!({
+                    "raw_cmd": c.raw_cmd,
+                    "output_preview": c.output,
+                    "output_path": c.output_path,
+                    "exit_code": c.exit_code,
+                    "duration_ms": c.duration_ms,
+                    "executed_at": c.executed_at.to_rfc3339()
+                })).collect();
+                Ok(serde_json::json!(cmd_json))
+            } else {
+                Ok(serde_json::json!({
+                    "message": "No active target selected. Use set_target to select one."
+                }))
+            }
         }
         "update_target" => {
-            let target_id = args.get("target_id").and_then(|v| v.as_i64())
-                .context("Missing target_id")?;
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id)
+                .context("Missing target_id and no active target selected")?;
             let ports_json = args.get("ports_json").and_then(|v| v.as_str());
             let metadata_json = args.get("metadata_json").and_then(|v| v.as_str());
             DatabaseQueries::update_target(conn, target_id, ports_json, metadata_json)?;
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
-            Ok(serde_json::json!({"success": true}))
+            Ok(serde_json::json!({"success": true, "target_id": target_id}))
         }
         "add_finding" => {
-            let target_id = args.get("target_id").and_then(|v| v.as_i64())
-                .context("Missing target_id")?;
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id)
+                .context("Missing target_id and no active target selected")?;
             let title = args.get("title").and_then(|v| v.as_str()).context("Missing title")?;
             let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
             let severity = args.get("severity").and_then(|v| v.as_str()).context("Missing severity")?;
             let source_cmd = args.get("source_cmd").and_then(|v| v.as_str());
-            DatabaseQueries::add_finding(conn, target_id, title, description, severity, source_cmd, None, None)?;
+            let confidence = args.get("confidence").and_then(|v| v.as_i64()).map(|c| c as i32);
+            let evidence_path = args.get("evidence_path").and_then(|v| v.as_str());
+            let id = DatabaseQueries::add_finding(conn, target_id, title, description, severity, source_cmd, confidence, evidence_path)?;
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
-            Ok(serde_json::json!({"success": true}))
+            Ok(serde_json::json!({"success": true, "finding_id": id, "target_id": target_id}))
         }
         "add_target" => {
             let ip_host = args.get("ip_host").and_then(|v| v.as_str()).context("Missing ip_host")?;
             let ports_json = args.get("ports_json").and_then(|v| v.as_str());
             let notes = args.get("notes").and_then(|v| v.as_str());
             let id = DatabaseQueries::add_target(conn, ip_host, ports_json, notes)?;
-            let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
-            Ok(serde_json::json!({"id": id, "success": true}))
+            let _ = app_tx.send(crate::app::AppEvent::SetActiveTarget(id));
+            Ok(serde_json::json!({"id": id, "target_id": id, "ip_host": ip_host, "success": true}))
         }
         "open_reverse_shell_tab" => {
             let target_id = args.get("target_id").and_then(|v| v.as_i64())
@@ -517,6 +742,135 @@ pub async fn execute_tool_call(
             }
 
             Ok(serde_json::Value::Object(files_by_category))
+        }
+        "save_workspace_file" => {
+            let folder = args.get("folder").and_then(|v| v.as_str()).unwrap_or("evidence");
+            let raw_name = args.get("filename").and_then(|v| v.as_str()).context("Missing filename")?;
+            let content = args.get("content").and_then(|v| v.as_str()).context("Missing content")?;
+            let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id);
+
+            // Clean folder
+            let valid_folder = match folder {
+                "evidence" | "artifacts" | "exploits" => folder,
+                _ => "evidence",
+            };
+
+            // Clean filename
+            let file_stem = std::path::Path::new(raw_name)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(raw_name);
+            let clean_name: String = file_stem
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
+                .collect();
+
+            let target_dir = workspace_path.join(valid_folder);
+            std::fs::create_dir_all(&target_dir)?;
+            let file_path = target_dir.join(&clean_name);
+            std::fs::write(&file_path, content)?;
+            let rel_path = format!("workspace/{}/{}", valid_folder, clean_name);
+            let bytes_written = content.len();
+
+            // Automatic DB integration
+            if let Some(tid) = target_id {
+                if valid_folder == "evidence" {
+                    let title = if description.is_empty() {
+                        format!("Evidence: {}", clean_name)
+                    } else {
+                        format!("Evidence: {} ({})", clean_name, description)
+                    };
+                    let _ = DatabaseQueries::add_finding(
+                        conn,
+                        tid,
+                        &title,
+                        description,
+                        "info",
+                        None,
+                        Some(100),
+                        Some(&rel_path),
+                    );
+                    let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
+                } else if valid_folder == "artifacts" {
+                    let note_text = if description.is_empty() {
+                        format!("Saved artifact: {}", rel_path)
+                    } else {
+                        format!("Saved artifact {}: {}", rel_path, description)
+                    };
+                    let _ = DatabaseQueries::add_note(conn, tid, &note_text);
+                    let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
+                }
+            }
+
+            Ok(serde_json::json!({
+                "status": "saved",
+                "folder": valid_folder,
+                "file": clean_name,
+                "path": rel_path,
+                "bytes": bytes_written
+            }))
+        }
+        "read_workspace_file" => {
+            let path_arg = args.get("path").and_then(|v| v.as_str());
+            let folder_arg = args.get("folder").and_then(|v| v.as_str());
+            let filename_arg = args.get("filename").and_then(|v| v.as_str());
+            let start_line = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let max_lines = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(120) as usize;
+
+            let file_path = if let Some(p) = path_arg {
+                let clean_p = p.trim_start_matches("workspace/").trim_start_matches("workspace\\");
+                let rel = std::path::Path::new(clean_p);
+                // Security: ensure no traversal outside workspace
+                if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    anyhow::bail!("Directory traversal rejected");
+                }
+                workspace_path.join(rel)
+            } else if let (Some(folder), Some(filename)) = (folder_arg, filename_arg) {
+                let clean_folder = match folder {
+                    "outputs" | "evidence" | "artifacts" | "exploits" => folder,
+                    _ => anyhow::bail!("Invalid folder: {}", folder),
+                };
+                let stem = std::path::Path::new(filename)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(filename);
+                let clean_name: String = stem
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
+                    .collect();
+                workspace_path.join(clean_folder).join(clean_name)
+            } else {
+                anyhow::bail!("Specify either 'path' or 'folder' + 'filename'");
+            };
+
+            if !file_path.exists() {
+                anyhow::bail!("File '{}' not found in workspace", file_path.display());
+            }
+
+            let content = std::fs::read_to_string(&file_path)?;
+            let all_lines: Vec<&str> = content.lines().collect();
+            let total_lines = all_lines.len();
+
+            let offset = start_line.saturating_sub(1).min(total_lines);
+            let end = (offset + max_lines).min(total_lines);
+            let slice = &all_lines[offset..end];
+            let truncated = end < total_lines;
+
+            let display_content = if truncated {
+                format!("{}\n... [truncated, total {} lines, showing {}-{}] ...", slice.join("\n"), total_lines, offset + 1, end)
+            } else {
+                slice.join("\n")
+            };
+
+            Ok(serde_json::json!({
+                "file": file_path.file_name().and_then(|f| f.to_str()).unwrap_or(""),
+                "total_lines": total_lines,
+                "start_line": offset + 1,
+                "lines_returned": slice.len(),
+                "truncated": truncated,
+                "content": display_content
+            }))
         }
         _ => anyhow::bail!("Unknown tool: {}", name),
     }
