@@ -1458,8 +1458,9 @@ impl App {
         format!("{}\n{}", stdout, stderr)
     };
 
+    let cleaned = crate::ui::layout::sanitize_terminal_output(&combined);
     let exit_code = output.status.code().unwrap_or(0);
-    Ok((combined, exit_code))
+    Ok((cleaned, exit_code))
 }
 
     async fn send_to_pty(&mut self, cmd: &str) -> Result<()> {

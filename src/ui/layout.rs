@@ -299,11 +299,90 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
     render_input_line(f, app, chunks[3]);
 }
 
+pub fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    for next_c in chars.by_ref() {
+                        if (0x40..=0x7E).contains(&(next_c as u32)) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(next_c) = chars.next() {
+                        if next_c == '\x07' {
+                            break;
+                        }
+                        if next_c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some('(') | Some(')') => {
+                    chars.next();
+                }
+                Some(other) => {
+                    if !(0x40..=0x7E).contains(&(other as u32)) {
+                        // ignore
+                    }
+                }
+                None => {}
+            }
+        } else if c == '\t' {
+            out.push_str("    ");
+        } else if c == '\r' || c == '\n' || !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn resolve_carriage_returns(text: &str) -> String {
+    let mut result = Vec::new();
+    for raw_line in text.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        if !line.contains('\r') {
+            result.push(line.to_string());
+            continue;
+        }
+
+        let mut char_buf: Vec<char> = Vec::new();
+        let mut cursor = 0;
+        for c in line.chars() {
+            if c == '\r' {
+                cursor = 0;
+            } else {
+                if cursor < char_buf.len() {
+                    char_buf[cursor] = c;
+                } else {
+                    char_buf.push(c);
+                }
+                cursor += 1;
+            }
+        }
+        let resolved: String = char_buf.into_iter().collect();
+        result.push(resolved);
+    }
+    result.join("\n")
+}
+
+pub fn sanitize_terminal_output(raw: &str) -> String {
+    let stripped = strip_ansi_escapes(raw);
+    resolve_carriage_returns(&stripped)
+}
+
 pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let sanitized_content = sanitize_terminal_output(&msg.content);
     match msg.role.as_str() {
         "user" => {
-            let is_llm = msg.content.starts_with('?');
+            let is_llm = sanitized_content.starts_with('?');
             let header = if is_llm { "You (LLM Query) " } else { "You ($) " };
             let color = if is_llm { Color::Cyan } else { Color::Green };
             lines.push(Line::from(vec![
@@ -311,7 +390,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled(header, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Span::styled("──────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
             ]));
-            for line in msg.content.lines() {
+            for line in sanitized_content.lines() {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(color)),
                     Span::styled(line.to_string(), Style::default().fg(Color::White)),
@@ -320,7 +399,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
             lines.push(Line::from(""));
         }
         "output" => {
-            for line in msg.content.lines() {
+            for line in sanitized_content.lines() {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(Color::DarkGray)),
                     Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
@@ -335,7 +414,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled(format!("[{}] ", active_model), Style::default().fg(Color::Yellow)),
                 Span::styled("──────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
             ]));
-            for line in msg.content.lines() {
+            for line in sanitized_content.lines() {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::Cyan)),
                     Span::styled(line.to_string(), Style::default().fg(Color::White)),
@@ -348,7 +427,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
         }
         "tool" => {
             let mut first = true;
-            for line in msg.content.lines() {
+            for line in sanitized_content.lines() {
                 if first {
                     lines.push(Line::from(vec![
                         Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
@@ -374,7 +453,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
             lines.push(Line::from(vec![
                 Span::styled("┌─ ⚠️ Notice / System ──────────────────────────────────────────", Style::default().fg(Color::Red)),
             ]));
-            for line in msg.content.lines() {
+            for line in sanitized_content.lines() {
                 lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::Red)),
                     Span::styled(line.to_string(), Style::default().fg(Color::White)),
@@ -725,5 +804,24 @@ fn render_notifications(f: &mut Frame, app: &App) {
         f.render_widget(notif_widget, area);
         
         y_offset += card_height;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_terminal_output_carriage_return() {
+        let raw = " 0     0    0\r53 1.25M   53\r100 1.25M  100";
+        let cleaned = sanitize_terminal_output(raw);
+        assert_eq!(cleaned, "100 1.25M  100");
+    }
+
+    #[test]
+    fn test_sanitize_terminal_output_ansi_and_tabs() {
+        let raw = "\x1b[31mError:\x1b[0m\tCheck failed\r\nDone";
+        let cleaned = sanitize_terminal_output(raw);
+        assert_eq!(cleaned, "Error:    Check failed\nDone");
     }
 }
