@@ -40,15 +40,6 @@ pub struct Command {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub id: i64,
-    pub target_id: Option<i64>,
-    pub role: String,
-    pub content: String,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortInfo {
     pub port: u16,
     pub proto: String,

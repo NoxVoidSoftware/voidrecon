@@ -34,14 +34,6 @@ impl LlmClient {
         }
     }
 
-    pub fn with_base_url(self, base_url: String) -> Self {
-        let mut inner = (*self.inner).clone();
-        inner.base_url = base_url;
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-
     /// Fetch available models from OpenRouter
     pub async fn fetch_models(&self) -> Result<Vec<crate::config::ModelInfo>> {
         let response = self
@@ -88,6 +80,7 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let err = response.text().await.unwrap_or_default();
+            let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err.clone()));
             anyhow::bail!("Chat request failed: {}", err);
         }
 
@@ -170,33 +163,5 @@ impl LlmClient {
             }],
             usage: None,
         })
-    }
-
-    /// Non-streaming chat completion
-    pub async fn non_stream_chat(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        let mut request = request;
-        request.stream = false;
-
-        let response = self
-            .inner
-            .client
-            .post(format!("{}/chat/completions", self.inner.base_url))
-            .header("Authorization", format!("Bearer {}", self.inner.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send chat request")?;
-
-        if !response.status().is_success() {
-            let err = response.text().await.unwrap_or_default();
-            anyhow::bail!("Chat request failed: {}", err);
-        }
-
-        let chat_response: ChatCompletionResponse = response
-            .json()
-            .await
-            .context("Failed to parse chat response")?;
-        Ok(chat_response)
     }
 }

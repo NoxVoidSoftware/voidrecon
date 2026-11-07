@@ -92,7 +92,6 @@ pub enum LlmRequestState {
     Idle,
     Streaming,
     ProcessingToolCalls,
-    AwaitingFinalResponse,
     Completed,
     Failed,
 }

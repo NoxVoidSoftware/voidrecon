@@ -4,5 +4,3 @@
 pub mod tab;
 pub mod widget;
 
-pub use tab::*;
-pub use widget::*;

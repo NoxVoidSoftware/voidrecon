@@ -108,6 +108,7 @@ pub async fn execute_tool_call(
     _active_target_id: Option<i64>,
     app_tx: &tokio::sync::mpsc::UnboundedSender<crate::app::AppEvent>,
 ) -> Result<Value> {
+    validate_tool_call(tool_call)?;
     let name = &tool_call.function.name;
     let args: Value = serde_json::from_str(&tool_call.function.arguments)
         .context("Failed to parse tool arguments")?;

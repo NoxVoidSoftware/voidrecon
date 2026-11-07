@@ -15,7 +15,6 @@ pub enum AppEvent {
     LlmDone(u64),
     Tick,
     Resize(u16, u16),
-    Notification(String, crate::app::state::NotifLevel),
     SidebarReload,
     ModelsLoaded(Vec<crate::config::ModelInfo>),
 }

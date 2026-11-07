@@ -134,7 +134,6 @@ pub struct App {
     // Targets & sidebar
     pub sidebar_nodes: Vec<SidebarNode>,
     pub active_target_id: Option<i64>,
-    pub sidebar_scroll: usize,
     
     // PTY tabs
     pub tabs: Vec<PtyTab>,
@@ -147,7 +146,6 @@ pub struct App {
     pub llm_response_buffer: String,
     pub pending_llm_request: Option<String>,
     pub pending_tool_calls: Vec<crate::llm::types::ToolCall>,
-    pub awaiting_tool_results: bool,
     pub post_exec_mode: bool,
     
     // Suggestion panel
@@ -249,7 +247,6 @@ impl App {
             history_index: None,
             sidebar_nodes: Vec::new(),
             active_target_id: None,
-            sidebar_scroll: 0,
             tabs: Vec::new(), // Tab 0 is always Workspace & LLM; tabs holds Tab 1..N (Shell tabs)
             active_tab: 0,
             next_tab_id: 1,
@@ -258,7 +255,6 @@ impl App {
             llm_response_buffer: String::new(),
             pending_llm_request: None,
             pending_tool_calls: Vec::new(),
-            awaiting_tool_results: false,
             post_exec_mode: false,
             suggestion: None,
             suggestion_visible: false,
@@ -274,16 +270,10 @@ impl App {
         // Dynamic model discovery on startup (fetch OpenRouter models if cache is older than 24 hours)
         if app.config.is_cache_stale() {
             let tx = app.event_tx.clone();
+            let client = app.llm_client.clone();
             tokio::spawn(async move {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build();
-                if let Ok(client) = client {
-                    if let Ok(res) = client.get("https://openrouter.ai/api/v1/models").send().await {
-                        if let Ok(list) = res.json::<crate::llm::types::ModelListResponse>().await {
-                            let _ = tx.send(AppEvent::ModelsLoaded(list.data));
-                        }
-                    }
+                if let Ok(models) = client.fetch_models().await {
+                    let _ = tx.send(AppEvent::ModelsLoaded(models));
                 }
             });
         }
@@ -356,7 +346,5 @@ pub struct UiState {
     pub sidebar_selected: usize,
     pub log_scroll: usize,
     pub log_at_bottom: bool,
-    pub chat_scroll: usize,
-    pub chat_at_bottom: bool,
     pub input_cursor: usize,
 }

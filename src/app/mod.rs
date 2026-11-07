@@ -6,4 +6,3 @@ pub mod handlers;
 
 pub use state::*;
 pub use events::*;
-pub use handlers::*;

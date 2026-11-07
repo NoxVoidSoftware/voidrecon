@@ -2,13 +2,13 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
-use crate::db::models::{Command, Finding, PortInfo, Target, TargetMetadata, ChatMessage};
+use crate::db::models::{Command, Finding, Target};
 
 /// Parse datetime from SQLite TEXT
 fn parse_datetime(s: &str) -> DateTime<Utc> {
@@ -267,16 +267,5 @@ impl DatabaseQueries {
             .query_row("SELECT COUNT(*) FROM targets", [], |row| row.get(0))
             .context("Failed to count targets")?;
         Ok(count)
-    }
-
-    // Transaction helper for related writes
-    pub fn with_transaction<F, R>(conn: &mut Connection, f: F) -> Result<R>
-    where
-        F: FnOnce(&Transaction) -> Result<R>,
-    {
-        let tx = conn.transaction().context("Failed to start transaction")?;
-        let result = f(&tx)?;
-        tx.commit().context("Failed to commit transaction")?;
-        Ok(result)
     }
 }

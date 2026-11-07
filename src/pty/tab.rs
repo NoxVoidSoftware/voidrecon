@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
-use ratatui::style::Style;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -15,17 +14,6 @@ use crate::app::AppEvent;
 pub enum TerminalKind {
     LocalShell,
     Listener,
-    RemoteShell,
-}
-
-/// Process state for a terminal tab
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessState {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    TimedOut,
 }
 
 /// A PTY terminal tab
@@ -34,16 +22,11 @@ pub struct PtyTab {
     pub label: String,
     pub kind: TerminalKind,
     pub master: Box<dyn MasterPty + Send>,
-    pub slave: Option<Box<dyn SlavePty + Send>>,
+    pub _slave: Option<Box<dyn SlavePty + Send>>,
     pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     pub parser: Arc<Mutex<Parser>>,
     pub writer: Box<dyn Write + Send>,
-    pub reader_thread: Option<std::thread::JoinHandle<()>>,
-    pub process_state: ProcessState,
-    pub exit_code: Option<i32>,
-    pub target_id: Option<i64>,
-    pub lport: Option<u16>,
-    pub shell_type: Option<String>,
+    pub _reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PtyTab {
@@ -148,16 +131,11 @@ impl PtyTab {
             label: format!("Shell {}", id),
             kind: TerminalKind::LocalShell,
             master: pty_pair.master,
-            slave: Some(pty_pair.slave),
+            _slave: Some(pty_pair.slave),
             child: child_arc,
             parser,
             writer,
-            reader_thread: Some(reader_thread),
-            process_state: ProcessState::Running,
-            exit_code: None,
-            target_id: None,
-            lport: None,
-            shell_type: None,
+            _reader_thread: Some(reader_thread),
         })
     }
 
@@ -267,111 +245,11 @@ impl PtyTab {
             label: format!("Listener: :{}", lport),
             kind: TerminalKind::Listener,
             master: pty_pair.master,
-            slave: Some(pty_pair.slave),
+            _slave: Some(pty_pair.slave),
             child: child_arc,
             parser,
             writer,
-            reader_thread: Some(reader_thread),
-            process_state: ProcessState::Running,
-            exit_code: None,
-            target_id: None,
-            lport: Some(lport),
-            shell_type: None,
-        })
-    }
-
-    /// Create a new remote shell tab (for established connections)
-    pub fn new_remote_shell(
-        id: usize,
-        label: String,
-        target_id: i64,
-        tx: mpsc::UnboundedSender<AppEvent>,
-    ) -> Result<Self> {
-        let pty_system = native_pty_system();
-        let pty_pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("Failed to open PTY for remote shell")?;
-
-        let cmd = Self::build_shell_command();
-
-        let child = pty_pair
-            .slave
-            .spawn_command(cmd)
-            .context("Failed to spawn remote shell")?;
-
-        let mut reader = pty_pair.master.try_clone_reader().context("Failed to clone reader")?;
-        let writer = pty_pair.master.take_writer().context("Failed to take writer")?;
-
-        let parser = Arc::new(Mutex::new(Parser::new(24, 80, 0)));
-
-        let parser_clone = parser.clone();
-        let tx_clone = tx.clone();
-        let tab_id = id;
-
-        let reader_thread = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = &buf[..n];
-                        if let Ok(mut p) = parser_clone.lock() {
-                            p.process(data);
-                        }
-                        if tx_clone.send(AppEvent::PtyData(tab_id, data.to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = tx_clone.send(AppEvent::PtyExited(tab_id, 0));
-        });
-
-        let child_arc = Arc::new(Mutex::new(child));
-        let child_clone = child_arc.clone();
-        let tx_exit = tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(mut c) = child_clone.lock() {
-                    match c.try_wait() {
-                        Ok(Some(status)) => {
-                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, status.exit_code() as i32));
-                            break;
-                        }
-                        Ok(None) => continue,
-                        Err(_) => {
-                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, 0));
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self {
-            id,
-            label,
-            kind: TerminalKind::RemoteShell,
-            master: pty_pair.master,
-            slave: Some(pty_pair.slave),
-            child: child_arc,
-            parser,
-            writer,
-            reader_thread: Some(reader_thread),
-            process_state: ProcessState::Running,
-            exit_code: None,
-            target_id: Some(target_id),
-            lport: None,
-            shell_type: Some("bash".to_string()),
+            _reader_thread: Some(reader_thread),
         })
     }
 
@@ -394,32 +272,6 @@ impl PtyTab {
             parser.set_size(rows, cols);
         }
         Ok(())
-    }
-
-    /// Get the current process state
-    pub fn process_state(&self) -> ProcessState {
-        self.process_state
-    }
-
-    /// Mark the process as exited
-    pub fn mark_exited(&mut self, exit_code: i32) {
-        self.process_state = ProcessState::Completed;
-        self.exit_code = Some(exit_code);
-    }
-
-    /// Get screen content for rendering - uses the parser's screen
-    pub fn get_screen_content(&self) -> Vec<(u16, u16, char, Style)> {
-        let mut result = Vec::new();
-        if let Ok(parser) = self.parser.lock() {
-            let screen = parser.screen();
-            let contents = screen.contents();
-            for (y, line) in contents.lines().enumerate() {
-                for (x, ch) in line.chars().enumerate() {
-                    result.push((x as u16, y as u16, ch, Style::default()));
-                }
-            }
-        }
-        result
     }
 }
 

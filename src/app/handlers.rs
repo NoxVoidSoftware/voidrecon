@@ -45,7 +45,6 @@ impl App {
             AppEvent::LlmDone(request_id) => self.handle_llm_done(request_id).await?,
             AppEvent::Tick => self.handle_tick(),
             AppEvent::Resize(cols, rows) => self.handle_resize(cols, rows).await?,
-            AppEvent::Notification(msg, level) => self.add_notification(msg, level),
             AppEvent::SidebarReload => self.reload_sidebar().await?,
             AppEvent::ModelsLoaded(models) => {
                 self.config.update_models_cache(models);
@@ -623,15 +622,10 @@ impl App {
             ":note" => {
                 if parts.len() > 1 {
                     if let Some(target_id) = self.active_target_id {
-                        DatabaseQueries::add_finding(
+                        DatabaseQueries::add_note(
                             self.db.conn(),
                             target_id,
-                            "note",
                             parts[1],
-                            "info",
-                            None,
-                            Some(100),
-                            None,
                         )?;
                         self.add_notification("Note added".to_string(), NotifLevel::Info);
                         self.reload_sidebar().await?;
@@ -688,6 +682,8 @@ impl App {
         
         // Save to database with full output artifact
         let target_id = self.active_target_id;
+        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "user", cmd);
+        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "assistant", &output);
         DatabaseQueries::add_command(
             self.db.conn(),
             &self.session_meta.path(),
