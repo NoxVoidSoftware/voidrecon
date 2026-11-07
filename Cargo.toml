@@ -43,6 +43,7 @@ which = "6.0"
 
 # Terminal size detection
 terminal_size = "0.2"
+unicode-width = "0.1"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

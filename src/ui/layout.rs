@@ -347,10 +347,27 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
             lines.push(Line::from(""));
         }
         "tool" => {
-            lines.push(Line::from(vec![
-                Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
-                Span::styled(msg.content.clone(), Style::default().fg(Color::DarkGray)),
-            ]));
+            let mut first = true;
+            for line in msg.content.lines() {
+                if first {
+                    lines.push(Line::from(vec![
+                        Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
+                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                    first = false;
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+            if first {
+                lines.push(Line::from(vec![
+                    Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
+                    Span::styled("(empty)".to_string(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
             lines.push(Line::from(""));
         }
         _ => {
@@ -369,6 +386,66 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
     lines
 }
 
+fn calculate_line_wrapped_rows(line_text: &str, max_width: usize) -> usize {
+    if max_width == 0 {
+        return 1;
+    }
+    use unicode_width::UnicodeWidthStr;
+    let total_width = line_text.width();
+    if total_width == 0 {
+        return 1;
+    }
+    if total_width <= max_width {
+        return 1;
+    }
+
+    let mut rows = 1;
+    let mut current_row_width = 0;
+
+    for word in line_text.split(' ') {
+        let word_width = word.width();
+        if word_width == 0 {
+            // space
+            if current_row_width + 1 <= max_width {
+                current_row_width += 1;
+            } else {
+                rows += 1;
+                current_row_width = 1;
+            }
+            continue;
+        }
+
+        if current_row_width == 0 {
+            if word_width <= max_width {
+                current_row_width = word_width;
+            } else {
+                let extra_rows = (word_width.saturating_sub(1)) / max_width;
+                rows += extra_rows;
+                current_row_width = word_width % max_width;
+                if current_row_width == 0 {
+                    current_row_width = max_width;
+                }
+            }
+        } else if current_row_width + 1 + word_width <= max_width {
+            current_row_width += 1 + word_width;
+        } else {
+            rows += 1;
+            if word_width <= max_width {
+                current_row_width = word_width;
+            } else {
+                let extra_rows = (word_width.saturating_sub(1)) / max_width;
+                rows += extra_rows;
+                current_row_width = word_width % max_width;
+                if current_row_width == 0 {
+                    current_row_width = max_width;
+                }
+            }
+        }
+    }
+
+    rows
+}
+
 fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -380,20 +457,13 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         lines_slice
             .iter()
             .map(|l| {
-                let len: usize = l.spans.iter().map(|s| s.content.len()).sum();
-                if len == 0 { 1 } else { (len + inner_width - 1) / inner_width }
+                let line_text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                calculate_line_wrapped_rows(&line_text, inner_width)
             })
             .sum()
     };
 
-    // When at bottom, slice only the tail lines to keep Ratatui paragraph wrapping ultra-fast
-    let mut display_lines = if app.ui_state.log_at_bottom && app.cached_chat_lines.len() > 150 {
-        let tail_count = (inner_height * 3).max(100);
-        let start_idx = app.cached_chat_lines.len().saturating_sub(tail_count);
-        app.cached_chat_lines[start_idx..].to_vec()
-    } else {
-        app.cached_chat_lines.clone()
-    };
+    let mut display_lines = app.cached_chat_lines.clone();
     
     // Add streaming LLM response
     if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
@@ -441,16 +511,21 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     let max_scroll = total_visual_rows.saturating_sub(inner_height);
 
     let (scroll_offset, title) = if app.ui_state.log_at_bottom {
+        app.ui_state.log_scroll = max_scroll;
         (max_scroll, " Workspace & LLM ".to_string())
     } else {
-        let scroll = app.ui_state.log_scroll.min(max_scroll);
-        app.ui_state.log_scroll = scroll;
-        let title = if scroll < max_scroll {
-            format!(" Workspace & LLM [Scrolled: line {}/{} - PgDn/Ctrl+End to bottom] ", scroll, max_scroll)
+        if app.ui_state.log_scroll >= max_scroll {
+            app.ui_state.log_scroll = max_scroll;
+            app.ui_state.log_at_bottom = true;
+            (max_scroll, " Workspace & LLM ".to_string())
         } else {
-            " Workspace & LLM ".to_string()
-        };
-        (scroll, title)
+            let scroll = app.ui_state.log_scroll;
+            let title = format!(
+                " Workspace & LLM [Scrolled: line {}/{} - PgDn/Ctrl+End to bottom] ",
+                scroll, max_scroll
+            );
+            (scroll, title)
+        }
     };
 
     let (border_color, focus_badge) = match app.ui_state.focus {

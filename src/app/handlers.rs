@@ -1692,13 +1692,25 @@ impl App {
 
             // Execute tool calls
             for tool_call in tool_calls {
-                let result = crate::llm::tools::execute_tool_call(
+                let result = match crate::llm::tools::execute_tool_call(
                     &tool_call,
                     &self.db,
                     self.active_target_id,
                     &self.session_meta.workspace_path(),
                     &self.event_tx,
-                ).await?;
+                ).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        self.add_notification(
+                            format!("Tool {} error: {}", tool_call.function.name, e),
+                            NotifLevel::Error,
+                        );
+                        serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        })
+                    }
+                };
 
                 if tool_call.function.name == "save_exploit_script" {
                     if let Some(path) = result.get("path").and_then(|v| v.as_str()) {

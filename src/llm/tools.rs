@@ -825,10 +825,21 @@ pub async fn execute_tool_call(
             };
 
             if !file_path.exists() {
-                anyhow::bail!("File '{}' not found in workspace", file_path.display());
+                return Ok(serde_json::json!({
+                    "status": "error",
+                    "error": format!("File '{}' not found in workspace", file_path.display())
+                }));
             }
 
-            let content = std::fs::read_to_string(&file_path)?;
+            let content = match std::fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(serde_json::json!({
+                        "status": "error",
+                        "error": format!("Failed to read file '{}': {}", file_path.display(), e)
+                    }));
+                }
+            };
             let all_lines: Vec<&str> = content.lines().collect();
             let total_lines = all_lines.len();
 

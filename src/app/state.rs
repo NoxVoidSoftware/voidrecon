@@ -372,6 +372,7 @@ impl App {
         let lines = crate::ui::layout::format_chat_message(&msg, &self.config.active_model);
         self.cached_chat_lines.extend(lines);
         self.chat_log.push(msg);
+        self.ui_state.log_at_bottom = true;
         self.save_chat_history();
     }
 

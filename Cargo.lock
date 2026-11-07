@@ -2475,6 +2475,7 @@ dependencies = [
  "terminal_size",
  "tokio",
  "tokio-test",
+ "unicode-width",
  "uuid",
  "vt100",
  "which",
