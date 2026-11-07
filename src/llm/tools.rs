@@ -625,10 +625,21 @@ pub async fn execute_tool_call(
 
             let file_path = workspace_path.join("exploits").join(&clean_name);
             if !file_path.exists() {
-                anyhow::bail!("Exploit script 'workspace/exploits/{}' not found", clean_name);
+                return Ok(serde_json::json!({
+                    "status": "error",
+                    "error": format!("Exploit script 'workspace/exploits/{}' not found", clean_name)
+                }));
             }
 
-            let content = std::fs::read_to_string(&file_path)?;
+            let content = match std::fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(serde_json::json!({
+                        "status": "error",
+                        "error": format!("Failed to read exploit script '{}': {}", clean_name, e)
+                    }));
+                }
+            };
             let lines: Vec<&str> = content.lines().collect();
             let total_lines = lines.len();
             let truncated = total_lines > max_lines;
