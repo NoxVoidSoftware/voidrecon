@@ -1,7 +1,6 @@
 //! Layout rendering for voidrecon UI
 
 use crate::app::state::{App, InputMode, NotifLevel};
-use crate::pty::widget::VtScreenWidget;
 use crate::ui::modals::{render_help_modal, render_model_picker_modal};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -34,6 +33,9 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
     }
     if app.ui_state.show_model_picker {
         render_model_picker_modal(f, app);
+    }
+    if app.ui_state.show_session_picker {
+        crate::ui::modals::render_session_picker_modal(f, app);
     }
     if app.ui_state.show_api_key_prompt {
         crate::ui::modals::render_api_key_modal(f, app);
@@ -201,23 +203,47 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
+    let approval_height = if app.pending_exploit_approval.is_some() { 4 } else { 0 };
     let suggestion_height = if app.suggestion_visible { 5 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),          // Chat/log area
+            Constraint::Min(8),                    // Chat/log area
+            Constraint::Length(approval_height),   // Exploit approval panel
             Constraint::Length(suggestion_height), // Suggestion panel
-            Constraint::Length(1),        // Input line
+            Constraint::Length(1),                 // Input line
         ])
         .split(area);
     
     render_chat_log(f, app, chunks[0]);
     
+    if let Some(approval) = &app.pending_exploit_approval {
+        let content = vec![
+            Line::from(vec![
+                Span::styled(" [EXPLOIT APPROVAL REQUIRED] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::raw(" LLM requests reverse shell listener:"),
+            ]),
+            Line::from(vec![
+                Span::styled(format!(" Target: {} (ID {}) │ Interface: {}:{} │ Shell: {}", approval.target_ip, approval.target_id, approval.lhost, approval.lport, approval.shell_type), Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [y] Approve & Spawn Listener ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                Span::raw("   "),
+                Span::styled(" [n/Esc] Reject ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+            ]),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red))
+            .title(" Action Approval ");
+        f.render_widget(Paragraph::new(content).block(block), chunks[1]);
+    }
+
     if app.suggestion_visible {
-        render_suggestion_panel(f, app, chunks[1]);
+        render_suggestion_panel(f, app, chunks[2]);
     }
     
-    render_input_line(f, app, chunks[2]);
+    render_input_line(f, app, chunks[3]);
 }
 
 fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
@@ -321,11 +347,11 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
     
     f.render_widget(input, area);
     
-    // Set cursor position
-    f.set_cursor(
-        area.x + mode_indicator.len() as u16 + app.ui_state.input_cursor as u16,
-        area.y,
-    );
+    // Set cursor position: accurately calculated and bounded
+    let cursor_offset = app.ui_state.input_cursor.min(app.input_buffer.len());
+    let cursor_x = (area.x + mode_indicator.len() as u16 + cursor_offset as u16)
+        .min(area.x + area.width.saturating_sub(1));
+    f.set_cursor(cursor_x, area.y);
 }
 
 fn render_shell_tab(f: &mut Frame, app: &mut App, area: Rect) {
@@ -348,7 +374,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     };
     
     let footer = Line::from(vec![
-        Span::styled(" F1/:help:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(" F1/Alt+H/:help:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F2:Models ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F3:New Shell ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" Tab:Switch Tab ", Style::default().bg(Color::DarkGray).fg(Color::White)),

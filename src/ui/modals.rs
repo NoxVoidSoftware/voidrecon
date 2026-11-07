@@ -21,7 +21,7 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
         Line::from(vec![
             Span::styled(" Global Keys:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from("   F1 / Ctrl+H - Toggle this help (or type :help)"),
+        Line::from("   F1 / Alt+H / Ctrl+H - Toggle this help (or type :help)"),
         Line::from("   F2          - Open model picker (or type :models)"),
         Line::from("   F3          - New shell tab (or type :newtab)"),
         Line::from("   Tab         - Cycle open tabs"),
@@ -38,6 +38,7 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
         Line::from("   :findings N - Show findings for target N"),
         Line::from("   :note <txt> - Add a note (info finding)"),
         Line::from("   :models     - Open model picker"),
+        Line::from("   :sessions   - Switch or create assessment sessions"),
         Line::from("   :newtab     - New shell tab"),
         Line::from("   :closeshell - Close current tab"),
         Line::from("   :exploit    - Enter exploit mode for active target"),
@@ -101,7 +102,7 @@ pub fn render_api_key_modal(f: &mut Frame, app: &App) {
 
     let intro = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("No OpenRouter API key configured in ~/.audit-tui/config.json", Style::default().fg(Color::Yellow)),
+            Span::styled("No OpenRouter API key configured in ~/.config/voidrecon/config.json", Style::default().fg(Color::Yellow)),
         ]),
         Line::from("Enter your API key to enable LLM assistance:"),
     ]);
@@ -216,6 +217,99 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     }
     
     f.render_stateful_widget(table, chunks[2], &mut state);
+}
+
+pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
+    let area = centered_rect(70, 60, f.size());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Assessment Sessions (Enter: Select/Create | Esc: Close) ");
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Top description
+            Constraint::Min(0),    // Table
+            Constraint::Length(1), // Footer hint
+        ])
+        .split(inner_area);
+
+    let intro = Paragraph::new(Line::from(vec![
+        Span::styled("Current Session: ", Style::default().fg(Color::Gray)),
+        Span::styled(&app.session_meta.name, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+    ]));
+    f.render_widget(intro, chunks[0]);
+
+    // Rows: First is [+ Create New Session], followed by existing sessions
+    let mut rows = Vec::new();
+    let is_create_selected = app.ui_state.session_picker_selected == 0;
+    rows.push(
+        Row::new(vec![
+            "[+ Create New Session (auto-generated timestamp)]".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        ])
+        .style(if is_create_selected {
+            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        }),
+    );
+
+    for (idx, s) in app.ui_state.session_list.iter().enumerate() {
+        let is_selected = idx + 1 == app.ui_state.session_picker_selected;
+        let is_current = s.name == app.session_meta.name;
+        let prefix = if is_current { "* " } else { "  " };
+
+        let style = if is_selected {
+            Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+
+        rows.push(
+            Row::new(vec![
+                format!("{}{}", prefix, s.name),
+                s.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                s.last_activity.format("%Y-%m-%d %H:%M").to_string(),
+            ])
+            .style(style),
+        );
+    }
+
+    let table = Table::new(rows, [
+        Constraint::Percentage(50),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+    ])
+    .header(
+        Row::new(vec!["Session Name", "Created", "Last Activity"])
+            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    )
+    .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
+
+    let mut state = TableState::default();
+    let total_rows = 1 + app.ui_state.session_list.len();
+    state.select(Some(app.ui_state.session_picker_selected.min(total_rows.saturating_sub(1))));
+
+    f.render_stateful_widget(table, chunks[1], &mut state);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" [↑/↓] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::raw(" Navigate    "),
+        Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black)),
+        Span::raw(" Select / Create    "),
+        Span::styled(" [Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::raw(" Cancel"),
+    ]));
+    f.render_widget(footer, chunks[2]);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

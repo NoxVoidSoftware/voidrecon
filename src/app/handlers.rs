@@ -96,16 +96,56 @@ impl App {
             return Ok(());
         }
 
+        // If Session Picker modal is open, handle session picker keys
+        if self.ui_state.show_session_picker {
+            self.handle_session_picker_key(key).await?;
+            return Ok(());
+        }
+
+        // If Exploit Approval is pending, intercept y/n/Esc
+        if let Some(approval) = self.pending_exploit_approval.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.pending_exploit_approval = None;
+                    self.spawn_listener_tab(approval.lport).await?;
+                    self.chat_log.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: serde_json::json!({
+                            "status": "approved",
+                            "message": format!("Listener spawned on port {}", approval.lport),
+                            "target_id": approval.target_id,
+                            "lhost": approval.lhost,
+                            "lport": approval.lport,
+                            "shell_type": approval.shell_type,
+                        }).to_string(),
+                        tool_calls: None,
+                        tool_call_id: Some(approval.tool_call.id),
+                    });
+                    self.continue_llm_conversation().await?;
+                    return Ok(());
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.pending_exploit_approval = None;
+                    self.chat_log.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: serde_json::json!({
+                            "status": "rejected",
+                            "message": "User rejected spawning reverse shell listener"
+                        }).to_string(),
+                        tool_calls: None,
+                        tool_call_id: Some(approval.tool_call.id),
+                    });
+                    self.continue_llm_conversation().await?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+
         // If Help modal is open, intercept keys
         if self.ui_state.show_help {
-            match key.code {
-                KeyCode::F(1) | KeyCode::F(12) | KeyCode::Esc | KeyCode::Char('q') => {
-                    self.ui_state.show_help = false;
-                }
-                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.ui_state.show_help = false;
-                }
-                _ => {}
+            if self.is_help_key(key) || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.ui_state.show_help = false;
             }
             return Ok(());
         }
@@ -116,19 +156,17 @@ impl App {
             return Ok(());
         }
 
+        // Help hotkey (global check)
+        if self.is_help_key(key) {
+            self.ui_state.show_help = !self.ui_state.show_help;
+            return Ok(());
+        }
+
         // If on interactive Shell tab (Tab 1..N), pass raw input to PTY
         if self.active_tab > 0 {
             match (key.code, key.modifiers) {
                 (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                     self.ui_state.should_quit = true;
-                    return Ok(());
-                }
-                (KeyCode::F(1), _) | (KeyCode::F(12), _) => {
-                    self.ui_state.show_help = !self.ui_state.show_help;
-                    return Ok(());
-                }
-                (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-                    self.ui_state.show_help = !self.ui_state.show_help;
                     return Ok(());
                 }
                 (KeyCode::F(2), _) => {
@@ -151,6 +189,8 @@ impl App {
                 }
                 (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                     self.input_mode = InputMode::LlmQuery;
+                    self.input_buffer.clear();
+                    self.ui_state.input_cursor = 0;
                     self.active_tab = 0; // return to Workspace & LLM tab
                     return Ok(());
                 }
@@ -174,14 +214,7 @@ impl App {
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 self.input_mode = InputMode::LlmQuery;
                 self.input_buffer.clear();
-                return Ok(());
-            }
-            (KeyCode::F(1), _) | (KeyCode::F(12), _) => {
-                self.ui_state.show_help = !self.ui_state.show_help;
-                return Ok(());
-            }
-            (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-                self.ui_state.show_help = !self.ui_state.show_help;
+                self.ui_state.input_cursor = 0;
                 return Ok(());
             }
             (KeyCode::F(2), _) => {
@@ -198,15 +231,19 @@ impl App {
             }
             (KeyCode::Esc, _) => {
                 self.input_mode = InputMode::Shell;
+                self.input_buffer.clear();
+                self.ui_state.input_cursor = 0;
                 self.suggestion_visible = false;
                 self.history_index = None;
                 self.ui_state.show_help = false;
                 self.ui_state.show_model_picker = false;
+                self.ui_state.show_session_picker = false;
                 self.ui_state.show_api_key_prompt = false;
                 return Ok(());
             }
             (KeyCode::Char('['), _) => {
                 self.ui_state.sidebar_collapsed = !self.ui_state.sidebar_collapsed;
+                self.update_pty_dimensions().await?;
                 return Ok(());
             }
             _ => {}
@@ -217,6 +254,38 @@ impl App {
             InputMode::Shell => self.handle_shell_key(key).await?,
             InputMode::LlmQuery => self.handle_llm_query_key(key).await?,
             InputMode::EditCommand => self.handle_edit_command_key(key).await?,
+        }
+        Ok(())
+    }
+
+    async fn handle_session_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let total_rows = 1 + self.ui_state.session_list.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.ui_state.show_session_picker = false;
+            }
+            KeyCode::Up => {
+                if self.ui_state.session_picker_selected > 0 {
+                    self.ui_state.session_picker_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.ui_state.session_picker_selected + 1 < total_rows {
+                    self.ui_state.session_picker_selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.ui_state.session_picker_selected;
+                if selected == 0 {
+                    let session_name = format!("{}_scan", chrono::Local::now().format("%Y-%m-%d_%H%M%S"));
+                    self.switch_session(session_name).await?;
+                } else if let Some(s) = self.ui_state.session_list.get(selected - 1) {
+                    let name = s.name.clone();
+                    self.switch_session(name).await?;
+                }
+                self.ui_state.show_session_picker = false;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -275,14 +344,69 @@ impl App {
         Ok(())
     }
     
+    fn is_help_key(&self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::F(1) | KeyCode::F(12) => true,
+            KeyCode::Char('h') | KeyCode::Char('H') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) => true,
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) && self.input_buffer.is_empty() => true,
+            _ => false,
+        }
+    }
+
+    fn insert_input_char(&mut self, c: char) {
+        if self.ui_state.input_cursor >= self.input_buffer.len() {
+            self.input_buffer.push(c);
+            self.ui_state.input_cursor = self.input_buffer.len();
+        } else {
+            self.input_buffer.insert(self.ui_state.input_cursor, c);
+            self.ui_state.input_cursor += 1;
+        }
+    }
+
+    fn delete_char_before_cursor(&mut self) {
+        if self.ui_state.input_cursor > 0 && !self.input_buffer.is_empty() {
+            self.ui_state.input_cursor -= 1;
+            if self.ui_state.input_cursor < self.input_buffer.len() {
+                self.input_buffer.remove(self.ui_state.input_cursor);
+            }
+        }
+    }
+
+    fn delete_char_at_cursor(&mut self) {
+        if self.ui_state.input_cursor < self.input_buffer.len() {
+            self.input_buffer.remove(self.ui_state.input_cursor);
+        }
+    }
+
+    fn cursor_left(&mut self) {
+        if self.ui_state.input_cursor > 0 {
+            self.ui_state.input_cursor -= 1;
+        }
+    }
+
+    fn cursor_right(&mut self) {
+        if self.ui_state.input_cursor < self.input_buffer.len() {
+            self.ui_state.input_cursor += 1;
+        }
+    }
+
+    fn cursor_home(&mut self) {
+        self.ui_state.input_cursor = 0;
+    }
+
+    fn cursor_end(&mut self) {
+        self.ui_state.input_cursor = self.input_buffer.len();
+    }
+
     async fn handle_shell_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
                 let cmd = self.input_buffer.trim().to_string();
+                self.input_buffer.clear();
+                self.ui_state.input_cursor = 0;
                 if !cmd.is_empty() {
                     self.command_history.push_back(cmd.clone());
                     self.history_index = None;
-                    self.input_buffer.clear();
                     
                     // Handle special commands
                     if cmd.starts_with(':') {
@@ -316,6 +440,7 @@ impl App {
                             if let Some(sug) = &self.suggestion {
                                 if let Some(cmd) = &sug.command {
                                     self.input_buffer = cmd.clone();
+                                    self.ui_state.input_cursor = self.input_buffer.len();
                                     self.input_mode = InputMode::EditCommand;
                                 }
                             }
@@ -331,24 +456,41 @@ impl App {
                 }
                 if self.input_buffer.is_empty() && c == '?' {
                     self.input_mode = InputMode::LlmQuery;
+                    self.ui_state.input_cursor = 0;
                     return Ok(());
                 }
-                self.input_buffer.push(c);
+                self.insert_input_char(c);
             }
             KeyCode::Backspace => {
-                self.input_buffer.pop();
+                self.delete_char_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.delete_char_at_cursor();
+            }
+            KeyCode::Left => {
+                self.cursor_left();
+            }
+            KeyCode::Right => {
+                self.cursor_right();
+            }
+            KeyCode::Home => {
+                self.cursor_home();
+            }
+            KeyCode::End => {
+                self.cursor_end();
             }
             KeyCode::Up => {
                 if let Some(idx) = self.history_index {
                     if idx > 0 {
                         self.history_index = Some(idx - 1);
                         self.input_buffer = self.command_history[idx - 1].clone();
+                        self.ui_state.input_cursor = self.input_buffer.len();
                     }
                 } else if !self.command_history.is_empty() {
                     self.history_index = Some(self.command_history.len() - 1);
                     self.input_buffer = self.command_history.back().unwrap().clone();
+                    self.ui_state.input_cursor = self.input_buffer.len();
                 }
-                // Scroll up in log
                 if self.ui_state.log_at_bottom {
                     self.ui_state.log_at_bottom = false;
                 }
@@ -358,23 +500,18 @@ impl App {
                     if idx + 1 < self.command_history.len() {
                         self.history_index = Some(idx + 1);
                         self.input_buffer = self.command_history[idx + 1].clone();
+                        self.ui_state.input_cursor = self.input_buffer.len();
                     } else {
                         self.history_index = None;
                         self.input_buffer.clear();
+                        self.ui_state.input_cursor = 0;
                     }
-                }
-                // Scroll down in log
-                if !self.ui_state.log_at_bottom {
-                    // Check if we reached bottom - would need viewport height
                 }
             }
             KeyCode::PageUp => {
                 self.ui_state.log_at_bottom = false;
-                // Scroll by viewport - would need viewport height
             }
-            KeyCode::PageDown => {
-                // Scroll by viewport
-            }
+            KeyCode::PageDown => {}
             _ => {}
         }
         Ok(())
@@ -384,21 +521,38 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let query = self.input_buffer.trim().to_string();
+                self.input_buffer.clear();
+                self.ui_state.input_cursor = 0;
+                self.input_mode = InputMode::Shell;
                 if !query.is_empty() {
-                    self.input_buffer.clear();
-                    self.input_mode = InputMode::Shell;
                     self.send_llm_query(&query).await?;
                 }
             }
             KeyCode::Char(c) => {
-                self.input_buffer.push(c);
+                self.insert_input_char(c);
             }
             KeyCode::Backspace => {
-                self.input_buffer.pop();
+                self.delete_char_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.delete_char_at_cursor();
+            }
+            KeyCode::Left => {
+                self.cursor_left();
+            }
+            KeyCode::Right => {
+                self.cursor_right();
+            }
+            KeyCode::Home => {
+                self.cursor_home();
+            }
+            KeyCode::End => {
+                self.cursor_end();
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Shell;
                 self.input_buffer.clear();
+                self.ui_state.input_cursor = 0;
             }
             _ => {}
         }
@@ -409,11 +563,12 @@ impl App {
         match key.code {
             KeyCode::Enter => {
                 let cmd = self.input_buffer.trim().to_string();
+                self.input_buffer.clear();
+                self.ui_state.input_cursor = 0;
+                self.input_mode = InputMode::Shell;
+                self.suggestion_visible = false;
                 if !cmd.is_empty() {
                     self.command_history.push_back(cmd.clone());
-                    self.input_buffer.clear();
-                    self.input_mode = InputMode::Shell;
-                    self.suggestion_visible = false;
                     if self.active_tab == 0 {
                         self.execute_workspace_command(&cmd).await?;
                     } else {
@@ -422,13 +577,30 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
-                self.input_buffer.push(c);
+                self.insert_input_char(c);
             }
             KeyCode::Backspace => {
-                self.input_buffer.pop();
+                self.delete_char_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.delete_char_at_cursor();
+            }
+            KeyCode::Left => {
+                self.cursor_left();
+            }
+            KeyCode::Right => {
+                self.cursor_right();
+            }
+            KeyCode::Home => {
+                self.cursor_home();
+            }
+            KeyCode::End => {
+                self.cursor_end();
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Shell;
+                self.input_buffer.clear();
+                self.ui_state.input_cursor = 0;
                 self.suggestion_visible = false;
             }
             _ => {}
@@ -468,6 +640,11 @@ impl App {
             }
             ":models" => {
                 self.ui_state.show_model_picker = true;
+            }
+            ":sessions" => {
+                self.ui_state.session_list = crate::app::state::SessionMeta::list_sessions();
+                self.ui_state.session_picker_selected = 0;
+                self.ui_state.show_session_picker = true;
             }
             ":newtab" => {
                 self.new_shell_tab().await?;
@@ -557,8 +734,10 @@ impl App {
     }
     
     async fn send_to_pty(&mut self, cmd: &str) -> Result<()> {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.write(format!("{}\n", cmd).as_bytes())?;
+        if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab - 1) {
+                tab.write(format!("{}\n", cmd).as_bytes())?;
+            }
         }
         Ok(())
     }
@@ -732,11 +911,36 @@ impl App {
                 
                 // Handle special tool results
                 if tool_call.function.name == "open_reverse_shell_tab" {
-                    if let Some(action) = result.get("action").and_then(|v| v.as_str()) {
-                        if action == "spawn_listener_tab" {
-                            let lport = result.get("lport").and_then(|v| v.as_u64()).unwrap_or(4444) as u16;
-                            self.spawn_listener_tab(lport).await?;
-                        }
+                    let target_id = result.get("target_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let target = DatabaseQueries::get_target(self.db.conn(), target_id)?;
+                    if let Some(target) = target {
+                        let lhost = result.get("lhost").and_then(|v| v.as_str()).unwrap_or("0.0.0.0").to_string();
+                        let lport = result.get("lport").and_then(|v| v.as_u64()).unwrap_or(4444) as u16;
+                        let shell_type = result.get("shell_type").and_then(|v| v.as_str()).unwrap_or("bash").to_string();
+
+                        self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
+                            target_id,
+                            target_ip: target.ip_host,
+                            lhost,
+                            lport,
+                            shell_type,
+                            tool_call: tool_call.clone(),
+                        });
+                        self.add_notification(
+                            format!("Approval required for reverse shell on port {}", lport),
+                            NotifLevel::Warning,
+                        );
+                        return Ok(());
+                    } else {
+                        self.chat_log.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: serde_json::json!({
+                                "error": format!("Target ID {} is not within current assessment scope", target_id)
+                            }).to_string(),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_call.id),
+                        });
+                        continue;
                     }
                 }
                 
@@ -813,8 +1017,20 @@ impl App {
     }
     
     async fn handle_pty_exited(&mut self, tab_id: usize, exit_code: i32) -> Result<()> {
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            tab.mark_exited(exit_code);
+        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+            let label = self.tabs[pos].label.clone();
+            self.tabs.remove(pos);
+            let tab_index = pos + 1;
+            if self.active_tab == tab_index {
+                // If on the closed tab, switch to previous tab or Tab 0 (Workspace & LLM)
+                self.active_tab = pos;
+            } else if self.active_tab > tab_index {
+                self.active_tab -= 1;
+            }
+            if self.active_tab > self.tabs.len() {
+                self.active_tab = self.tabs.len();
+            }
+            self.add_notification(format!("{} closed (exit code {})", label, exit_code), NotifLevel::Info);
         }
         Ok(())
     }
@@ -829,11 +1045,21 @@ impl App {
         self.last_tick = now;
     }
     
-    async fn handle_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        // Resize all PTY tabs
+    pub async fn update_pty_dimensions(&mut self) -> Result<()> {
+        let (term_cols, term_rows) = self.terminal_size;
+        let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
+        let pty_cols = term_cols.saturating_sub(sidebar_width).max(20);
+        let pty_rows = term_rows.saturating_sub(3).max(5);
+
         for tab in &mut self.tabs {
-            tab.resize(cols, rows)?;
+            let _ = tab.resize(pty_cols, pty_rows);
         }
+        Ok(())
+    }
+
+    async fn handle_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.terminal_size = (cols, rows);
+        self.update_pty_dimensions().await?;
         Ok(())
     }
     
@@ -945,7 +1171,7 @@ impl App {
         Ok(())
     }
     
-    fn add_notification(&mut self, message: String, level: NotifLevel) {
+    pub fn add_notification(&mut self, message: String, level: NotifLevel) {
         self.notifications.push(crate::app::state::Notification {
             message,
             level,

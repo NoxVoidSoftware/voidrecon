@@ -40,6 +40,17 @@ pub struct Config {
     pub models_cache_updated_at: Option<DateTime<Utc>>,
 }
 
+impl ModelInfo {
+    pub fn is_free(&self) -> bool {
+        if self.id.ends_with(":free") {
+            return true;
+        }
+        let prompt_zero = self.pricing.prompt.trim().parse::<f64>().map(|v| v == 0.0).unwrap_or(false);
+        let completion_zero = self.pricing.completion.trim().parse::<f64>().map(|v| v == 0.0).unwrap_or(false);
+        prompt_zero && completion_zero
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let fallback_models = vec![
@@ -101,8 +112,8 @@ impl Default for Config {
 impl Config {
     pub fn config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Could not find user home directory")?;
-        let config_dir = home.join(".audit-tui");
-        fs::create_dir_all(&config_dir).context("Failed to create config directory ~/.audit-tui")?;
+        let config_dir = home.join(".config").join("voidrecon");
+        fs::create_dir_all(&config_dir).context("Failed to create config directory ~/.config/voidrecon")?;
         Ok(config_dir.join("config.json"))
     }
 
@@ -141,10 +152,7 @@ impl Config {
     pub fn get_free_models(&self) -> Vec<&ModelInfo> {
         self.models_cache
             .iter()
-            .filter(|m| {
-                m.id.ends_with(":free")
-                    || (m.pricing.prompt == "0" && m.pricing.completion == "0")
-            })
+            .filter(|m| m.is_free())
             .collect()
     }
 

@@ -41,6 +41,16 @@ pub struct SidebarNode {
     pub findings_by_severity: Vec<(String, Vec<Finding>)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExploitApproval {
+    pub target_id: i64,
+    pub target_ip: String,
+    pub lhost: String,
+    pub lport: u16,
+    pub shell_type: String,
+    pub tool_call: crate::llm::types::ToolCall,
+}
+
 /// Session metadata
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
@@ -61,12 +71,16 @@ impl SessionMeta {
         }
     }
 
-    pub fn path(&self) -> PathBuf {
+    pub fn sessions_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".audit-tui")
+            .join(".config")
+            .join("voidrecon")
             .join("sessions")
-            .join(&self.name)
+    }
+
+    pub fn path(&self) -> PathBuf {
+        Self::sessions_dir().join(&self.name)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -79,6 +93,26 @@ impl SessionMeta {
 
     pub fn workspace_path(&self) -> PathBuf {
         self.path().join("workspace")
+    }
+
+    pub fn list_sessions() -> Vec<SessionMeta> {
+        let dir = Self::sessions_dir();
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut list = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let meta_path = entry.path().join("session.json");
+                if meta_path.exists() {
+                    if let Ok(meta) = Self::load(&meta_path) {
+                        list.push(meta);
+                    }
+                }
+            }
+        }
+        list.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        list
     }
 }
 
@@ -130,6 +164,12 @@ pub struct App {
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
     
+    // Terminal size & layout
+    pub terminal_size: (u16, u16),
+    
+    // Exploit approval prompt
+    pub pending_exploit_approval: Option<ExploitApproval>,
+
     // Timing
     pub last_tick: Instant,
 }
@@ -226,6 +266,8 @@ impl App {
             notifications: Vec::new(),
             event_tx,
             event_rx,
+            terminal_size: (80, 24),
+            pending_exploit_approval: None,
             last_tick: Instant::now(),
         };
 
@@ -256,6 +298,31 @@ impl App {
         self.llm_request_id += 1;
         self.llm_request_id
     }
+
+    pub async fn switch_session(&mut self, session_name: String) -> Result<()> {
+        let meta_path = SessionMeta::sessions_dir().join(&session_name).join("session.json");
+        let session_meta = if meta_path.exists() {
+            SessionMeta::load(&meta_path)?
+        } else {
+            let meta = SessionMeta::new(session_name);
+            std::fs::create_dir_all(&meta.path())?;
+            std::fs::create_dir_all(meta.workspace_path().join("outputs"))?;
+            std::fs::create_dir_all(meta.workspace_path().join("evidence"))?;
+            std::fs::create_dir_all(meta.workspace_path().join("artifacts"))?;
+            meta.save()?;
+            meta
+        };
+
+        self.db = Database::new(&session_meta.db_path())?;
+        self.session_meta = session_meta;
+        self.chat_log.clear();
+        self.tabs.clear();
+        self.active_tab = 0;
+        self.active_target_id = None;
+        self.reload_sidebar().await?;
+        self.add_notification(format!("Switched to session: {}", self.session_meta.name), NotifLevel::Info);
+        Ok(())
+    }
 }
 
 impl SessionMeta {
@@ -277,6 +344,9 @@ pub struct UiState {
     pub should_quit: bool,
     pub show_help: bool,
     pub show_model_picker: bool,
+    pub show_session_picker: bool,
+    pub session_picker_selected: usize,
+    pub session_list: Vec<SessionMeta>,
     pub show_api_key_prompt: bool,
     pub api_key_input: String,
     pub model_picker_search: String,

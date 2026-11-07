@@ -35,7 +35,7 @@ pub struct PtyTab {
     pub kind: TerminalKind,
     pub master: Box<dyn MasterPty + Send>,
     pub slave: Option<Box<dyn SlavePty + Send>>,
-    pub child: Box<dyn Child + Send + Sync>,
+    pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     pub parser: Arc<Mutex<Parser>>,
     pub writer: Box<dyn Write + Send>,
     pub reader_thread: Option<std::thread::JoinHandle<()>>,
@@ -117,13 +117,39 @@ impl PtyTab {
             let _ = tx_clone.send(AppEvent::PtyExited(tab_id, 0));
         });
 
+        let child_arc = Arc::new(Mutex::new(child));
+        let child_clone = child_arc.clone();
+        let tx_exit = tx.clone();
+
+        // Watcher thread to promptly detect when process terminates (e.g. user typed 'exit')
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(mut c) = child_clone.lock() {
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, status.exit_code() as i32));
+                            break;
+                        }
+                        Ok(None) => continue,
+                        Err(_) => {
+                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, 0));
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             id,
             label: format!("Shell {}", id),
             kind: TerminalKind::LocalShell,
             master: pty_pair.master,
             slave: Some(pty_pair.slave),
-            child,
+            child: child_arc,
             parser,
             writer,
             reader_thread: Some(reader_thread),
@@ -212,13 +238,37 @@ impl PtyTab {
             let _ = tx_clone.send(AppEvent::PtyExited(tab_id, 0));
         });
 
+        let child_arc = Arc::new(Mutex::new(child));
+        let child_clone = child_arc.clone();
+        let tx_exit = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(mut c) = child_clone.lock() {
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, status.exit_code() as i32));
+                            break;
+                        }
+                        Ok(None) => continue,
+                        Err(_) => {
+                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, 0));
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             id,
             label: format!("Listener: :{}", lport),
             kind: TerminalKind::Listener,
             master: pty_pair.master,
             slave: Some(pty_pair.slave),
-            child,
+            child: child_arc,
             parser,
             writer,
             reader_thread: Some(reader_thread),
@@ -283,13 +333,37 @@ impl PtyTab {
             let _ = tx_clone.send(AppEvent::PtyExited(tab_id, 0));
         });
 
+        let child_arc = Arc::new(Mutex::new(child));
+        let child_clone = child_arc.clone();
+        let tx_exit = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let Ok(mut c) = child_clone.lock() {
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, status.exit_code() as i32));
+                            break;
+                        }
+                        Ok(None) => continue,
+                        Err(_) => {
+                            let _ = tx_exit.send(AppEvent::PtyExited(tab_id, 0));
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             id,
             label,
             kind: TerminalKind::RemoteShell,
             master: pty_pair.master,
             slave: Some(pty_pair.slave),
-            child,
+            child: child_arc,
             parser,
             writer,
             reader_thread: Some(reader_thread),
@@ -351,6 +425,8 @@ impl PtyTab {
 
 impl Drop for PtyTab {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
     }
 }
