@@ -519,7 +519,7 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" [ACTION APPROVAL] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(" Press ", Style::default().fg(Color::White)),
             Span::styled(" [Y / Enter] ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
-            Span::styled(" to Approve listener or ", Style::default().fg(Color::White)),
+            Span::styled(" to Approve action or ", Style::default().fg(Color::White)),
             Span::styled(" [N / Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(" to Reject", Style::default().fg(Color::White)),
         ]);
