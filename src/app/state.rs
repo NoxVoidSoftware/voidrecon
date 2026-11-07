@@ -216,8 +216,8 @@ impl App {
             use futures_util::StreamExt;
             while let Some(event) = reader.next().await {
                 if let Ok(crossterm::event::Event::Key(key)) = event {
-                    // Only forward Press events to prevent duplicate inputs and flickering on Windows
-                    if key.kind == crossterm::event::KeyEventKind::Press {
+                    // Discard Release events to prevent duplicate inputs and flickering on Windows
+                    if key.kind != crossterm::event::KeyEventKind::Release {
                         if tx_keys.send(AppEvent::Key(key)).is_err() {
                             break;
                         }

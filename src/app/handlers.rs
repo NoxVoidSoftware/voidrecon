@@ -60,7 +60,7 @@ impl App {
     
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Defensive check: ignore key release events to prevent double inputs and flickering
-        if key.kind != crossterm::event::KeyEventKind::Press {
+        if key.kind == crossterm::event::KeyEventKind::Release {
             return Ok(());
         }
 
@@ -157,7 +157,7 @@ impl App {
 
         // Help hotkey (global check)
         if self.is_help_key(key) {
-            self.ui_state.show_help = !self.ui_state.show_help;
+            self.ui_state.show_help = true;
             return Ok(());
         }
 
@@ -169,7 +169,7 @@ impl App {
                     return Ok(());
                 }
                 (KeyCode::F(2), _) => {
-                    self.ui_state.show_model_picker = !self.ui_state.show_model_picker;
+                    self.ui_state.show_model_picker = true;
                     return Ok(());
                 }
                 (KeyCode::F(3), _) => {
@@ -217,7 +217,7 @@ impl App {
                 return Ok(());
             }
             (KeyCode::F(2), _) => {
-                self.ui_state.show_model_picker = !self.ui_state.show_model_picker;
+                self.ui_state.show_model_picker = true;
                 return Ok(());
             }
             (KeyCode::F(3), _) => {
@@ -240,7 +240,7 @@ impl App {
                 self.ui_state.show_api_key_prompt = false;
                 return Ok(());
             }
-            (KeyCode::Char('['), _) => {
+            (KeyCode::Char('['), _) if self.input_buffer.is_empty() => {
                 self.ui_state.sidebar_collapsed = !self.ui_state.sidebar_collapsed;
                 self.update_pty_dimensions().await?;
                 return Ok(());
@@ -299,6 +299,8 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::F(2) => {
                 self.ui_state.show_model_picker = false;
+                self.ui_state.model_picker_search.clear();
+                self.ui_state.model_picker_selected = 0;
             }
             KeyCode::Up => {
                 if self.ui_state.model_picker_selected > 0 {
@@ -329,6 +331,8 @@ impl App {
                     }
                 }
                 self.ui_state.show_model_picker = false;
+                self.ui_state.model_picker_search.clear();
+                self.ui_state.model_picker_selected = 0;
             }
             KeyCode::Char(c) => {
                 self.ui_state.model_picker_search.push(c);
@@ -473,10 +477,19 @@ impl App {
                 self.cursor_right();
             }
             KeyCode::Home => {
-                self.cursor_home();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.ui_state.log_at_bottom = false;
+                    self.ui_state.log_scroll = 0;
+                } else {
+                    self.cursor_home();
+                }
             }
             KeyCode::End => {
-                self.cursor_end();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.ui_state.log_at_bottom = true;
+                } else {
+                    self.cursor_end();
+                }
             }
             KeyCode::Up => {
                 if let Some(idx) = self.history_index {
@@ -489,9 +502,10 @@ impl App {
                     self.history_index = Some(self.command_history.len() - 1);
                     self.input_buffer = self.command_history.back().unwrap().clone();
                     self.ui_state.input_cursor = self.input_buffer.len();
-                }
-                if self.ui_state.log_at_bottom {
+                } else if self.input_buffer.is_empty() {
+                    // When no command history and empty input, Up scrolls chat log up by 1 line
                     self.ui_state.log_at_bottom = false;
+                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
@@ -505,12 +519,18 @@ impl App {
                         self.input_buffer.clear();
                         self.ui_state.input_cursor = 0;
                     }
+                } else if self.input_buffer.is_empty() {
+                    // When no command history and empty input, Down scrolls chat log down by 1 line
+                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(1);
                 }
             }
             KeyCode::PageUp => {
                 self.ui_state.log_at_bottom = false;
+                self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_sub(10);
             }
-            KeyCode::PageDown => {}
+            KeyCode::PageDown => {
+                self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(10);
+            }
             _ => {}
         }
         Ok(())
@@ -543,10 +563,26 @@ impl App {
                 self.cursor_right();
             }
             KeyCode::Home => {
-                self.cursor_home();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.ui_state.log_at_bottom = false;
+                    self.ui_state.log_scroll = 0;
+                } else {
+                    self.cursor_home();
+                }
             }
             KeyCode::End => {
-                self.cursor_end();
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.ui_state.log_at_bottom = true;
+                } else {
+                    self.cursor_end();
+                }
+            }
+            KeyCode::PageUp => {
+                self.ui_state.log_at_bottom = false;
+                self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(10);
             }
             KeyCode::Esc => {
                 self.input_mode = InputMode::Shell;
@@ -696,11 +732,12 @@ impl App {
         
         // Add output to chat log
         self.chat_log.push(ChatMessage {
-            role: "assistant".to_string(),
+            role: "output".to_string(),
             content: output.clone(),
             tool_calls: None,
             tool_call_id: None,
         });
+        self.ui_state.log_at_bottom = true;
         
         // Trigger post-execution analysis
         self.post_exec_mode = true;
@@ -743,26 +780,38 @@ impl App {
             self.add_notification("OpenRouter API key not configured".to_string(), NotifLevel::Error);
             return Ok(());
         }
+
+        // Add user question to visible chat log
+        self.chat_log.push(ChatMessage {
+            role: "user".to_string(),
+            content: format!("? {}", query),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        self.ui_state.log_at_bottom = true;
         
         // Build context
         let active_target = if let Some(id) = self.active_target_id {
             DatabaseQueries::get_target(self.db.conn(), id)?
         } else {
-            self.add_notification("No active target selected".to_string(), NotifLevel::Warning);
-            return Ok(());
+            None
         };
         
-        let active_target = active_target.context("Active target not found")?;
-        let findings = DatabaseQueries::get_findings_for_target(self.db.conn(), active_target.id)?;
-        let recent_commands = DatabaseQueries::get_recent_commands(self.db.conn(), active_target.id, 3)?;
-        let command_count = DatabaseQueries::get_command_count(self.db.conn(), active_target.id)?;
+        let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
+            let f = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?;
+            let r = DatabaseQueries::get_recent_commands(self.db.conn(), target.id, 3)?;
+            let c = DatabaseQueries::get_command_count(self.db.conn(), target.id)?;
+            (f, r, c)
+        } else {
+            (Vec::new(), Vec::new(), 0)
+        };
         let targets_count = DatabaseQueries::get_targets_count(self.db.conn())?;
         
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),
             targets_count,
-            &active_target,
+            active_target.as_ref(),
             &findings,
             &recent_commands,
             command_count,
@@ -967,10 +1016,24 @@ impl App {
                 self.add_notification("New assets detected - check LLM output".to_string(), NotifLevel::Info);
             }
         } else {
-            // Regular LLM suggestion
+            // Regular LLM query / suggestion
             let suggestion = parse_llm_response(&self.llm_response_buffer)?;
-            self.suggestion = Some(suggestion);
-            self.suggestion_visible = true;
+            let content_display = if !suggestion.explanation.is_empty() {
+                suggestion.explanation.clone()
+            } else {
+                self.llm_response_buffer.clone()
+            };
+            self.chat_log.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: content_display,
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            if suggestion.command.is_some() {
+                self.suggestion = Some(suggestion);
+                self.suggestion_visible = true;
+            }
+            self.ui_state.log_at_bottom = true;
         }
         
         self.llm_response_buffer.clear();
