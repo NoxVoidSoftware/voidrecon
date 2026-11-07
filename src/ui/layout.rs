@@ -12,6 +12,7 @@ use ratatui::{
 
 pub fn render_ui(f: &mut Frame, app: &mut App) {
     let area = f.size();
+    app.terminal_size = (area.width, area.height);
     
     // Main layout
     let chunks = Layout::default()

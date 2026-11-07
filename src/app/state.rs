@@ -305,7 +305,7 @@ impl App {
             notifications: Vec::new(),
             event_tx,
             event_rx,
-            terminal_size: (80, 24),
+            terminal_size: crossterm::terminal::size().unwrap_or((80, 24)),
             pending_exploit_approval: None,
             last_tick: Instant::now(),
         };

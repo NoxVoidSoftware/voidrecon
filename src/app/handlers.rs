@@ -882,15 +882,19 @@ impl App {
                 self.insert_input_char(c);
             }
             KeyCode::Backspace => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.delete_char_before_cursor();
             }
             KeyCode::Delete => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.delete_char_at_cursor();
             }
             KeyCode::Left => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.cursor_left();
             }
             KeyCode::Right => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.cursor_right();
             }
             KeyCode::Home => {
@@ -977,15 +981,19 @@ impl App {
                 self.insert_input_char(c);
             }
             KeyCode::Backspace => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.delete_char_before_cursor();
             }
             KeyCode::Delete => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.delete_char_at_cursor();
             }
             KeyCode::Left => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.cursor_left();
             }
             KeyCode::Right => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.cursor_right();
             }
             KeyCode::Home => {
@@ -1041,15 +1049,19 @@ impl App {
                 self.insert_input_char(c);
             }
             KeyCode::Backspace => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.delete_char_before_cursor();
             }
             KeyCode::Delete => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.delete_char_at_cursor();
             }
             KeyCode::Left => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.cursor_left();
             }
             KeyCode::Right => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 self.cursor_right();
             }
             KeyCode::Home => {
@@ -1959,7 +1971,9 @@ impl App {
         let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
 
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left) => {
                 // If any modal is showing, do not change focus
                 if self.ui_state.show_model_picker
                     || self.ui_state.show_session_picker
@@ -2016,6 +2030,14 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
+                if self.ui_state.show_model_picker {
+                    self.ui_state.model_picker_selected = self.ui_state.model_picker_selected.saturating_sub(1);
+                    return Ok(());
+                }
+                if self.ui_state.show_session_picker {
+                    self.ui_state.session_picker_selected = self.ui_state.session_picker_selected.saturating_sub(1);
+                    return Ok(());
+                }
                 if self.active_tab == 0 {
                     self.ui_state.focus = WindowFocus::ChatLog;
                     self.ui_state.log_at_bottom = false;
@@ -2023,7 +2045,16 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown => {
+                if self.ui_state.show_model_picker {
+                    self.ui_state.model_picker_selected = self.ui_state.model_picker_selected.saturating_add(1);
+                    return Ok(());
+                }
+                if self.ui_state.show_session_picker {
+                    self.ui_state.session_picker_selected = self.ui_state.session_picker_selected.saturating_add(1);
+                    return Ok(());
+                }
                 if self.active_tab == 0 {
+                    self.ui_state.focus = WindowFocus::ChatLog;
                     self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(3);
                 }
             }
