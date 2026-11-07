@@ -19,12 +19,14 @@ pub fn build_system_prompt(
     let mut prompt = String::from(
         r#"You are an expert penetration tester working an active session in voidrecon.
 Be concise.
-- When the user asks you to do something, perform a test, or run a scan:
-  Respond ONLY with JSON: {"command": "<shell_command>", "explanation": "<concise explanation>"}
-- When the user asks an informational question (about targets, findings, status, or past outputs):
-  Inspect the database using the available read tools (get_target_info, get_findings, list_targets, get_recent_commands, read_workspace_file) and answer clearly. Set "command": null.
-- If no shell command is needed, set command to null.
-Never output raw monologues before the JSON.
+- To execute or run a scan or command (nmap, gobuster, nikto, hydra, curl, etc.):
+  Call the `run_command` tool with the command and explanation.
+  Alternatively, you may format your response as JSON: {"command": "<command>", "explanation": "<reason>"}.
+  NEVER write commands to files to execute them. The user will be prompted to run your suggested command in the TUI ([r]un / [e]dit / [s]kip).
+- When the user asks an informational question (about targets, findings, open ports, status):
+  Use the database read tools (`get_target_info`, `get_findings`, `list_targets`, `get_recent_commands`) to inspect the database and answer clearly.
+- Voidrecon automatically archives all command outputs into `workspace/outputs/`. Do NOT attempt to manually save command outputs or tool results to files in evidence/.
+- The ONLY file-saving tool available is `save_exploit_script` when writing Python exploit PoCs into `workspace/exploits/`.
 "#,
     );
     prompt.push_str("\n## Session progress\nSession: ");
@@ -115,12 +117,11 @@ Workspace structure:
             r#"
 
 Tools & Workspace Workflow:
-1. `set_target`: Set or switch the active target in scope (e.g. `set_target(ip_host="192.168.1.1")`).
-2. `list_targets` / `get_target_info` / `get_findings`: Query targets, ports, and findings stored in the database.
-3. `update_target` / `add_finding`: Record discovered ports, OS details, and vulnerabilities into the database so they persist.
-4. `save_workspace_file`: Save evidence into `workspace/evidence/` (automatically linked as finding in DB) or artifacts into `workspace/artifacts/`.
-5. `read_workspace_file`: Read full raw command outputs (`workspace/outputs/<uuid>.txt`) or saved evidence/artifacts.
-6. `save_exploit_script` / `execute_exploit_script`: Save Python exploits with automatic syntax validation and execute with user Action Approval."#,
+1. `run_command`: Suggest or run a shell command/scan (nmap, gobuster, nikto, curl). The user is prompted in the TUI to approve and run it.
+2. `set_target`: Set or switch the active target in scope (e.g. `set_target(ip_host="192.168.1.1")`).
+3. `list_targets` / `get_target_info` / `get_findings`: Query targets, ports, and findings stored in the database.
+4. `update_target` / `add_finding`: Record discovered ports, OS details, and vulnerabilities into the database.
+5. `save_exploit_script` / `execute_exploit_script`: Save Python exploits into `workspace/exploits/` and execute with Action Approval."#,
         );
     }
 
@@ -194,7 +195,7 @@ Suggest the next logical step based on findings and open ports. Do not repeat co
 }
 
 /// Post-execution analysis prompt
-pub const POST_EXEC_PROMPT: &str = "In 2 sentences max: what is interesting in this output? List any new IPs, open ports, or software versions found.";
+pub const POST_EXEC_PROMPT: &str = "CRITICAL: If the scan output reveals open ports, services, operating system details, or vulnerabilities, invoke `update_target` or `add_target` to record them into the session database, and `add_finding` for any security issues. Summarize the key findings in 1-2 sentences.";
 
 /// Parse LLM response JSON into typed suggestion
 pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSuggestion> {
@@ -270,10 +271,23 @@ pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSugges
                         }
                         break 'parse crate::llm::types::LlmSuggestion { command, explanation };
                     }
+                } else if let Some(sug) = extract_malformed_suggestion(candidate, &text[..start]) {
+                    break 'parse sug;
                 }
                 search_end = start;
             } else {
                 break;
+            }
+        }
+
+        // Fallback: check if malformed JSON exists anywhere in text
+        if let Some(start) = text.find('{') {
+            if let Some(end) = text.rfind('}') {
+                if end > start {
+                    if let Some(sug) = extract_malformed_suggestion(&text[start..=end], &text[..start]) {
+                        break 'parse sug;
+                    }
+                }
             }
         }
 
@@ -286,6 +300,93 @@ pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSugges
 
     let _ = suggestion.validate();
     Ok(suggestion)
+}
+
+fn extract_malformed_suggestion(candidate: &str, preamble: &str) -> Option<crate::llm::types::LlmSuggestion> {
+    let cmd_key = "\"command\"";
+    let cmd_idx = candidate.find(cmd_key)?;
+    let after_cmd_key = &candidate[cmd_idx + cmd_key.len()..];
+    let colon_idx = after_cmd_key.find(':')?;
+    let val_after = after_cmd_key[colon_idx + 1..].trim_start();
+
+    if val_after.starts_with("null") {
+        let explanation = extract_explanation_string(candidate).unwrap_or_else(|| {
+            if !preamble.is_empty() {
+                preamble.to_string()
+            } else {
+                "Information query answered".to_string()
+            }
+        });
+        return Some(crate::llm::types::LlmSuggestion {
+            command: None,
+            explanation,
+        });
+    }
+
+    let raw_cmd = if let Some(expl_idx) = candidate.find("\"explanation\"") {
+        if expl_idx > cmd_idx {
+            let slice = &candidate[cmd_idx + cmd_key.len() + colon_idx + 1..expl_idx];
+            slice.trim().trim_end_matches(',').trim()
+        } else {
+            val_after.trim_end_matches('}').trim()
+        }
+    } else {
+        val_after.trim_end_matches('}').trim()
+    };
+
+    let clean_cmd = clean_extracted_command(raw_cmd);
+    if clean_cmd.is_empty() {
+        return None;
+    }
+
+    let explanation = extract_explanation_string(candidate).unwrap_or_else(|| {
+        if !preamble.is_empty() {
+            preamble.to_string()
+        } else {
+            "Suggested command for execution".to_string()
+        }
+    });
+
+    Some(crate::llm::types::LlmSuggestion {
+        command: Some(clean_cmd),
+        explanation,
+    })
+}
+
+fn clean_extracted_command(raw: &str) -> String {
+    let mut s = raw.trim();
+    if s.starts_with('"') || s.starts_with('\'') {
+        s = &s[1..];
+    }
+    if s.ends_with('"') || s.ends_with('\'') {
+        s = &s[..s.len().saturating_sub(1)];
+    }
+    s = s.trim();
+
+    if let Some(dot_idx) = s.find('.') {
+        let prefix = &s[..dot_idx];
+        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+            s = s[dot_idx + 1..].trim_start();
+        }
+    }
+
+    s = s.trim_matches(|c: char| c == '"' || c == '\'' || c == '.' || c.is_whitespace());
+    s.to_string()
+}
+
+fn extract_explanation_string(candidate: &str) -> Option<String> {
+    let expl_key = "\"explanation\"";
+    let expl_idx = candidate.find(expl_key)?;
+    let after_key = &candidate[expl_idx + expl_key.len()..];
+    let colon_idx = after_key.find(':')?;
+    let val_after = after_key[colon_idx + 1..].trim();
+    let trimmed = val_after.trim_end_matches('}').trim();
+    let cleaned = trimmed.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+    if !cleaned.is_empty() {
+        Some(cleaned.to_string())
+    } else {
+        None
+    }
 }
 
 fn extract_clean_command(val: &serde_json::Value) -> Option<String> {
@@ -333,5 +434,13 @@ mod tests {
         let res = parse_llm_response(raw).unwrap();
         assert!(res.command.is_none());
         assert_eq!(res.explanation, "Target 10.129.90.124 has ports 22 and 80 open.");
+    }
+
+    #[test]
+    fn test_parse_nemotron_malformed_quote_json() {
+        let raw = r#"The user wants to run an nmap scan. I need to execute a proper nmap command. Let me run a comprehensive nmap scan against the target 10.129.90.12{"command": "4. "nmap -sS -sV -O -p- -T4 10.129.90.124", "explanation": "Comprehensive nmap scan: SYN scan, service version detection, OS detection, all ports, fast timing"}"#;
+        let res = parse_llm_response(raw).unwrap();
+        assert_eq!(res.command.as_deref(), Some("nmap -sS -sV -O -p- -T4 10.129.90.124"));
+        assert_eq!(res.explanation, "Comprehensive nmap scan: SYN scan, service version detection, OS detection, all ports, fast timing");
     }
 }

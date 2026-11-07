@@ -54,6 +54,11 @@ pub enum ApprovalKind {
         script_name: String,
         command_line: String,
     },
+    SaveEvidence {
+        filename: String,
+        description: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +214,10 @@ pub struct App {
     // Exploit approval prompt
     pub pending_exploit_approval: Option<ExploitApproval>,
 
+    // Background workspace command execution (Tab 0)
+    pub running_command: Option<(u64, String, Instant)>,
+    pub command_abort_handle: Option<tokio::task::AbortHandle>,
+
     // Timing
     pub last_tick: Instant,
 }
@@ -307,6 +316,8 @@ impl App {
             event_rx,
             terminal_size: crossterm::terminal::size().unwrap_or((80, 24)),
             pending_exploit_approval: None,
+            running_command: None,
+            command_abort_handle: None,
             last_tick: Instant::now(),
         };
 

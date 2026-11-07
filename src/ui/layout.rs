@@ -73,21 +73,26 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
 
-    let llm_indicator = match app.llm_request_state {
-        crate::llm::types::LlmRequestState::Streaming => {
-            Span::styled(format!(" [LLM {}] ", spinner), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
-        }
-        crate::llm::types::LlmRequestState::ProcessingToolCalls => {
-            Span::styled(format!(" [Tools {}] ", spinner), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
-        }
-        crate::llm::types::LlmRequestState::Completed => {
-            Span::styled(" [LLM: Ready] ", Style::default().bg(Color::Green).fg(Color::Black))
-        }
-        crate::llm::types::LlmRequestState::Failed => {
-            Span::styled(" [LLM: Error] ", Style::default().bg(Color::Red).fg(Color::White))
-        }
-        crate::llm::types::LlmRequestState::Idle => {
-            Span::styled(" [LLM] ", Style::default().bg(Color::DarkGray).fg(Color::White))
+    let llm_indicator = if let Some((_, cmd, start)) = &app.running_command {
+        let elapsed = start.elapsed().as_secs();
+        Span::styled(format!(" [RUNNING {} ({}s): {}] ", spinner, elapsed, cmd), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+    } else {
+        match app.llm_request_state {
+            crate::llm::types::LlmRequestState::Streaming => {
+                Span::styled(format!(" [LLM {}] ", spinner), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+            }
+            crate::llm::types::LlmRequestState::ProcessingToolCalls => {
+                Span::styled(format!(" [Tools {}] ", spinner), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+            }
+            crate::llm::types::LlmRequestState::Completed => {
+                Span::styled(" [LLM: Ready] ", Style::default().bg(Color::Green).fg(Color::Black))
+            }
+            crate::llm::types::LlmRequestState::Failed => {
+                Span::styled(" [LLM: Error] ", Style::default().bg(Color::Red).fg(Color::White))
+            }
+            crate::llm::types::LlmRequestState::Idle => {
+                Span::styled(" [LLM] ", Style::default().bg(Color::DarkGray).fg(Color::White))
+            }
         }
     };
 
@@ -260,6 +265,11 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" Target: {} (ID {}) │ Script: {} │ Command: {}", approval.target_ip, approval.target_id, script_name, command_line),
                 " [y / Enter] Approve & Execute Exploit ",
             ),
+            crate::app::state::ApprovalKind::SaveEvidence { filename, description, .. } => (
+                " LLM requests saving evidence file:",
+                format!(" Target: {} (ID {}) │ File: workspace/evidence/{} │ Desc: {}", approval.target_ip, approval.target_id, filename, description),
+                " [y / Enter] Approve & Save Evidence ",
+            ),
         };
         let content = vec![
             Line::from(vec![
@@ -414,6 +424,16 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("│ {}", spinner), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ]));
         }
+        display_lines.push(Line::from(""));
+    }
+
+    if let Some((_, cmd, start)) = &app.running_command {
+        let elapsed = start.elapsed().as_secs();
+        let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
+        display_lines.push(Line::from(vec![
+            Span::styled(format!(" {} Executing: {} ({}s)...", spinner, cmd, elapsed), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
         display_lines.push(Line::from(""));
     }
 

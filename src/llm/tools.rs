@@ -10,6 +10,24 @@ use crate::llm::types::{ToolCall, ToolDefinition};
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new_function(
+            "run_command",
+            "Suggest or execute a shell command or scan in the session workspace (e.g. nmap, gobuster, nikto, hydra, curl, whoami) against the target. The command is presented to the user in the voidrecon TUI with [r]un / [e]dit / [s]kip confirmation before execution, and results are captured into the workspace and database.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The exact shell command to execute, e.g. 'nmap -sS -sV -T4 10.129.90.124'"
+                    },
+                    "explanation": {
+                        "type": "string",
+                        "description": "Concise explanation of what this command does and why it should be executed"
+                    }
+                },
+                "required": ["command", "explanation"]
+            }),
+        ),
+        ToolDefinition::new_function(
             "set_target",
             "Set or switch the active target in scope. If the target exists in the database, sets it as active; if not, inserts it and sets it as active.",
             serde_json::json!({
@@ -107,34 +125,17 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new_function(
-            "save_workspace_file",
-            "Save reconnaissance evidence or assessment artifacts into the session workspace (workspace/evidence/ or workspace/artifacts/). Automatically records evidence as findings in the database.",
+            "save_evidence",
+            "Save evidence or scan findings to workspace/evidence/<filename>. NOTE: Requires interactive user approval in the TUI before any file is saved.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "folder": {
-                        "type": "string",
-                        "enum": ["evidence", "artifacts", "exploits"],
-                        "description": "Destination subfolder in workspace"
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "Filename, e.g. 'nmap_scan_full.txt', 'admin_creds.txt', 'notes.md'"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "File text content"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Short description of the file or evidence"
-                    },
-                    "target_id": {
-                        "type": "integer",
-                        "description": "Target ID associated with this file (defaults to active target)"
-                    }
+                    "filename": {"type": "string", "description": "Filename, e.g. 'nmap_scan.txt' or 'extracted_hashes.txt'"},
+                    "content": {"type": "string", "description": "Text content of the evidence to save"},
+                    "description": {"type": "string", "description": "Short description of the evidence for user approval"},
+                    "target_id": {"type": "integer", "description": "Target ID (defaults to active target)"}
                 },
-                "required": ["folder", "filename", "content"]
+                "required": ["filename", "content"]
             }),
         ),
         ToolDefinition::new_function(
@@ -743,72 +744,27 @@ pub async fn execute_tool_call(
 
             Ok(serde_json::Value::Object(files_by_category))
         }
-        "save_workspace_file" => {
-            let folder = args.get("folder").and_then(|v| v.as_str()).unwrap_or("evidence");
-            let raw_name = args.get("filename").and_then(|v| v.as_str()).context("Missing filename")?;
+        "run_command" => {
+            let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let explanation = args.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(serde_json::json!({
+                "status": "suggested",
+                "command": command,
+                "explanation": explanation
+            }))
+        }
+        "save_evidence" => {
+            let filename = args.get("filename").and_then(|v| v.as_str()).context("Missing filename")?;
             let content = args.get("content").and_then(|v| v.as_str()).context("Missing content")?;
             let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
             let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id);
 
-            // Clean folder
-            let valid_folder = match folder {
-                "evidence" | "artifacts" | "exploits" => folder,
-                _ => "evidence",
-            };
-
-            // Clean filename
-            let file_stem = std::path::Path::new(raw_name)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(raw_name);
-            let clean_name: String = file_stem
-                .chars()
-                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
-                .collect();
-
-            let target_dir = workspace_path.join(valid_folder);
-            std::fs::create_dir_all(&target_dir)?;
-            let file_path = target_dir.join(&clean_name);
-            std::fs::write(&file_path, content)?;
-            let rel_path = format!("workspace/{}/{}", valid_folder, clean_name);
-            let bytes_written = content.len();
-
-            // Automatic DB integration
-            if let Some(tid) = target_id {
-                if valid_folder == "evidence" {
-                    let title = if description.is_empty() {
-                        format!("Evidence: {}", clean_name)
-                    } else {
-                        format!("Evidence: {} ({})", clean_name, description)
-                    };
-                    let _ = DatabaseQueries::add_finding(
-                        conn,
-                        tid,
-                        &title,
-                        description,
-                        "info",
-                        None,
-                        Some(100),
-                        Some(&rel_path),
-                    );
-                    let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
-                } else if valid_folder == "artifacts" {
-                    let note_text = if description.is_empty() {
-                        format!("Saved artifact: {}", rel_path)
-                    } else {
-                        format!("Saved artifact {}: {}", rel_path, description)
-                    };
-                    let _ = DatabaseQueries::add_note(conn, tid, &note_text);
-                    let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
-                }
-            }
-
             Ok(serde_json::json!({
-                "status": "saved",
-                "folder": valid_folder,
-                "file": clean_name,
-                "path": rel_path,
-                "bytes": bytes_written
+                "status": "requires_approval",
+                "filename": filename,
+                "description": description,
+                "content": content,
+                "target_id": target_id
             }))
         }
         "read_workspace_file" => {

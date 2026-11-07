@@ -81,6 +81,14 @@ impl App {
                 self.handle_llm_done(request_id).await?;
                 Ok(true)
             }
+            AppEvent::CommandStarted(request_id, cmd) => {
+                self.handle_command_started(request_id, cmd);
+                Ok(true)
+            }
+            AppEvent::CommandCompleted(request_id, result) => {
+                self.handle_command_completed(request_id, result).await?;
+                Ok(true)
+            }
             AppEvent::Tick => Ok(self.handle_tick()),
             AppEvent::Resize(cols, rows) => {
                 self.handle_resize(cols, rows).await?;
@@ -328,6 +336,55 @@ impl App {
                             }
                             self.ui_state.log_at_bottom = true;
                         }
+                        crate::app::state::ApprovalKind::SaveEvidence { filename, description, content } => {
+                            let target_dir = self.session_meta.workspace_path().join("evidence");
+                            let _ = std::fs::create_dir_all(&target_dir);
+                            let file_path = target_dir.join(&filename);
+                            match std::fs::write(&file_path, &content) {
+                                Ok(_) => {
+                                    let rel_path = format!("workspace/evidence/{}", filename);
+                                    let title = if description.is_empty() {
+                                        format!("Evidence: {}", filename)
+                                    } else {
+                                        format!("Evidence: {} ({})", filename, description)
+                                    };
+                                    let _ = DatabaseQueries::add_finding(
+                                        self.db.conn(),
+                                        approval.target_id,
+                                        &title,
+                                        &description,
+                                        "info",
+                                        None,
+                                        Some(100),
+                                        Some(&rel_path),
+                                    );
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "approved_and_saved",
+                                            "path": rel_path,
+                                            "bytes": content.len()
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(format!("Approved & saved evidence: {}", filename), NotifLevel::Info);
+                                    let _ = self.reload_sidebar().await;
+                                }
+                                Err(e) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "save_failed",
+                                            "error": e.to_string()
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(format!("Failed to save evidence: {}", e), NotifLevel::Error);
+                                }
+                            }
+                        }
                     }
                     self.continue_llm_conversation().await?;
                     return Ok(());
@@ -337,6 +394,7 @@ impl App {
                     let reject_msg = match &approval.kind {
                         crate::app::state::ApprovalKind::ReverseShellListener { .. } => "User rejected spawning reverse shell listener",
                         crate::app::state::ApprovalKind::ExecuteExploit { .. } => "User rejected exploit script execution",
+                        crate::app::state::ApprovalKind::SaveEvidence { .. } => "User rejected saving evidence file",
                     };
                     self.append_chat_message(ChatMessage {
                         role: "tool".to_string(),
@@ -446,6 +504,32 @@ impl App {
 
         // Tab 0 (Workspace & LLM) shortcuts
         match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if let Some(handle) = self.command_abort_handle.take() {
+                    handle.abort();
+                    self.running_command = None;
+                    self.append_chat_message(ChatMessage {
+                        role: "system".to_string(),
+                        content: "⚠️ Command cancelled by user (Ctrl+C)".to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    self.add_notification("Command cancelled".to_string(), NotifLevel::Warning);
+                    return Ok(());
+                }
+                if let Some(handle) = self.llm_abort_handle.take() {
+                    handle.abort();
+                    self.llm_request_state = LlmRequestState::Idle;
+                    self.append_chat_message(ChatMessage {
+                        role: "system".to_string(),
+                        content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    self.add_notification("LLM cancelled".to_string(), NotifLevel::Warning);
+                    return Ok(());
+                }
+            }
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.ui_state.should_quit = true;
                 return Ok(());
@@ -1217,82 +1301,155 @@ impl App {
         Ok(())
     }
     
-    async fn execute_workspace_command(&mut self, cmd: &str) -> Result<()> {
-        let start = Instant::now();
-        
-        // Add to chat log
-        self.append_chat_message(ChatMessage {
-            role: "user".to_string(),
-            content: format!("$ {}", cmd),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        
-        // Execute command and capture output
-        let output = self.run_command_capture(cmd).await?;
-        let duration_ms = start.elapsed().as_millis() as i64;
-        let exit_code = 0; // Would get actual exit code
-        
-        // Save to database with full output artifact
+    fn handle_command_started(&mut self, request_id: u64, cmd: String) {
+        self.running_command = Some((request_id, cmd, Instant::now()));
+    }
+
+    async fn handle_command_completed(&mut self, request_id: u64, result: crate::app::events::CommandResult) -> Result<()> {
+        if let Some((cur_id, _, _)) = &self.running_command {
+            if *cur_id != request_id {
+                return Ok(());
+            }
+        }
+        self.running_command = None;
+        self.command_abort_handle = None;
+
         let target_id = self.active_target_id;
-        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "user", cmd);
-        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "assistant", &output);
-        DatabaseQueries::add_command(
+
+        // Save to database with full output artifact
+        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "user", &result.cmd);
+        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "assistant", &result.output);
+        let _ = DatabaseQueries::add_command(
             self.db.conn(),
             &self.session_meta.path(),
             target_id,
-            cmd,
-            Some(&output),
-            Some(exit_code),
-            Some(duration_ms),
-        )?;
-        
+            &result.cmd,
+            Some(&result.output),
+            Some(result.exit_code),
+            Some(result.duration_ms),
+        );
+
         // Add output to chat log
         self.append_chat_message(ChatMessage {
             role: "output".to_string(),
-            content: output.clone(),
+            content: result.output.clone(),
             tool_calls: None,
             tool_call_id: None,
         });
         self.ui_state.log_at_bottom = true;
-        
-        // Trigger post-execution analysis
-        self.post_exec_mode = true;
-        self.send_post_exec_analysis(cmd, &output).await?;
-        
+
+        // Auto-parse scan outputs (e.g. nmap) to update target and open ports immediately
+        if let Ok(Some(discovered_target_id)) = DatabaseQueries::parse_nmap_and_update_target(
+            self.db.conn(),
+            &result.cmd,
+            &result.output,
+            self.active_target_id,
+        ) {
+            self.active_target_id = Some(discovered_target_id);
+            self.add_notification(
+                "Recon engine: Discovered target and updated open ports in DB".to_string(),
+                NotifLevel::Info,
+            );
+        }
+
         // Reload sidebar
         self.reload_sidebar().await?;
-        
+
+        // Trigger post-execution analysis
+        self.post_exec_mode = true;
+        self.send_post_exec_analysis(&result.cmd, &result.output).await?;
+
         Ok(())
     }
-    
-    async fn run_command_capture(&self, cmd: &str) -> Result<String> {
+
+    async fn execute_workspace_command(&mut self, cmd: &str) -> Result<()> {
+        let cmd_str = cmd.trim().to_string();
+        if cmd_str.is_empty() {
+            return Ok(());
+        }
+
+        let req_id = self.next_request_id();
+
+        // Add to chat log
+        self.append_chat_message(ChatMessage {
+            role: "user".to_string(),
+            content: format!("$ {}", cmd_str),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        self.ui_state.log_at_bottom = true;
+
+        self.running_command = Some((req_id, cmd_str.clone(), Instant::now()));
+
         let ws_path = self.session_meta.workspace_path();
         let _ = std::fs::create_dir_all(&ws_path);
 
-        #[cfg(target_os = "windows")]
-        let mut command = tokio::process::Command::new("cmd");
-        #[cfg(target_os = "windows")]
-        command.args(["/C", cmd]);
+        let tx = self.event_tx.clone();
+        let cmd_for_task = cmd_str.clone();
 
-        #[cfg(not(target_os = "windows"))]
-        let mut command = tokio::process::Command::new("sh");
-        #[cfg(not(target_os = "windows"))]
-        command.args(["-c", cmd]);
+        let _ = tx.send(AppEvent::CommandStarted(req_id, cmd_str.clone()));
 
-        command.current_dir(&ws_path);
-        let output = command.output().await.context("Failed to execute command")?;
-        
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        
-        if stderr.is_empty() {
-            Ok(stdout.to_string())
-        } else {
-            Ok(format!("{}\n{}", stdout, stderr))
-        }
+        let handle = tokio::spawn(async move {
+            let start = Instant::now();
+            let res = Self::run_process_in_dir(&cmd_for_task, &ws_path).await;
+            let duration_ms = start.elapsed().as_millis() as i64;
+            let (output, exit_code) = match res {
+                Ok(pair) => pair,
+                Err(e) => (format!("Failed to execute command: {}", e), 1),
+            };
+
+            let _ = tx.send(AppEvent::CommandCompleted(
+                req_id,
+                crate::app::events::CommandResult {
+                    cmd: cmd_for_task,
+                    output,
+                    exit_code,
+                    duration_ms,
+                },
+            ));
+        });
+
+        self.command_abort_handle = Some(handle.abort_handle());
+
+        Ok(())
     }
-    
+
+    async fn run_command_capture(&self, cmd: &str) -> Result<String> {
+        let ws_path = self.session_meta.workspace_path();
+        let _ = std::fs::create_dir_all(&ws_path);
+        let (output, _) = Self::run_process_in_dir(cmd, &ws_path).await?;
+        Ok(output)
+    }
+
+    async fn run_process_in_dir(cmd: &str, dir: &std::path::Path) -> Result<(String, i32)> {
+    #[cfg(target_os = "windows")]
+    let mut command = tokio::process::Command::new("cmd");
+    #[cfg(target_os = "windows")]
+    command.args(["/C", cmd]);
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = tokio::process::Command::new("sh");
+    #[cfg(not(target_os = "windows"))]
+    command.args(["-c", cmd]);
+
+    command.current_dir(dir);
+    let output = command.output().await.context("Failed to execute process")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let combined = if stderr.is_empty() {
+        stdout.to_string()
+    } else if stdout.is_empty() {
+        stderr.to_string()
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+
+    let exit_code = output.status.code().unwrap_or(0);
+    Ok((combined, exit_code))
+}
+
     async fn send_to_pty(&mut self, cmd: &str) -> Result<()> {
         if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
             if let Some(tab) = self.tabs.get_mut(self.active_tab - 1) {
@@ -1426,7 +1583,7 @@ impl App {
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are an automated security recon engine in voidrecon. Analyze the command output. If you identify new targets, open ports, services, operating system details, or security findings, invoke the appropriate tools (set_target, update_target, add_finding, add_target, save_workspace_file) to record them into the session database. Provide a concise 1-2 sentence summary.".to_string(),
+                content: "You are an automated security recon engine in voidrecon. Analyze the command output. If you identify new targets, open ports, services, operating system details, or security findings, invoke the appropriate tools (set_target, update_target, add_finding, add_target) to record them into the session database. Provide a concise 1-2 sentence summary.".to_string(),
                 tool_calls: None,
                 tool_call_id: None,
             },
@@ -1540,13 +1697,51 @@ impl App {
                     }
                 }
 
-                if tool_call.function.name == "save_workspace_file" {
-                    if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
-                        self.add_notification(
-                            format!("Saved file: {}", path),
-                            NotifLevel::Info,
-                        );
+                if tool_call.function.name == "run_command" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) {
+                        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                        let explanation = args.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
+                        if !cmd.is_empty() {
+                            self.suggestion = Some(crate::llm::types::LlmSuggestion {
+                                command: Some(cmd.to_string()),
+                                explanation: explanation.to_string(),
+                            });
+                            self.suggestion_visible = true;
+                        }
                     }
+                }
+
+                if tool_call.function.name == "save_evidence" {
+                    let target_id = result.get("target_id").and_then(|v| v.as_i64()).or(self.active_target_id).unwrap_or(0);
+                    let target_ip = if target_id > 0 {
+                        DatabaseQueries::get_target(self.db.conn(), target_id)
+                            .ok()
+                            .flatten()
+                            .map(|t| t.ip_host)
+                            .unwrap_or_else(|| "target".to_string())
+                    } else {
+                        "active_target".to_string()
+                    };
+
+                    let filename = result.get("filename").and_then(|v| v.as_str()).unwrap_or("evidence.txt").to_string();
+                    let description = result.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let content = result.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                    self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
+                        target_id,
+                        target_ip,
+                        kind: crate::app::state::ApprovalKind::SaveEvidence {
+                            filename: filename.clone(),
+                            description,
+                            content,
+                        },
+                        tool_call: tool_call.clone(),
+                    });
+                    self.add_notification(
+                        format!("Approval required to save evidence to {}", filename),
+                        NotifLevel::Warning,
+                    );
+                    return Ok(());
                 }
 
                 if tool_call.function.name == "set_target" || tool_call.function.name == "add_target" {

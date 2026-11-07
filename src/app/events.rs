@@ -3,6 +3,14 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use crate::llm::types::ToolCall;
 
+#[derive(Debug, Clone)]
+pub struct CommandResult {
+    pub cmd: String,
+    pub output: String,
+    pub exit_code: i32,
+    pub duration_ms: i64,
+}
+
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
@@ -14,6 +22,8 @@ pub enum AppEvent {
     LlmRequestStarted(u64),
     LlmRequestFailed(u64, String),
     LlmDone(u64),
+    CommandStarted(u64, String),
+    CommandCompleted(u64, CommandResult),
     Tick,
     Resize(u16, u16),
     SidebarReload,

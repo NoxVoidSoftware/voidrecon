@@ -292,4 +292,221 @@ impl DatabaseQueries {
             .context("Failed to count targets")?;
         Ok(count)
     }
+
+    /// Automatically parses scan outputs (such as nmap) to extract discovered open ports, services,
+    /// versions, and operating system details, persisting them directly into the session database.
+    pub fn parse_nmap_and_update_target(
+        conn: &Connection,
+        cmd: &str,
+        output: &str,
+        fallback_target_id: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let is_scan = output.contains("Nmap") || cmd.contains("nmap") || output.contains("/tcp") || output.contains("/udp");
+        if !is_scan {
+            return Ok(None);
+        }
+
+        // 1. Extract target host or IP
+        let mut target_ip = None;
+        for line in output.lines() {
+            if line.contains("Nmap scan report for ") {
+                let part = line.trim_start_matches("Nmap scan report for ").trim();
+                if let Some(open) = part.find('(') {
+                    if let Some(close) = part.find(')') {
+                        if close > open {
+                            target_ip = Some(part[open + 1..close].trim().to_string());
+                        }
+                    }
+                }
+                if target_ip.is_none() {
+                    target_ip = Some(part.to_string());
+                }
+                break;
+            }
+        }
+
+        // If not in output, inspect cmd line arguments for IPv4
+        if target_ip.is_none() {
+            for word in cmd.split_whitespace() {
+                let clean = word.trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
+                let parts: Vec<&str> = clean.split('.').collect();
+                if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+                    target_ip = Some(clean.to_string());
+                    break;
+                }
+            }
+        }
+
+        // 2. Extract open ports
+        let mut ports: Vec<crate::db::models::PortInfo> = Vec::new();
+        for line in output.lines() {
+            let trimmed = line.trim();
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let port_proto = parts[0];
+                if let Some(slash_idx) = port_proto.find('/') {
+                    let port_str = &port_proto[..slash_idx];
+                    let proto = &port_proto[slash_idx + 1..];
+                    if let Ok(port_num) = port_str.parse::<u16>() {
+                        let state = parts[1];
+                        if state == "open" {
+                            let service = parts.get(2).unwrap_or(&"unknown").to_string();
+                            let version = if parts.len() > 3 {
+                                parts[3..].join(" ")
+                            } else {
+                                String::new()
+                            };
+                            ports.push(crate::db::models::PortInfo {
+                                port: port_num,
+                                proto: proto.to_string(),
+                                service,
+                                version,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Extract OS info if present
+        let mut os_detected = None;
+        for line in output.lines() {
+            let lower = line.to_lowercase();
+            if lower.contains("service info: os:") {
+                if let Some(idx) = line.find("OS:") {
+                    let after = &line[idx + 3..];
+                    let os_str = after.split(';').next().unwrap_or(after).trim();
+                    if !os_str.is_empty() {
+                        os_detected = Some(os_str.to_string());
+                        break;
+                    }
+                }
+            } else if lower.contains("os details:") {
+                let os_str = line.trim_start_matches("OS details:").trim();
+                if !os_str.is_empty() {
+                    os_detected = Some(os_str.to_string());
+                    break;
+                }
+            } else if lower.contains("running:") {
+                let os_str = line.trim_start_matches("Running:").trim();
+                if !os_str.is_empty() {
+                    os_detected = Some(os_str.to_string());
+                    break;
+                }
+            }
+        }
+
+        if ports.is_empty() && os_detected.is_none() {
+            return Ok(None);
+        }
+
+        // 4. Update or insert target
+        let target_to_update = if let Some(ip) = &target_ip {
+            if let Ok(Some(existing)) = Self::get_target_by_ip(conn, ip) {
+                Some(existing)
+            } else {
+                let ports_json_str = if !ports.is_empty() {
+                    Some(serde_json::to_string(&ports)?)
+                } else {
+                    None
+                };
+                let id = Self::add_target(conn, ip, ports_json_str.as_deref(), None)?;
+                if let Some(os) = &os_detected {
+                    let meta = serde_json::json!({ "os": os });
+                    let _ = Self::update_target(conn, id, None, Some(&meta.to_string()));
+                }
+                return Ok(Some(id));
+            }
+        } else if let Some(fid) = fallback_target_id {
+            Self::get_target(conn, fid).unwrap_or(None)
+        } else {
+            None
+        };
+
+        if let Some(target) = target_to_update {
+            let mut merged_ports = if let Some(existing_json) = &target.ports_json {
+                serde_json::from_str::<Vec<crate::db::models::PortInfo>>(existing_json).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            for new_p in ports {
+                if let Some(existing_p) = merged_ports.iter_mut().find(|p| p.port == new_p.port && p.proto == new_p.proto) {
+                    if !new_p.service.is_empty() && new_p.service != "unknown" {
+                        existing_p.service = new_p.service;
+                    }
+                    if !new_p.version.is_empty() {
+                        existing_p.version = new_p.version;
+                    }
+                } else {
+                    merged_ports.push(new_p);
+                }
+            }
+            merged_ports.sort_by_key(|p| p.port);
+
+            let ports_json = serde_json::to_string(&merged_ports)?;
+            let metadata_json = if let Some(os) = os_detected {
+                let mut meta: serde_json::Value = target.metadata_json
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str(m).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                meta["os"] = serde_json::Value::String(os);
+                Some(meta.to_string())
+            } else {
+                target.metadata_json
+            };
+
+            Self::update_target(conn, target.id, Some(&ports_json), metadata_json.as_deref())?;
+            Ok(Some(target.id))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_nmap_scan_output() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_database(&conn).unwrap();
+
+        let cmd = "nmap -sS -sV -T4 10.129.90.124";
+        let output = r#"
+Starting Nmap 7.94 ( https://nmap.org ) at 2026-11-07 20:00 UTC
+Nmap scan report for 10.129.90.124
+Host is up (0.045s latency).
+Not shown: 996 closed ports
+PORT     STATE SERVICE       VERSION
+135/tcp  open  msrpc         Microsoft Windows RPC
+139/tcp  open  netbios-ssn   Microsoft Windows netbios-ssn
+445/tcp  open  microsoft-ds?
+5985/tcp open  http          Microsoft HTTPAPI httpd 2.0 (SSDP/UPnP)
+Service Info: OS: Windows; CPE: cpe:/o:microsoft:windows
+
+Service detection performed. Please report any incorrect results at https://nmap.org/submit/ .
+Nmap done: 1 IP address (1 host up) scanned in 16.65 seconds
+"#;
+
+        let res = DatabaseQueries::parse_nmap_and_update_target(&conn, cmd, output, None).unwrap();
+        assert!(res.is_some());
+        let target_id = res.unwrap();
+
+        let target = DatabaseQueries::get_target(&conn, target_id).unwrap().unwrap();
+        assert_eq!(target.ip_host, "10.129.90.124");
+        assert!(target.ports_json.is_some());
+
+        let ports: Vec<crate::db::models::PortInfo> = serde_json::from_str(&target.ports_json.unwrap()).unwrap();
+        assert_eq!(ports.len(), 4);
+        assert_eq!(ports[0].port, 135);
+        assert_eq!(ports[0].service, "msrpc");
+        assert_eq!(ports[0].version, "Microsoft Windows RPC");
+        assert_eq!(ports[3].port, 5985);
+        assert_eq!(ports[3].service, "http");
+
+        let meta: serde_json::Value = serde_json::from_str(&target.metadata_json.unwrap()).unwrap();
+        assert_eq!(meta["os"], "Windows");
+    }
 }
