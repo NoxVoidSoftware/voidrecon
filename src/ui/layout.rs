@@ -377,6 +377,55 @@ pub fn sanitize_terminal_output(raw: &str) -> String {
     resolve_carriage_returns(&stripped)
 }
 
+fn push_chunked_line(
+    lines_out: &mut Vec<Line<'static>>,
+    prefix: &str,
+    prefix_style: Style,
+    line: &str,
+    text_style: Style,
+) {
+    if line.len() <= 200 {
+        lines_out.push(Line::from(vec![
+            Span::styled(prefix.to_string(), prefix_style),
+            Span::styled(line.to_string(), text_style),
+        ]));
+        return;
+    }
+
+    let mut chunk_start = 0;
+    let mut chunks_shown = 0;
+    while chunk_start < line.len() {
+        if chunks_shown >= 4 {
+            lines_out.push(Line::from(vec![
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::styled(
+                    format!("... [long line truncated, total {} chars] ...", line.len()),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            break;
+        }
+
+        let mut chunk_end = (chunk_start + 200).min(line.len());
+        while chunk_end > chunk_start && !line.is_char_boundary(chunk_end) {
+            chunk_end -= 1;
+        }
+        if chunk_end == chunk_start {
+            break;
+        }
+
+        let piece = &line[chunk_start..chunk_end];
+        let p = if chunks_shown == 0 { prefix } else { "  " };
+        lines_out.push(Line::from(vec![
+            Span::styled(p.to_string(), prefix_style),
+            Span::styled(piece.to_string(), text_style),
+        ]));
+
+        chunk_start = chunk_end;
+        chunks_shown += 1;
+    }
+}
+
 pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let sanitized_content = sanitize_terminal_output(&msg.content);
@@ -391,18 +440,25 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled("──────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
             ]));
             for line in sanitized_content.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(color)),
-                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
-                ]));
+                push_chunked_line(&mut lines, "│ ", Style::default().fg(color), line, Style::default().fg(Color::White));
             }
             lines.push(Line::from(""));
         }
         "output" => {
-            for line in sanitized_content.lines() {
+            let all: Vec<&str> = sanitized_content.lines().collect();
+            let total = all.len();
+            let max_lines = 100;
+            let show_count = total.min(max_lines);
+            for &line in &all[..show_count] {
+                push_chunked_line(&mut lines, "  ", Style::default().fg(Color::DarkGray), line, Style::default().fg(Color::Gray));
+            }
+            if total > max_lines {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("... [truncated {} lines; full output stored in workspace/outputs/] ...", total - max_lines),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ),
                 ]));
             }
             lines.push(Line::from(""));
@@ -415,10 +471,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled("──────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
             ]));
             for line in sanitized_content.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
-                ]));
+                push_chunked_line(&mut lines, "│ ", Style::default().fg(Color::Cyan), line, Style::default().fg(Color::White));
             }
             lines.push(Line::from(vec![
                 Span::styled("└────────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
@@ -426,25 +479,32 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
             lines.push(Line::from(""));
         }
         "tool" => {
+            let all: Vec<&str> = sanitized_content.lines().collect();
+            let total = all.len();
+            let max_lines = 50;
+            let show_count = total.min(max_lines);
             let mut first = true;
-            for line in sanitized_content.lines() {
+            for &line in &all[..show_count] {
                 if first {
-                    lines.push(Line::from(vec![
-                        Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
-                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
-                    ]));
+                    push_chunked_line(&mut lines, "# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC), line, Style::default().fg(Color::DarkGray));
                     first = false;
                 } else {
-                    lines.push(Line::from(vec![
-                        Span::styled("  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
-                    ]));
+                    push_chunked_line(&mut lines, "  ", Style::default().fg(Color::DarkGray), line, Style::default().fg(Color::DarkGray));
                 }
             }
             if first {
                 lines.push(Line::from(vec![
                     Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
                     Span::styled("(empty)".to_string(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            if total > max_lines {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("... [tool result truncated {} lines] ...", total - max_lines),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ),
                 ]));
             }
             lines.push(Line::from(""));
@@ -454,10 +514,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled("┌─ ⚠️ Notice / System ──────────────────────────────────────────", Style::default().fg(Color::Red)),
             ]));
             for line in sanitized_content.lines() {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::Red)),
-                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
-                ]));
+                push_chunked_line(&mut lines, "│ ", Style::default().fg(Color::Red), line, Style::default().fg(Color::White));
             }
             lines.push(Line::from(""));
         }

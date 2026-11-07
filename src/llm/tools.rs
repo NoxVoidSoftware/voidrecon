@@ -649,10 +649,24 @@ pub async fn execute_tool_call(
                 content
             };
 
+            let max_bytes = 24_000;
+            let (code, byte_truncated) = if code.len() > max_bytes {
+                let mut end = max_bytes;
+                while !code.is_char_boundary(end) {
+                    end -= 1;
+                }
+                (
+                    format!("{}\n# ... [truncated, code exceeds 24KB (total {} bytes)] ...", &code[..end], code.len()),
+                    true
+                )
+            } else {
+                (code, false)
+            };
+
             Ok(serde_json::json!({
                 "file": clean_name,
                 "total_lines": total_lines,
-                "truncated": truncated,
+                "truncated": truncated || byte_truncated,
                 "code": code,
                 "run_command": format!("python workspace/exploits/{}", clean_name)
             }))
@@ -865,12 +879,26 @@ pub async fn execute_tool_call(
                 slice.join("\n")
             };
 
+            let max_bytes = 24_000;
+            let (display_content, byte_truncated) = if display_content.len() > max_bytes {
+                let mut end = max_bytes;
+                while !display_content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                (
+                    format!("{}\n... [truncated, content exceeds 24KB (total {} bytes)] ...", &display_content[..end], display_content.len()),
+                    true
+                )
+            } else {
+                (display_content, false)
+            };
+
             Ok(serde_json::json!({
                 "file": file_path.file_name().and_then(|f| f.to_str()).unwrap_or(""),
                 "total_lines": total_lines,
                 "start_line": offset + 1,
                 "lines_returned": slice.len(),
-                "truncated": truncated,
+                "truncated": truncated || byte_truncated,
                 "content": display_content
             }))
         }

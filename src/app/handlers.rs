@@ -1958,7 +1958,22 @@ impl App {
         for msg in slice {
             match msg.role.as_str() {
                 "user" | "assistant" | "system" | "tool" => {
-                    messages.push(msg.clone());
+                    let max_bytes = 24_000;
+                    if msg.content.len() > max_bytes {
+                        let mut end = max_bytes;
+                        while !msg.content.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        let mut msg_copy = msg.clone();
+                        msg_copy.content = format!(
+                            "{}\n... [content truncated to protect context limits, total {} bytes] ...",
+                            &msg.content[..end],
+                            msg.content.len()
+                        );
+                        messages.push(msg_copy);
+                    } else {
+                        messages.push(msg.clone());
+                    }
                 }
                 "output" => {
                     let lines: Vec<&str> = msg.content.lines().collect();
