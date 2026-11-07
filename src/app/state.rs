@@ -173,6 +173,7 @@ pub struct App {
     pub pending_llm_request: Option<String>,
     pub pending_tool_calls: Vec<crate::llm::types::ToolCall>,
     pub post_exec_mode: bool,
+    pub llm_abort_handle: Option<tokio::task::AbortHandle>,
     
     // Suggestion panel
     pub suggestion: Option<LlmSuggestion>,
@@ -278,6 +279,7 @@ impl App {
             pending_llm_request: None,
             pending_tool_calls: Vec::new(),
             post_exec_mode: false,
+            llm_abort_handle: None,
             suggestion: None,
             suggestion_visible: false,
             chat_log: Vec::new(),
@@ -303,6 +305,24 @@ impl App {
     pub fn next_request_id(&mut self) -> u64 {
         self.llm_request_id += 1;
         self.llm_request_id
+    }
+
+    pub fn cancel_llm_request(&mut self) {
+        if let Some(abort) = self.llm_abort_handle.take() {
+            abort.abort();
+        }
+        self.next_request_id();
+        self.llm_request_state = LlmRequestState::Idle;
+        self.pending_tool_calls.clear();
+        self.llm_response_buffer.clear();
+        self.append_chat_message(ChatMessage {
+            role: "system".to_string(),
+            content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        self.ui_state.log_at_bottom = true;
+        self.add_notification("LLM generation cancelled".to_string(), NotifLevel::Info);
     }
 
     pub fn save_chat_history(&self) {

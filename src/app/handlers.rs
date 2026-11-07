@@ -226,6 +226,15 @@ impl App {
             return Ok(());
         }
 
+        // If LLM is generating, Ctrl+C or Esc cancels the request
+        if matches!(self.llm_request_state, LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls) {
+            if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                || key.code == KeyCode::Esc {
+                self.cancel_llm_request();
+                return Ok(());
+            }
+        }
+
         // If on interactive Shell tab (Tab 1..N), pass raw input to PTY
         if self.active_tab > 0 {
             match (key.code, key.modifiers) {
@@ -1154,9 +1163,10 @@ impl App {
         let tx = self.event_tx.clone();
         let client = self.llm_client.clone();
         
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = client.stream_chat(request, tx, request_id).await;
         });
+        self.llm_abort_handle = Some(handle.abort_handle());
         
         Ok(())
     }
@@ -1198,9 +1208,10 @@ impl App {
         let tx = self.event_tx.clone();
         let client = self.llm_client.clone();
         
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = client.stream_chat(request, tx, request_id).await;
         });
+        self.llm_abort_handle = Some(handle.abort_handle());
         
         Ok(())
     }
@@ -1231,6 +1242,7 @@ impl App {
     
     fn handle_llm_request_failed(&mut self, request_id: u64, error: String) {
         if request_id == self.llm_request_id {
+            self.llm_abort_handle = None;
             self.llm_request_state = LlmRequestState::Failed;
             self.add_notification(format!("LLM request failed: {}", error), NotifLevel::Error);
             self.append_chat_message(ChatMessage {
@@ -1249,6 +1261,7 @@ impl App {
             return Ok(());
         }
         
+        self.llm_abort_handle = None;
         self.llm_request_state = LlmRequestState::Completed;
         
         if !self.pending_tool_calls.is_empty() {
@@ -1431,9 +1444,10 @@ impl App {
         let tx = self.event_tx.clone();
         let client = self.llm_client.clone();
         
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let _ = client.stream_chat(request, tx, request_id).await;
         });
+        self.llm_abort_handle = Some(handle.abort_handle());
         
         Ok(())
     }

@@ -26,7 +26,7 @@ impl LlmClient {
     pub fn new(provider: Provider) -> Self {
         let inner = LlmClientInner {
             client: Client::builder()
-                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),
             provider,
@@ -54,7 +54,8 @@ impl LlmClient {
         let mut req = self
             .inner
             .client
-            .get(self.inner.provider.models_endpoint());
+            .get(self.inner.provider.models_endpoint())
+            .timeout(Duration::from_secs(15));
 
         if let Some(key) = self.inner.provider.api_key() {
             if !key.trim().is_empty() {
@@ -203,8 +204,10 @@ impl LlmClient {
         let response = match req.json(&request).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                let err_msg = if e.is_timeout() {
-                    format!("Request timed out (30s) waiting for {}", self.inner.provider.name())
+                let err_msg = if e.is_connect() {
+                    format!("Connection failed to {}: {}", self.inner.provider.name(), e)
+                } else if e.is_timeout() {
+                    format!("Request timed out connecting to {}", self.inner.provider.name())
                 } else {
                     format!("HTTP error: {}", e)
                 };
@@ -251,8 +254,8 @@ impl LlmClient {
             while let Some(newline_pos) = line_buffer.find('\n') {
                 let line: String = line_buffer.drain(..=newline_pos).collect();
                 let trimmed = line.trim();
-                if trimmed.starts_with("data: ") {
-                    let data = trimmed[6..].trim();
+                if let Some(data) = trimmed.strip_prefix("data:") {
+                    let data = data.trim();
                     if data == "[DONE]" {
                         break;
                     }
@@ -304,6 +307,18 @@ impl LlmClient {
                                     }
                                 }
                             }
+                        }
+                    } else if let Ok(err_val) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(err_obj) = err_val.get("error") {
+                            let msg = err_obj.get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Server error in stream");
+                            let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, format!("Provider error: {}", msg)));
+                            return Ok(ChatCompletionResponse {
+                                id: "stream_error".to_string(),
+                                choices: vec![],
+                                usage: None,
+                            });
                         }
                     }
                 }

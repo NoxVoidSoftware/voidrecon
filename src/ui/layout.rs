@@ -347,9 +347,9 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
 
         let title = if app.llm_request_state == crate::llm::types::LlmRequestState::ProcessingToolCalls {
-            format!("┌─ 🤖 AI / LLM [Executing Tools... {}] ────────────────────────────", spinner)
+            format!("┌─ 🤖 AI / LLM [Executing Tools... {}] (Ctrl+C: Cancel) ────────", spinner)
         } else {
-            format!("┌─ 🤖 AI / LLM [Thinking / Streaming... {}] ───────────────────────", spinner)
+            format!("┌─ 🤖 AI / LLM [Thinking / Streaming... {}] (Ctrl+C: Cancel) ───", spinner)
         };
         lines.push(Line::from(vec![
             Span::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -480,14 +480,19 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         InputMode::EditCommand => "EDIT CMD",
     };
     
-    let footer = Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled(" F1/Alt+H/:help:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F2:Models ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F3:New Shell ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" Tab:Switch Tab ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" Esc:Workspace ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::styled(format!(" [{}] ", mode_text), Style::default().bg(Color::Blue).fg(Color::White)),
-    ]);
+    ];
+    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+        footer_spans.push(Span::styled(" Ctrl+C: Cancel LLM ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+    }
+    footer_spans.push(Span::styled(format!(" [{}] ", mode_text), Style::default().bg(Color::Blue).fg(Color::White)));
+
+    let footer = Line::from(footer_spans);
     
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), area);
 }
