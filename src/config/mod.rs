@@ -11,16 +11,27 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub context_length: Option<u32>,
+    #[serde(default)]
     pub pricing: ModelPricing,
+    #[serde(default)]
     pub architecture: Option<ModelArchitecture>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_zero() -> String {
+    "0".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPricing {
+    #[serde(default = "default_zero")]
     pub prompt: String,
+    #[serde(default = "default_zero")]
     pub completion: String,
 }
 
@@ -32,8 +43,63 @@ pub struct ModelArchitecture {
     pub tokenizer: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    OpenRouter,
+    NvidiaNim,
+    OpenAi,
+    Ollama,
+    Custom,
+}
+
+pub const ALL_PROVIDERS: &[ProviderKind] = &[
+    ProviderKind::OpenRouter,
+    ProviderKind::NvidiaNim,
+    ProviderKind::OpenAi,
+    ProviderKind::Ollama,
+    ProviderKind::Custom,
+];
+
+fn default_provider() -> ProviderKind {
+    ProviderKind::OpenRouter
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::NvidiaNim => "NVIDIA NIM",
+            Self::OpenAi => "OpenAI",
+            Self::Ollama => "Ollama (Local)",
+            Self::Custom => "Custom Endpoint",
+        }
+    }
+
+    pub fn default_base_url(&self) -> &'static str {
+        match self {
+            Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::NvidiaNim => "https://integrate.api.nvidia.com/v1",
+            Self::OpenAi => "https://api.openai.com/v1",
+            Self::Ollama => "http://localhost:11434/v1",
+            Self::Custom => "http://localhost:1234/v1",
+        }
+    }
+
+    pub fn requires_api_key(&self) -> bool {
+        match self {
+            Self::OpenRouter | Self::NvidiaNim | Self::OpenAi => true,
+            Self::Ollama | Self::Custom => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_provider")]
+    pub provider: ProviderKind,
+    #[serde(default)]
+    pub base_url: Option<String>,
     pub api_key: String,
     pub active_model: String,
     pub models_cache: Vec<ModelInfo>,
@@ -53,57 +119,12 @@ impl ModelInfo {
 
 impl Default for Config {
     fn default() -> Self {
-        let fallback_models = vec![
-            ModelInfo {
-                id: "google/gemini-2.0-flash-exp:free".to_string(),
-                name: "Google: Gemini 2.0 Flash (free)".to_string(),
-                description: Some("Fast multimodal model with 1M context".to_string()),
-                context_length: Some(1048576),
-                pricing: ModelPricing {
-                    prompt: "0".to_string(),
-                    completion: "0".to_string(),
-                },
-                architecture: None,
-            },
-            ModelInfo {
-                id: "meta-llama/llama-3.3-70b-instruct:free".to_string(),
-                name: "Meta: Llama 3.3 70B Instruct (free)".to_string(),
-                description: Some("State-of-the-art open weights 70B model".to_string()),
-                context_length: Some(131072),
-                pricing: ModelPricing {
-                    prompt: "0".to_string(),
-                    completion: "0".to_string(),
-                },
-                architecture: None,
-            },
-            ModelInfo {
-                id: "deepseek/deepseek-r1:free".to_string(),
-                name: "DeepSeek: R1 (free)".to_string(),
-                description: Some("Advanced reasoning and code analysis model".to_string()),
-                context_length: Some(65536),
-                pricing: ModelPricing {
-                    prompt: "0".to_string(),
-                    completion: "0".to_string(),
-                },
-                architecture: None,
-            },
-            ModelInfo {
-                id: "qwen/qwen-2.5-coder-32b-instruct:free".to_string(),
-                name: "Qwen: Qwen 2.5 Coder 32B Instruct (free)".to_string(),
-                description: Some("Specialized coding & CLI commands model".to_string()),
-                context_length: Some(32768),
-                pricing: ModelPricing {
-                    prompt: "0".to_string(),
-                    completion: "0".to_string(),
-                },
-                architecture: None,
-            },
-        ];
-
         Self {
+            provider: ProviderKind::OpenRouter,
+            base_url: None,
             api_key: String::new(),
-            active_model: "google/gemini-2.0-flash-exp:free".to_string(),
-            models_cache: fallback_models,
+            active_model: String::new(),
+            models_cache: Vec::new(),
             models_cache_updated_at: None,
         }
     }
@@ -142,6 +163,14 @@ impl Config {
             }
             None => true,
         }
+    }
+
+    pub fn set_provider(&mut self, provider: ProviderKind, custom_base_url: Option<String>) {
+        self.provider = provider;
+        self.base_url = custom_base_url;
+        self.models_cache.clear();
+        self.active_model.clear();
+        self.models_cache_updated_at = None;
     }
 
     pub fn update_models_cache(&mut self, models: Vec<ModelInfo>) {

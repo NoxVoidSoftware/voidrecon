@@ -177,8 +177,8 @@ impl App {
         // Load or create config
         let config = Config::load().context("Failed to load config")?;
         
-        // If no API key, we'll prompt for it in the UI
-        let llm_client = LlmClient::new(config.api_key.clone());
+        // Initialize LLM client for configured provider (OpenRouter, OpenAI, Ollama, Custom)
+        let llm_client = LlmClient::from_config(&config);
         
         // For now create a default session
         let session_name = format!("{}_scan", chrono::Local::now().format("%Y-%m-%d"));
@@ -230,7 +230,7 @@ impl App {
             }
         });
         
-        let prompt_api_key = config.api_key.is_empty();
+        let prompt_api_key = config.provider.requires_api_key() && config.api_key.is_empty();
 
         let mut app = Self {
             config,
@@ -267,15 +267,9 @@ impl App {
             last_tick: Instant::now(),
         };
 
-        // Dynamic model discovery on startup (fetch OpenRouter models if cache is older than 24 hours)
-        if app.config.is_cache_stale() {
-            let tx = app.event_tx.clone();
-            let client = app.llm_client.clone();
-            tokio::spawn(async move {
-                if let Ok(models) = client.fetch_models().await {
-                    let _ = tx.send(AppEvent::ModelsLoaded(models));
-                }
-            });
+        // Dynamic model discovery on startup (fetch live models from provider if cache is empty or stale)
+        if app.config.is_cache_stale() || app.config.models_cache.is_empty() {
+            app.trigger_fetch_models();
         }
         
         // Load sidebar
@@ -339,6 +333,7 @@ pub struct UiState {
     pub session_list: Vec<SessionMeta>,
     pub show_api_key_prompt: bool,
     pub api_key_input: String,
+    pub provider_picker_selected: usize,
     pub model_picker_search: String,
     pub model_picker_free_only: bool,
     pub model_picker_selected: usize,

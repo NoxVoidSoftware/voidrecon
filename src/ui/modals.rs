@@ -38,6 +38,7 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
         Line::from("   :findings N - Show findings for target N"),
         Line::from("   :note <txt> - Add a note (info finding)"),
         Line::from("   :models     - Open model picker"),
+        Line::from("   :provider   - LLM setup & provider switcher (openrouter/nvidia/openai/ollama/custom)"),
         Line::from("   :sessions   - Switch or create assessment sessions"),
         Line::from("   :newtab     - New shell tab"),
         Line::from("   :closeshell - Close current tab"),
@@ -80,13 +81,13 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
 }
 
 pub fn render_api_key_modal(f: &mut Frame, app: &App) {
-    let area = centered_rect(65, 35, f.size());
+    let area = centered_rect(72, 45, f.size());
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" OpenRouter API Key Setup (voidrecon) ");
+        .title(" LLM Provider & API Key Setup (voidrecon) ");
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -94,42 +95,109 @@ pub fn render_api_key_modal(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Intro
+            Constraint::Length(2), // Provider tabs
+            Constraint::Length(2), // Description / info
             Constraint::Length(3), // Input box
             Constraint::Length(2), // Hints
         ])
         .split(inner);
 
-    let intro = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("No OpenRouter API key configured in ~/.config/voidrecon/config.json", Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from("Enter your API key to enable LLM assistance:"),
+    let providers = crate::config::ALL_PROVIDERS;
+    let selected_idx = app.ui_state.provider_picker_selected.min(providers.len().saturating_sub(1));
+    let selected_provider = providers[selected_idx];
+
+    // 1. Provider tabs
+    let mut tab_spans = vec![Span::styled(" Provider: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))];
+    for (i, p) in providers.iter().enumerate() {
+        let is_selected = i == selected_idx;
+        if is_selected {
+            tab_spans.push(Span::styled(
+                format!(" [{}] ", p.as_str()),
+                Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            tab_spans.push(Span::styled(
+                format!("  {}  ", p.as_str()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[0]);
+
+    // 2. Info / description
+    let desc = match selected_provider {
+        crate::config::ProviderKind::OpenRouter => {
+            "OpenRouter (openrouter.ai): 100+ models with free tier. API key format: sk-or-v1-..."
+        }
+        crate::config::ProviderKind::NvidiaNim => {
+            "NVIDIA NIM (build.nvidia.com): Fast Llama 3.3, DeepSeek R1 & Nemotron. API key format: nvapi-..."
+        }
+        crate::config::ProviderKind::OpenAi => {
+            "OpenAI (platform.openai.com): GPT-4o, o1, o3-mini. API key format: sk-..."
+        }
+        crate::config::ProviderKind::Ollama => {
+            "Ollama (Local): Runs offline via http://localhost:11434/v1. No API key needed!"
+        }
+        crate::config::ProviderKind::Custom => {
+            "Custom Endpoint: LM Studio, vLLM, Groq, or LocalAI. (API key optional)"
+        }
+    };
+    let desc_para = Paragraph::new(vec![
+        Line::from(Span::styled(desc, Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            format!("Endpoint: {}", selected_provider.default_base_url()),
+            Style::default().fg(Color::DarkGray),
+        )),
     ]);
-    f.render_widget(intro, chunks[0]);
+    f.render_widget(desc_para, chunks[1]);
 
-    let input_text = format!(" Key: {}█", app.ui_state.api_key_input);
-    let input = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
-        .block(Block::default().borders(Borders::ALL).title(" API Key "));
-    f.render_widget(input, chunks[1]);
+    // 3. Input box
+    let title = if selected_provider.requires_api_key() {
+        format!(" {} API Key ", selected_provider.as_str())
+    } else {
+        format!(" {} API Key (Optional) ", selected_provider.as_str())
+    };
 
+    let placeholder = if !selected_provider.requires_api_key() && app.ui_state.api_key_input.is_empty() {
+        " (Not required - press Enter to continue) "
+    } else {
+        ""
+    };
+
+    let input_text = if app.ui_state.api_key_input.is_empty() && !placeholder.is_empty() {
+        Span::styled(placeholder, Style::default().fg(Color::Green).add_modifier(Modifier::ITALIC))
+    } else {
+        Span::styled(format!(" Key: {}█", app.ui_state.api_key_input), Style::default().fg(Color::White))
+    };
+
+    let input = Paragraph::new(Line::from(input_text))
+        .style(Style::default().bg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(input, chunks[2]);
+
+    // 4. Footer navigation hints
     let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" [Tab / ← / →] ", Style::default().bg(Color::Blue).fg(Color::White)),
+        Span::raw(" Switch Provider    "),
         Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
-        Span::raw(" Save & Continue    "),
+        Span::raw(" Save & Start    "),
         Span::styled(" [Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" Skip (LLM disabled)"),
+        Span::raw(" Skip"),
     ]));
-    f.render_widget(footer, chunks[2]);
+    f.render_widget(footer, chunks[3]);
 }
 
 pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     let area = centered_rect(80, 80, f.size());
     f.render_widget(Clear, area);
 
+    let title = format!(
+        " Model Picker: {} (F2/Esc: Close | Enter: Select | F5: Fetch/Refresh | Tab: Toggle Free) ",
+        app.config.provider.as_str()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Model Picker (F2/Esc: Close | Enter: Select | Tab: Toggle Free) ");
+        .title(title);
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -203,6 +271,17 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
         ]).style(style));
     }
     
+    if rows.is_empty() {
+        rows.push(
+            Row::new(vec![
+                "[No models loaded yet - press F5/Ctrl+R to fetch from provider]".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ])
+            .style(Style::default().fg(Color::Yellow)),
+        );
+    }
+
     let table = Table::new(rows, [
         Constraint::Percentage(50),
         Constraint::Percentage(20),

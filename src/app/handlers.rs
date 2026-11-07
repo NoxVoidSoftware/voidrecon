@@ -9,7 +9,10 @@ use crate::app::events::AppEvent;
 use crate::app::state::{App, InputMode, NotifLevel, SidebarNode};
 use crate::db::DatabaseQueries;
 use crate::db::models::Finding;
-use crate::llm::{ChatMessage, LlmRequestState, build_system_prompt, get_tool_definitions, parse_llm_response, POST_EXEC_PROMPT};
+use crate::llm::{
+    ChatMessage, LlmProvider, LlmRequestState, build_system_prompt, get_tool_definitions,
+    parse_llm_response, POST_EXEC_PROMPT,
+};
 use crate::llm::types::ToolCall;
 use crate::pty::tab::PtyTab;
 use crate::ui::render_ui;
@@ -47,15 +50,35 @@ impl App {
             AppEvent::Resize(cols, rows) => self.handle_resize(cols, rows).await?,
             AppEvent::SidebarReload => self.reload_sidebar().await?,
             AppEvent::ModelsLoaded(models) => {
+                let count = models.len();
+                let provider_name = self.config.provider.as_str();
                 self.config.update_models_cache(models);
+                if !self.config.models_cache.is_empty()
+                    && (self.config.active_model.is_empty()
+                        || !self.config.models_cache.iter().any(|m| m.id == self.config.active_model))
+                {
+                    self.config.active_model = self.config.models_cache[0].id.clone();
+                }
                 let _ = self.config.save();
                 self.add_notification(
-                    format!("Updated {} models from OpenRouter", self.config.models_cache.len()),
+                    format!("Fetched {} models from {}", count, provider_name),
                     NotifLevel::Info,
                 );
             }
         }
         Ok(())
+    }
+
+    pub fn trigger_fetch_models(&self) {
+        let tx = self.event_tx.clone();
+        let client = self.llm_client.clone();
+        tokio::spawn(async move {
+            if let Ok(models) = client.fetch_models().await {
+                if !models.is_empty() {
+                    let _ = tx.send(AppEvent::ModelsLoaded(models));
+                }
+            }
+        });
     }
     
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -64,25 +87,41 @@ impl App {
             return Ok(());
         }
 
-        // If API key prompt modal is open, intercept keys
+        // If Provider & API key setup modal is open, intercept keys
         if self.ui_state.show_api_key_prompt {
+            let providers = crate::config::ALL_PROVIDERS;
+            let total_providers = providers.len();
             match key.code {
                 KeyCode::Esc => {
                     self.ui_state.show_api_key_prompt = false;
                     self.add_notification(
-                        "API key prompt skipped - LLM features disabled until key is set".to_string(),
+                        "Setup skipped - LLM features disabled until configured".to_string(),
                         NotifLevel::Warning,
                     );
                 }
-                KeyCode::Enter => {
-                    let key_val = self.ui_state.api_key_input.trim().to_string();
-                    if !key_val.is_empty() {
-                        self.config.api_key = key_val.clone();
-                        let _ = self.config.save();
-                        self.llm_client = crate::llm::LlmClient::new(key_val);
-                        self.add_notification("OpenRouter API key saved".to_string(), NotifLevel::Info);
+                KeyCode::Tab | KeyCode::Right => {
+                    self.ui_state.provider_picker_selected = (self.ui_state.provider_picker_selected + 1) % total_providers;
+                }
+                KeyCode::BackTab | KeyCode::Left => {
+                    if self.ui_state.provider_picker_selected == 0 {
+                        self.ui_state.provider_picker_selected = total_providers - 1;
+                    } else {
+                        self.ui_state.provider_picker_selected -= 1;
                     }
+                }
+                KeyCode::Enter => {
+                    let selected_provider = providers[self.ui_state.provider_picker_selected.min(total_providers - 1)];
+                    let key_val = self.ui_state.api_key_input.trim().to_string();
+                    self.config.set_provider(selected_provider, None);
+                    self.config.api_key = key_val;
+                    let _ = self.config.save();
+                    self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                    self.add_notification(
+                        format!("Configured provider: {}", selected_provider.as_str()),
+                        NotifLevel::Info,
+                    );
                     self.ui_state.show_api_key_prompt = false;
+                    self.trigger_fetch_models();
                 }
                 KeyCode::Char(c) => {
                     self.ui_state.api_key_input.push(c);
@@ -169,6 +208,9 @@ impl App {
                     return Ok(());
                 }
                 (KeyCode::F(2), _) => {
+                    if self.config.models_cache.is_empty() {
+                        self.trigger_fetch_models();
+                    }
                     self.ui_state.show_model_picker = true;
                     return Ok(());
                 }
@@ -217,6 +259,9 @@ impl App {
                 return Ok(());
             }
             (KeyCode::F(2), _) => {
+                if self.config.models_cache.is_empty() {
+                    self.trigger_fetch_models();
+                }
                 self.ui_state.show_model_picker = true;
                 return Ok(());
             }
@@ -301,6 +346,20 @@ impl App {
                 self.ui_state.show_model_picker = false;
                 self.ui_state.model_picker_search.clear();
                 self.ui_state.model_picker_selected = 0;
+            }
+            KeyCode::F(5) => {
+                self.trigger_fetch_models();
+                self.add_notification(
+                    format!("Fetching models from {}...", self.config.provider.as_str()),
+                    NotifLevel::Info,
+                );
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.trigger_fetch_models();
+                self.add_notification(
+                    format!("Fetching models from {}...", self.config.provider.as_str()),
+                    NotifLevel::Info,
+                );
             }
             KeyCode::Up => {
                 if self.ui_state.model_picker_selected > 0 {
@@ -669,7 +728,65 @@ impl App {
                 }
             }
             ":models" => {
+                if self.config.models_cache.is_empty() {
+                    self.trigger_fetch_models();
+                }
                 self.ui_state.show_model_picker = true;
+            }
+            ":provider" => {
+                if parts.len() > 1 {
+                    let subparts: Vec<&str> = parts[1].split_whitespace().collect();
+                    match subparts.first().copied().unwrap_or("") {
+                        "openrouter" => {
+                            self.config.set_provider(crate::config::ProviderKind::OpenRouter, None);
+                            let _ = self.config.save();
+                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            self.add_notification("Switched provider to OpenRouter".to_string(), NotifLevel::Info);
+                            self.trigger_fetch_models();
+                        }
+                        "nvidia" | "nvidianim" | "nim" => {
+                            self.config.set_provider(crate::config::ProviderKind::NvidiaNim, None);
+                            let _ = self.config.save();
+                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            self.add_notification("Switched provider to NVIDIA NIM".to_string(), NotifLevel::Info);
+                            self.trigger_fetch_models();
+                        }
+                        "openai" => {
+                            self.config.set_provider(crate::config::ProviderKind::OpenAi, None);
+                            let _ = self.config.save();
+                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            self.add_notification("Switched provider to OpenAI".to_string(), NotifLevel::Info);
+                            self.trigger_fetch_models();
+                        }
+                        "ollama" => {
+                            let url = subparts.get(1).map(|u| u.to_string());
+                            self.config.set_provider(crate::config::ProviderKind::Ollama, url);
+                            let _ = self.config.save();
+                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            self.add_notification("Switched provider to Ollama (Local)".to_string(), NotifLevel::Info);
+                            self.trigger_fetch_models();
+                        }
+                        "custom" => {
+                            let url = subparts.get(1).map(|u| u.to_string());
+                            self.config.set_provider(crate::config::ProviderKind::Custom, url);
+                            let _ = self.config.save();
+                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            self.add_notification("Switched provider to Custom endpoint".to_string(), NotifLevel::Info);
+                            self.trigger_fetch_models();
+                        }
+                        "setup" | "menu" => {
+                            self.ui_state.show_api_key_prompt = true;
+                        }
+                        other => {
+                            self.add_notification(
+                                format!("Unknown provider '{}'. Supported: openrouter, nvidia, openai, ollama, custom, setup", other),
+                                NotifLevel::Warning,
+                            );
+                        }
+                    }
+                } else {
+                    self.ui_state.show_api_key_prompt = true;
+                }
             }
             ":sessions" => {
                 self.ui_state.session_list = crate::app::state::SessionMeta::list_sessions();
@@ -776,8 +893,11 @@ impl App {
     }
     
     async fn send_llm_query(&mut self, query: &str) -> Result<()> {
-        if self.config.api_key.is_empty() {
-            self.add_notification("OpenRouter API key not configured".to_string(), NotifLevel::Error);
+        if self.llm_client.provider().requires_api_key() && self.config.api_key.trim().is_empty() {
+            self.add_notification(
+                format!("{} API key not configured", self.llm_client.provider().name()),
+                NotifLevel::Error,
+            );
             return Ok(());
         }
 
@@ -859,7 +979,7 @@ impl App {
     }
     
     async fn send_post_exec_analysis(&mut self, cmd: &str, output: &str) -> Result<()> {
-        if self.config.api_key.is_empty() {
+        if self.llm_client.provider().requires_api_key() && self.config.api_key.trim().is_empty() {
             return Ok(());
         }
         

@@ -81,10 +81,6 @@ pub struct StreamChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelListResponse {
-    pub data: Vec<crate::config::ModelInfo>,
-}
 
 /// LLM request state tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

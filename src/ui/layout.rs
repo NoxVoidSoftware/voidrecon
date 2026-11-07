@@ -73,6 +73,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let header = Line::from(vec![
         Span::styled(format!(" session: {} ", app.session_meta.name), Style::default().bg(Color::Blue).fg(Color::White)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" provider: {} ", app.config.provider.as_str()), Style::default().bg(Color::Cyan).fg(Color::Black)),
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" model: {} ", model_display), Style::default().bg(Color::Green).fg(Color::Black)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" [{}] ", tab_name), Style::default().bg(Color::Yellow).fg(Color::Black)),

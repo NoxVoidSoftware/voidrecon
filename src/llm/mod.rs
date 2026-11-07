@@ -3,10 +3,12 @@
 
 pub mod client;
 pub mod context;
+pub mod provider;
 pub mod tools;
 pub mod types;
 
 pub use client::*;
 pub use context::*;
+pub use provider::*;
 pub use tools::*;
 pub use types::*;
