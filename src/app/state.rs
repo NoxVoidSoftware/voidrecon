@@ -180,20 +180,10 @@ impl App {
         // Initialize LLM client for configured provider (OpenRouter, OpenAI, Ollama, Custom)
         let llm_client = LlmClient::from_config(&config);
         
-        // For now create a default session
-        let session_name = format!("{}_scan", chrono::Local::now().format("%Y-%m-%d"));
-        let session_meta = SessionMeta::new(session_name);
-        
-        // Create session directory and workspace
-        std::fs::create_dir_all(&session_meta.path())?;
-        std::fs::create_dir_all(session_meta.workspace_path().join("outputs"))?;
-        std::fs::create_dir_all(session_meta.workspace_path().join("evidence"))?;
-        std::fs::create_dir_all(session_meta.workspace_path().join("artifacts"))?;
-        
-        // Save session metadata
-        session_meta.save()?;
-        
-        let db = Database::new(&session_meta.db_path()).context("Failed to open database")?;
+        // Initialize with in-memory database and placeholder session until user selects or creates a session
+        let db = Database::in_memory().context("Failed to initialize temporary database")?;
+        let session_meta = SessionMeta::new("None".to_string());
+        let session_list = SessionMeta::list_sessions();
         
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         
@@ -238,6 +228,12 @@ impl App {
             llm_client,
             session_meta,
             ui_state: UiState {
+                show_session_picker: true,
+                is_initial_session_select: true,
+                session_picker_selected: 0,
+                session_list,
+                session_naming_mode: false,
+                session_name_input: String::new(),
                 show_api_key_prompt: prompt_api_key,
                 ..UiState::default()
             },
@@ -286,7 +282,10 @@ impl App {
     pub async fn switch_session(&mut self, session_name: String) -> Result<()> {
         let meta_path = SessionMeta::sessions_dir().join(&session_name).join("session.json");
         let session_meta = if meta_path.exists() {
-            SessionMeta::load(&meta_path)?
+            let mut meta = SessionMeta::load(&meta_path)?;
+            meta.last_activity = Utc::now();
+            let _ = meta.save();
+            meta
         } else {
             let meta = SessionMeta::new(session_name);
             std::fs::create_dir_all(&meta.path())?;
@@ -304,7 +303,8 @@ impl App {
         self.active_tab = 0;
         self.active_target_id = None;
         self.reload_sidebar().await?;
-        self.add_notification(format!("Switched to session: {}", self.session_meta.name), NotifLevel::Info);
+        self.ui_state.session_list = SessionMeta::list_sessions();
+        self.add_notification(format!("Active session: {}", self.session_meta.name), NotifLevel::Info);
         Ok(())
     }
 }
@@ -329,6 +329,9 @@ pub struct UiState {
     pub show_help: bool,
     pub show_model_picker: bool,
     pub show_session_picker: bool,
+    pub is_initial_session_select: bool,
+    pub session_naming_mode: bool,
+    pub session_name_input: String,
     pub session_picker_selected: usize,
     pub session_list: Vec<SessionMeta>,
     pub show_api_key_prompt: bool,

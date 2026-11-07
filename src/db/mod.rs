@@ -24,6 +24,12 @@ impl Database {
         Ok(Self { conn })
     }
 
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Failed to open database")?;
+        schema::init_database(&conn)?;
+        Ok(Self { conn })
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }

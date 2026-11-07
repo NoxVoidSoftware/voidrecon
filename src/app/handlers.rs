@@ -87,6 +87,12 @@ impl App {
             return Ok(());
         }
 
+        // If Session Picker modal is open, handle session picker keys first
+        if self.ui_state.show_session_picker {
+            self.handle_session_picker_key(key).await?;
+            return Ok(());
+        }
+
         // If Provider & API key setup modal is open, intercept keys
         if self.ui_state.show_api_key_prompt {
             let providers = crate::config::ALL_PROVIDERS;
@@ -157,12 +163,6 @@ impl App {
                 }
                 _ => {}
             }
-            return Ok(());
-        }
-
-        // If Session Picker modal is open, handle session picker keys
-        if self.ui_state.show_session_picker {
-            self.handle_session_picker_key(key).await?;
             return Ok(());
         }
 
@@ -335,10 +335,57 @@ impl App {
     }
 
     async fn handle_session_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.ui_state.session_naming_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.ui_state.session_naming_mode = false;
+                    self.ui_state.session_name_input.clear();
+                }
+                KeyCode::Enter => {
+                    let raw = self.ui_state.session_name_input.trim();
+                    let session_name = if raw.is_empty() {
+                        format!("{}_scan", chrono::Local::now().format("%Y-%m-%d_%H%M%S"))
+                    } else {
+                        // Sanitize filename: replace invalid chars with '_'
+                        raw.chars().map(|c| {
+                            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                                c
+                            } else {
+                                '_'
+                            }
+                        }).collect::<String>()
+                    };
+
+                    self.switch_session(session_name).await?;
+                    self.ui_state.session_naming_mode = false;
+                    self.ui_state.session_name_input.clear();
+                    self.ui_state.show_session_picker = false;
+                    self.ui_state.is_initial_session_select = false;
+                }
+                KeyCode::Backspace => {
+                    self.ui_state.session_name_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ' {
+                        let c = if c == ' ' { '-' } else { c };
+                        if self.ui_state.session_name_input.len() < 50 {
+                            self.ui_state.session_name_input.push(c);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         let total_rows = 1 + self.ui_state.session_list.len();
         match key.code {
             KeyCode::Esc => {
-                self.ui_state.show_session_picker = false;
+                if self.ui_state.is_initial_session_select {
+                    self.ui_state.should_quit = true;
+                } else {
+                    self.ui_state.show_session_picker = false;
+                }
             }
             KeyCode::Up => {
                 if self.ui_state.session_picker_selected > 0 {
@@ -353,13 +400,14 @@ impl App {
             KeyCode::Enter => {
                 let selected = self.ui_state.session_picker_selected;
                 if selected == 0 {
-                    let session_name = format!("{}_scan", chrono::Local::now().format("%Y-%m-%d_%H%M%S"));
-                    self.switch_session(session_name).await?;
+                    self.ui_state.session_naming_mode = true;
+                    self.ui_state.session_name_input.clear();
                 } else if let Some(s) = self.ui_state.session_list.get(selected - 1) {
                     let name = s.name.clone();
                     self.switch_session(name).await?;
+                    self.ui_state.show_session_picker = false;
+                    self.ui_state.is_initial_session_select = false;
                 }
-                self.ui_state.show_session_picker = false;
             }
             _ => {}
         }
@@ -900,6 +948,9 @@ impl App {
             ":sessions" => {
                 self.ui_state.session_list = crate::app::state::SessionMeta::list_sessions();
                 self.ui_state.session_picker_selected = 0;
+                self.ui_state.session_naming_mode = false;
+                self.ui_state.session_name_input.clear();
+                self.ui_state.is_initial_session_select = false;
                 self.ui_state.show_session_picker = true;
             }
             ":newtab" => {

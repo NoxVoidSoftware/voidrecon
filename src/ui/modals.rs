@@ -385,13 +385,95 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
 }
 
 pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
-    let area = centered_rect(70, 60, f.size());
+    if app.ui_state.session_naming_mode {
+        let area = centered_rect(65, 36, f.size());
+        f.render_widget(Clear, area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" 📝 Create New Assessment Session ");
+        let inner_area = block.inner(area);
+        f.render_widget(block, area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // Prompt instruction
+                Constraint::Length(3), // Input box
+                Constraint::Length(2), // Hint / path preview
+                Constraint::Min(0),    // Space
+                Constraint::Length(1), // Footer controls
+            ])
+            .split(inner_area);
+
+        let prompt = Paragraph::new(Line::from(vec![
+            Span::styled("Enter a name for the new session (alphanumeric, '-', '_'):", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]));
+        f.render_widget(prompt, chunks[0]);
+
+        let cursor_char = if app.ui_state.tick_count % 10 < 5 { "█" } else { " " };
+        let input_line = if app.ui_state.session_name_input.is_empty() {
+            Line::from(vec![
+                Span::styled("  > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("e.g. corp-network-audit", Style::default().fg(Color::DarkGray)),
+                Span::styled(cursor_char, Style::default().fg(Color::Cyan)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("  > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(&app.ui_state.session_name_input, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(cursor_char, Style::default().fg(Color::Cyan)),
+            ])
+        };
+
+        let input_box = Paragraph::new(input_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        f.render_widget(input_box, chunks[1]);
+
+        let default_suggestion = format!("{}_scan", chrono::Local::now().format("%Y-%m-%d"));
+        let hint_line = if app.ui_state.session_name_input.is_empty() {
+            Line::from(vec![
+                Span::styled("  ℹ Leave empty and press Enter for default: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(default_suggestion, Style::default().fg(Color::Green)),
+            ])
+        } else {
+            let clean: String = app.ui_state.session_name_input.chars().map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }
+            }).collect();
+            Line::from(vec![
+                Span::styled("  📁 Will create: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("~/.config/voidrecon/sessions/{}/", clean), Style::default().fg(Color::Green)),
+            ])
+        };
+        f.render_widget(Paragraph::new(hint_line), chunks[2]);
+
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+            Span::raw(" Create & Enter Session    "),
+            Span::styled(" [Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Span::raw(" Back to Sessions List"),
+        ]));
+        f.render_widget(footer, chunks[4]);
+        return;
+    }
+
+    let area = centered_rect(75, 60, f.size());
     f.render_widget(Clear, area);
+
+    let title = if app.ui_state.is_initial_session_select {
+        " 🎯 Select or Create Assessment Session (Enter: Select | Esc: Quit) "
+    } else {
+        " 🎯 Assessment Sessions (Enter: Select | Esc: Close) "
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" Assessment Sessions (Enter: Select/Create | Esc: Close) ");
+        .title(title);
     let inner_area = block.inner(area);
     f.render_widget(block, area);
 
@@ -404,10 +486,17 @@ pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
         ])
         .split(inner_area);
 
-    let intro = Paragraph::new(Line::from(vec![
-        Span::styled("Current Session: ", Style::default().fg(Color::Gray)),
-        Span::styled(&app.session_meta.name, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-    ]));
+    let intro = if app.ui_state.is_initial_session_select {
+        Paragraph::new(Line::from(vec![
+            Span::styled("Welcome to VoidRecon! ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Choose an existing assessment session or create a new one to enter:", Style::default().fg(Color::White)),
+        ]))
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled("Current Session: ", Style::default().fg(Color::Gray)),
+            Span::styled(&app.session_meta.name, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]))
+    };
     f.render_widget(intro, chunks[0]);
 
     // Rows: First is [+ Create New Session], followed by existing sessions
@@ -415,7 +504,7 @@ pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
     let is_create_selected = app.ui_state.session_picker_selected == 0;
     rows.push(
         Row::new(vec![
-            "[+ Create New Session (auto-generated timestamp)]".to_string(),
+            "[+ Create New Session (Enter custom name)]".to_string(),
             "-".to_string(),
             "-".to_string(),
         ])
@@ -428,7 +517,7 @@ pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
 
     for (idx, s) in app.ui_state.session_list.iter().enumerate() {
         let is_selected = idx + 1 == app.ui_state.session_picker_selected;
-        let is_current = s.name == app.session_meta.name;
+        let is_current = !app.ui_state.is_initial_session_select && s.name == app.session_meta.name;
         let prefix = if is_current { "* " } else { "  " };
 
         let style = if is_selected {
@@ -466,13 +555,19 @@ pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {
 
     f.render_stateful_widget(table, chunks[1], &mut state);
 
+    let esc_label = if app.ui_state.is_initial_session_select {
+        " Quit"
+    } else {
+        " Cancel"
+    };
+
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" [↑/↓] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::raw(" Navigate    "),
         Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black)),
         Span::raw(" Select / Create    "),
         Span::styled(" [Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" Cancel"),
+        Span::raw(esc_label),
     ]));
     f.render_widget(footer, chunks[2]);
 }

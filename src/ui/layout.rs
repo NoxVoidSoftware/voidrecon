@@ -36,8 +36,7 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
     }
     if app.ui_state.show_session_picker {
         crate::ui::modals::render_session_picker_modal(f, app);
-    }
-    if app.ui_state.show_api_key_prompt {
+    } else if app.ui_state.show_api_key_prompt {
         crate::ui::modals::render_api_key_modal(f, app);
     }
     
