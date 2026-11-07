@@ -1,11 +1,12 @@
 //! Application events for voidrecon
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use crate::llm::types::ToolCall;
 
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     PtyData(usize, Vec<u8>),
     PtyExited(usize, i32),
     LlmChunk(u64, String),

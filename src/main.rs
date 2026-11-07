@@ -11,6 +11,7 @@ mod ui;
 use anyhow::Result;
 use app::App;
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -23,7 +24,7 @@ struct TermGuard;
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -33,7 +34,7 @@ async fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
         original_hook(panic_info);
     }));
 
@@ -41,7 +42,7 @@ async fn main() -> Result<()> {
 
     // Setup terminal
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 

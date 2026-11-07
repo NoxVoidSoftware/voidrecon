@@ -49,6 +49,10 @@ impl App {
                 self.handle_key(key).await?;
                 Ok(true)
             }
+            AppEvent::Mouse(mouse) => {
+                self.handle_mouse(mouse).await?;
+                Ok(true)
+            }
             AppEvent::PtyData(tab_id, data) => {
                 self.handle_pty_data(tab_id, data).await?;
                 Ok(true)
@@ -836,6 +840,7 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
                 if self.suggestion_visible && self.input_buffer.is_empty() {
                     match c {
                         'r' => {
@@ -904,6 +909,11 @@ impl App {
                 }
             }
             KeyCode::Up => {
+                if self.ui_state.focus == crate::app::state::WindowFocus::ChatLog {
+                    self.ui_state.log_at_bottom = false;
+                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_sub(1);
+                    return Ok(());
+                }
                 if let Some(idx) = self.history_index {
                     if idx > 0 {
                         self.history_index = Some(idx - 1);
@@ -921,6 +931,10 @@ impl App {
                 }
             }
             KeyCode::Down => {
+                if self.ui_state.focus == crate::app::state::WindowFocus::ChatLog {
+                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(1);
+                    return Ok(());
+                }
                 if let Some(idx) = self.history_index {
                     if idx + 1 < self.command_history.len() {
                         self.history_index = Some(idx + 1);
@@ -1937,6 +1951,88 @@ impl App {
         Ok(())
     }
     
+    pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use crate::app::state::WindowFocus;
+
+        let term_rows = self.terminal_size.1;
+        let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // If any modal is showing, do not change focus
+                if self.ui_state.show_model_picker
+                    || self.ui_state.show_session_picker
+                    || self.ui_state.show_api_key_prompt
+                    || self.ui_state.show_help
+                {
+                    return Ok(());
+                }
+
+                // Check tab bar click (row 1)
+                if mouse.row == 1 && mouse.column >= sidebar_width {
+                    let col_in_tabs = mouse.column.saturating_sub(sidebar_width);
+                    if col_in_tabs < 24 {
+                        self.active_tab = 0;
+                    } else {
+                        let shell_tab_idx = (col_in_tabs.saturating_sub(24) / 16) as usize;
+                        if shell_tab_idx < self.tabs.len() {
+                            self.active_tab = shell_tab_idx + 1;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // In Tab 0:
+                if self.active_tab == 0 {
+                    // Check if clicked in sidebar
+                    if !self.ui_state.sidebar_collapsed && mouse.column < sidebar_width {
+                        self.ui_state.focus = WindowFocus::Sidebar;
+                        let target_idx = (mouse.row.saturating_sub(2) as usize) / 2;
+                        if target_idx < self.sidebar_nodes.len() {
+                            let tid = self.sidebar_nodes[target_idx].target.id;
+                            self.active_target_id = Some(tid);
+                        }
+                        return Ok(());
+                    }
+
+                    // Input line is at row term_rows - 2 (footer is term_rows - 1)
+                    let input_row = term_rows.saturating_sub(2);
+                    let suggestion_height = if self.suggestion_visible { 5 } else { 0 };
+                    let approval_height = if self.pending_exploit_approval.is_some() { 5 } else { 0 };
+                    let panels_height = suggestion_height + approval_height;
+                    let input_area_start = input_row.saturating_sub(panels_height as u16);
+
+                    if mouse.row >= input_area_start {
+                        // Clicked on input line or action panels -> focus input
+                        self.ui_state.focus = WindowFocus::Input;
+                        let prompt_len = 2; // "> " or "? "
+                        let click_col = mouse.column.saturating_sub(sidebar_width + prompt_len);
+                        self.ui_state.input_cursor = (click_col as usize).min(self.input_buffer.len());
+                    } else if mouse.row >= 2 {
+                        // Clicked inside the chat / log window -> focus chat window
+                        self.ui_state.focus = WindowFocus::ChatLog;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if self.active_tab == 0 {
+                    self.ui_state.focus = WindowFocus::ChatLog;
+                    self.ui_state.log_at_bottom = false;
+                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.active_tab == 0 {
+                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(3);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     pub fn add_notification(&mut self, message: String, level: NotifLevel) {
         self.notifications.push(crate::app::state::Notification {
             message,

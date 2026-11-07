@@ -253,6 +253,10 @@ impl App {
                             break;
                         }
                     }
+                } else if let Ok(crossterm::event::Event::Mouse(mouse)) = event {
+                    if tx_keys.send(AppEvent::Mouse(mouse)).is_err() {
+                        break;
+                    }
                 } else if let Ok(crossterm::event::Event::Resize(cols, rows)) = event {
                     if tx_keys.send(AppEvent::Resize(cols, rows)).is_err() {
                         break;
@@ -445,9 +449,23 @@ impl SessionMeta {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFocus {
+    ChatLog,
+    Input,
+    Sidebar,
+}
+
+impl Default for WindowFocus {
+    fn default() -> Self {
+        WindowFocus::Input
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct UiState {
     pub should_quit: bool,
+    pub focus: WindowFocus,
     pub show_help: bool,
     pub show_model_picker: bool,
     pub show_session_picker: bool,

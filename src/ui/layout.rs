@@ -173,8 +173,18 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     }
     
     let items_len = items.len();
+    let border_color = if app.ui_state.focus == crate::app::state::WindowFocus::Sidebar {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::RIGHT).title(" Targets "))
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(border_color))
+                .title(" Targets "),
+        )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));
     
     let mut state = ListState::default();
@@ -422,8 +432,19 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         (scroll, title)
     };
 
+    let (border_color, focus_badge) = match app.ui_state.focus {
+        crate::app::state::WindowFocus::ChatLog => (Color::Cyan, " [FOCUSED - Scroll with Wheel/Keys] "),
+        _ => (Color::DarkGray, ""),
+    };
+    let title = format!("{}{}", title, focus_badge);
+
     let log = Paragraph::new(display_lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(title),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset as u16, 0));
 
@@ -486,9 +507,21 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let (mode_indicator, mode_style) = match app.input_mode {
-        InputMode::Shell => ("> ", Style::default().fg(Color::Green)),
-        InputMode::LlmQuery => ("? ", Style::default().fg(Color::Cyan)),
-        InputMode::EditCommand => ("e ", Style::default().fg(Color::Yellow)),
+        InputMode::Shell => {
+            if app.ui_state.focus == crate::app::state::WindowFocus::Input {
+                ("> ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else {
+                ("> ", Style::default().fg(Color::DarkGray))
+            }
+        }
+        InputMode::LlmQuery => (
+            "? ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        InputMode::EditCommand => (
+            "e ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
     };
     
     let input = Paragraph::new(Line::from(vec![
@@ -500,11 +533,13 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
     
     f.render_widget(input, area);
     
-    // Set cursor position: accurately calculated and bounded
-    let cursor_offset = app.ui_state.input_cursor.min(app.input_buffer.len());
-    let cursor_x = (area.x + mode_indicator.len() as u16 + cursor_offset as u16)
-        .min(area.x + area.width.saturating_sub(1));
-    f.set_cursor(cursor_x, area.y);
+    // Set cursor position: accurately calculated and bounded when input is focused
+    if app.ui_state.focus == crate::app::state::WindowFocus::Input {
+        let cursor_offset = app.ui_state.input_cursor.min(app.input_buffer.len());
+        let cursor_x = (area.x + mode_indicator.len() as u16 + cursor_offset as u16)
+            .min(area.x + area.width.saturating_sub(1));
+        f.set_cursor(cursor_x, area.y);
+    }
 }
 
 fn render_shell_tab(f: &mut Frame, app: &mut App, area: Rect) {
