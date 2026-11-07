@@ -54,7 +54,8 @@ pub enum ApprovalKind {
         script_name: String,
         command_line: String,
     },
-    SaveEvidence {
+    SaveWorkspaceFile {
+        folder: String,
         filename: String,
         description: String,
         content: String,

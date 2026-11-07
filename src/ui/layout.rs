@@ -265,10 +265,10 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" Target: {} (ID {}) │ Script: {} │ Command: {}", approval.target_ip, approval.target_id, script_name, command_line),
                 " [y / Enter] Approve & Execute Exploit ",
             ),
-            crate::app::state::ApprovalKind::SaveEvidence { filename, description, .. } => (
-                " LLM requests saving evidence file:",
-                format!(" Target: {} (ID {}) │ File: workspace/evidence/{} │ Desc: {}", approval.target_ip, approval.target_id, filename, description),
-                " [y / Enter] Approve & Save Evidence ",
+            crate::app::state::ApprovalKind::SaveWorkspaceFile { folder, filename, description, .. } => (
+                " LLM requests saving workspace file:",
+                format!(" Target: {} (ID {}) │ File: workspace/{}/{} │ Desc: {}", approval.target_ip, approval.target_id, folder, filename, description),
+                " [y / Enter] Approve & Save File ",
             ),
         };
         let content = vec![

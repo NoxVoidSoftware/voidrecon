@@ -125,17 +125,34 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new_function(
-            "save_evidence",
-            "Save evidence or scan findings to workspace/evidence/<filename>. NOTE: Requires interactive user approval in the TUI before any file is saved.",
+            "save_workspace_file",
+            "Save evidence, artifacts, or notes into the session workspace (workspace/evidence/ or workspace/artifacts/). NOTE: Requires interactive user approval in the TUI before the file is written to disk.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "filename": {"type": "string", "description": "Filename, e.g. 'nmap_scan.txt' or 'extracted_hashes.txt'"},
-                    "content": {"type": "string", "description": "Text content of the evidence to save"},
-                    "description": {"type": "string", "description": "Short description of the evidence for user approval"},
-                    "target_id": {"type": "integer", "description": "Target ID (defaults to active target)"}
+                    "folder": {
+                        "type": "string",
+                        "enum": ["evidence", "artifacts", "exploits"],
+                        "description": "Destination subfolder in workspace"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Filename, e.g. 'nmap_scan_full.txt', 'admin_creds.txt', 'notes.md'"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File text content"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the file or evidence for user approval"
+                    },
+                    "target_id": {
+                        "type": "integer",
+                        "description": "Target ID associated with this file (defaults to active target)"
+                    }
                 },
-                "required": ["filename", "content"]
+                "required": ["folder", "filename", "content"]
             }),
         ),
         ToolDefinition::new_function(
@@ -753,14 +770,21 @@ pub async fn execute_tool_call(
                 "explanation": explanation
             }))
         }
-        "save_evidence" => {
+        "save_workspace_file" => {
+            let folder = args.get("folder").and_then(|v| v.as_str()).unwrap_or("evidence");
             let filename = args.get("filename").and_then(|v| v.as_str()).context("Missing filename")?;
             let content = args.get("content").and_then(|v| v.as_str()).context("Missing content")?;
             let description = args.get("description").and_then(|v| v.as_str()).unwrap_or("");
             let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id);
 
+            let valid_folder = match folder {
+                "evidence" | "artifacts" | "exploits" => folder,
+                _ => "evidence",
+            };
+
             Ok(serde_json::json!({
                 "status": "requires_approval",
+                "folder": valid_folder,
                 "filename": filename,
                 "description": description,
                 "content": content,

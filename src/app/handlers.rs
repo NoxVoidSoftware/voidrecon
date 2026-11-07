@@ -336,39 +336,51 @@ impl App {
                             }
                             self.ui_state.log_at_bottom = true;
                         }
-                        crate::app::state::ApprovalKind::SaveEvidence { filename, description, content } => {
-                            let target_dir = self.session_meta.workspace_path().join("evidence");
+                        crate::app::state::ApprovalKind::SaveWorkspaceFile { folder, filename, description, content } => {
+                            let target_dir = self.session_meta.workspace_path().join(&folder);
                             let _ = std::fs::create_dir_all(&target_dir);
                             let file_path = target_dir.join(&filename);
                             match std::fs::write(&file_path, &content) {
                                 Ok(_) => {
-                                    let rel_path = format!("workspace/evidence/{}", filename);
-                                    let title = if description.is_empty() {
-                                        format!("Evidence: {}", filename)
-                                    } else {
-                                        format!("Evidence: {} ({})", filename, description)
-                                    };
-                                    let _ = DatabaseQueries::add_finding(
-                                        self.db.conn(),
-                                        approval.target_id,
-                                        &title,
-                                        &description,
-                                        "info",
-                                        None,
-                                        Some(100),
-                                        Some(&rel_path),
-                                    );
+                                    let rel_path = format!("workspace/{}/{}", folder, filename);
+                                    if folder == "evidence" {
+                                        let title = if description.is_empty() {
+                                            format!("Evidence: {}", filename)
+                                        } else {
+                                            format!("Evidence: {} ({})", filename, description)
+                                        };
+                                        let _ = DatabaseQueries::add_finding(
+                                            self.db.conn(),
+                                            approval.target_id,
+                                            &title,
+                                            &description,
+                                            "info",
+                                            None,
+                                            Some(100),
+                                            Some(&rel_path),
+                                        );
+                                    } else if folder == "artifacts" {
+                                        let note_text = if description.is_empty() {
+                                            format!("Saved artifact: {}", rel_path)
+                                        } else {
+                                            format!("Saved artifact {}: {}", rel_path, description)
+                                        };
+                                        let _ = DatabaseQueries::add_note(self.db.conn(), approval.target_id, &note_text);
+                                    }
+
                                     self.append_chat_message(ChatMessage {
                                         role: "tool".to_string(),
                                         content: serde_json::json!({
                                             "status": "approved_and_saved",
+                                            "folder": folder,
+                                            "file": filename,
                                             "path": rel_path,
                                             "bytes": content.len()
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
                                     });
-                                    self.add_notification(format!("Approved & saved evidence: {}", filename), NotifLevel::Info);
+                                    self.add_notification(format!("Approved & saved: {}", rel_path), NotifLevel::Info);
                                     let _ = self.reload_sidebar().await;
                                 }
                                 Err(e) => {
@@ -381,7 +393,7 @@ impl App {
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
                                     });
-                                    self.add_notification(format!("Failed to save evidence: {}", e), NotifLevel::Error);
+                                    self.add_notification(format!("Failed to save file: {}", e), NotifLevel::Error);
                                 }
                             }
                         }
@@ -394,7 +406,7 @@ impl App {
                     let reject_msg = match &approval.kind {
                         crate::app::state::ApprovalKind::ReverseShellListener { .. } => "User rejected spawning reverse shell listener",
                         crate::app::state::ApprovalKind::ExecuteExploit { .. } => "User rejected exploit script execution",
-                        crate::app::state::ApprovalKind::SaveEvidence { .. } => "User rejected saving evidence file",
+                        crate::app::state::ApprovalKind::SaveWorkspaceFile { .. } => "User rejected saving workspace file",
                     };
                     self.append_chat_message(ChatMessage {
                         role: "tool".to_string(),
@@ -1711,7 +1723,7 @@ impl App {
                     }
                 }
 
-                if tool_call.function.name == "save_evidence" {
+                if tool_call.function.name == "save_workspace_file" {
                     let target_id = result.get("target_id").and_then(|v| v.as_i64()).or(self.active_target_id).unwrap_or(0);
                     let target_ip = if target_id > 0 {
                         DatabaseQueries::get_target(self.db.conn(), target_id)
@@ -1723,14 +1735,16 @@ impl App {
                         "active_target".to_string()
                     };
 
-                    let filename = result.get("filename").and_then(|v| v.as_str()).unwrap_or("evidence.txt").to_string();
+                    let folder = result.get("folder").and_then(|v| v.as_str()).unwrap_or("evidence").to_string();
+                    let filename = result.get("filename").and_then(|v| v.as_str()).unwrap_or("file.txt").to_string();
                     let description = result.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let content = result.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
                     self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
                         target_id,
                         target_ip,
-                        kind: crate::app::state::ApprovalKind::SaveEvidence {
+                        kind: crate::app::state::ApprovalKind::SaveWorkspaceFile {
+                            folder,
                             filename: filename.clone(),
                             description,
                             content,
@@ -1738,7 +1752,7 @@ impl App {
                         tool_call: tool_call.clone(),
                     });
                     self.add_notification(
-                        format!("Approval required to save evidence to {}", filename),
+                        format!("Approval required to save file to {}", filename),
                         NotifLevel::Warning,
                     );
                     return Ok(());
