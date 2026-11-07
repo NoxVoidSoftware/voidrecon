@@ -1,0 +1,60 @@
+[package]
+name = "voidrecon"
+version = "0.1.0"
+edition = "2021"
+description = "Production-grade interactive TUI terminal application for security auditing, CLI workflows, and LLM-assisted terminal operations. Developed under NoxVoid Software."
+authors = ["NoxVoid Software"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# TUI
+ratatui = { version = "0.26", features = ["crossterm"] }
+crossterm = { version = "0.27", features = ["event-stream"] }
+
+# Async runtime
+tokio = { version = "1.38", features = ["full", "rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-std", "net", "signal"] }
+
+# PTY & terminal emulation
+portable-pty = "0.8"
+vt100 = "0.15"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite", "serde_json"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "cookies", "multipart"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+
+# Utilities
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.7", features = ["v4", "serde", "fast-rng"] }
+lazy_static = "1.4"
+parking_lot = "0.12"
+notify = "6.1"
+tempfile = "3.8"
+futures-util = "0.3"
+sha2 = "0.10"
+which = "6.0"
+
+# Terminal size detection
+terminal_size = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+debug = true
+
+[workspace]
+resolver = "2"
