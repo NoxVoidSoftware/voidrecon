@@ -208,40 +208,103 @@ impl App {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.pending_exploit_approval = None;
-                    match self.spawn_listener_tab(approval.lport).await {
-                        Ok(()) => {
-                            self.append_chat_message(ChatMessage {
-                                role: "tool".to_string(),
-                                content: serde_json::json!({
-                                    "status": "approved",
-                                    "message": format!("Listener spawned on port {}", approval.lport),
-                                    "target_id": approval.target_id,
-                                    "lhost": approval.lhost,
-                                    "lport": approval.lport,
-                                    "shell_type": approval.shell_type,
-                                }).to_string(),
-                                tool_calls: None,
-                                tool_call_id: Some(approval.tool_call.id),
-                            });
-                            self.add_notification(
-                                format!("Spawned listener on port {}", approval.lport),
-                                NotifLevel::Info,
-                            );
+                    match &approval.kind {
+                        crate::app::state::ApprovalKind::ReverseShellListener { lhost, lport, shell_type } => {
+                            match self.spawn_listener_tab(*lport).await {
+                                Ok(()) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "approved",
+                                            "message": format!("Listener spawned on port {}", lport),
+                                            "target_id": approval.target_id,
+                                            "lhost": lhost,
+                                            "lport": lport,
+                                            "shell_type": shell_type,
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(
+                                        format!("Spawned listener on port {}", lport),
+                                        NotifLevel::Info,
+                                    );
+                                }
+                                Err(e) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "error",
+                                            "message": format!("Failed to spawn listener on port {}: {}", lport, e),
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(
+                                        format!("Failed to spawn listener: {}", e),
+                                        NotifLevel::Error,
+                                    );
+                                }
+                            }
                         }
-                        Err(e) => {
+                        crate::app::state::ApprovalKind::ExecuteExploit { script_name, command_line } => {
+                            let start = Instant::now();
                             self.append_chat_message(ChatMessage {
-                                role: "tool".to_string(),
-                                content: serde_json::json!({
-                                    "status": "error",
-                                    "message": format!("Failed to spawn listener on port {}: {}", approval.lport, e),
-                                }).to_string(),
+                                role: "user".to_string(),
+                                content: format!("$ {}", command_line),
                                 tool_calls: None,
-                                tool_call_id: Some(approval.tool_call.id),
+                                tool_call_id: None,
                             });
-                            self.add_notification(
-                                format!("Failed to spawn listener: {}", e),
-                                NotifLevel::Error,
-                            );
+
+                            let output_result = self.run_command_capture(command_line).await;
+                            let duration_ms = start.elapsed().as_millis() as i64;
+
+                            match output_result {
+                                Ok(out) => {
+                                    let lines: Vec<&str> = out.lines().collect();
+                                    self.append_chat_message(ChatMessage {
+                                        role: "output".to_string(),
+                                        content: out.clone(),
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                    });
+
+                                    let tool_out = if lines.len() > 30 {
+                                        let top = lines[..25].join("\n");
+                                        format!("{}\n... [truncated {} lines, full output displayed above] ...", top, lines.len() - 25)
+                                    } else {
+                                        out.clone()
+                                    };
+
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "executed",
+                                            "script": script_name,
+                                            "exit_code": 0,
+                                            "duration_ms": duration_ms,
+                                            "output": tool_out
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(format!("Exploit executed ({})", script_name), NotifLevel::Info);
+                                }
+                                Err(e) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "execution_failed",
+                                            "script": script_name,
+                                            "error": e.to_string()
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(format!("Exploit failed: {}", e), NotifLevel::Error);
+                                }
+                            }
+                            self.ui_state.log_at_bottom = true;
                         }
                     }
                     self.continue_llm_conversation().await?;
@@ -249,16 +312,20 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.pending_exploit_approval = None;
+                    let reject_msg = match &approval.kind {
+                        crate::app::state::ApprovalKind::ReverseShellListener { .. } => "User rejected spawning reverse shell listener",
+                        crate::app::state::ApprovalKind::ExecuteExploit { .. } => "User rejected exploit script execution",
+                    };
                     self.append_chat_message(ChatMessage {
                         role: "tool".to_string(),
                         content: serde_json::json!({
                             "status": "rejected",
-                            "message": "User rejected spawning reverse shell listener"
+                            "message": reject_msg
                         }).to_string(),
                         tool_calls: None,
                         tool_call_id: Some(approval.tool_call.id),
                     });
-                    self.add_notification("Reverse shell listener rejected".to_string(), NotifLevel::Info);
+                    self.add_notification("Action rejected".to_string(), NotifLevel::Info);
                     self.continue_llm_conversation().await?;
                     return Ok(());
                 }
@@ -1130,11 +1197,21 @@ impl App {
     }
     
     async fn run_command_capture(&self, cmd: &str) -> Result<String> {
-        let output = tokio::process::Command::new("cmd")
-            .args(["/C", cmd])
-            .output()
-            .await
-            .context("Failed to execute command")?;
+        let ws_path = self.session_meta.workspace_path();
+        let _ = std::fs::create_dir_all(&ws_path);
+
+        #[cfg(target_os = "windows")]
+        let mut command = tokio::process::Command::new("cmd");
+        #[cfg(target_os = "windows")]
+        command.args(["/C", cmd]);
+
+        #[cfg(not(target_os = "windows"))]
+        let mut command = tokio::process::Command::new("sh");
+        #[cfg(not(target_os = "windows"))]
+        command.args(["-c", cmd]);
+
+        command.current_dir(&ws_path);
+        let output = command.output().await.context("Failed to execute command")?;
         
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1199,22 +1276,49 @@ impl App {
             &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+            Some(&self.session_meta.workspace_path()),
         );
         
-        let messages = vec![
+        let mut messages = vec![
             ChatMessage {
                 role: "system".to_string(),
                 content: system_prompt,
                 tool_calls: None,
                 tool_call_id: None,
             },
-            ChatMessage {
-                role: "user".to_string(),
-                content: query.to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-            },
         ];
+
+        // Include recent conversational turns (last 6 messages) for multi-turn coherence
+        let history_start = self.chat_log.len().saturating_sub(6);
+        for msg in &self.chat_log[history_start..] {
+            if msg.role == "user" && msg.content.starts_with('?') {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: msg.content.trim_start_matches("? ").to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            } else if msg.role == "assistant" && !msg.content.is_empty() {
+                let content = if msg.content.len() > 800 {
+                    format!("{}...", &msg.content[..800])
+                } else {
+                    msg.content.clone()
+                };
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: query.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
         
         let request_id = self.next_request_id();
         let request = crate::llm::types::ChatCompletionRequest {
@@ -1351,10 +1455,54 @@ impl App {
                     &tool_call,
                     &self.db,
                     self.active_target_id,
+                    &self.session_meta.workspace_path(),
                     &self.event_tx,
                 ).await?;
+
+                if tool_call.function.name == "save_exploit_script" {
+                    if let Some(path) = result.get("path").and_then(|v| v.as_str()) {
+                        self.add_notification(
+                            format!("Saved exploit to {}", path),
+                            NotifLevel::Info,
+                        );
+                    }
+                }
                 
                 // Handle special tool results
+                if tool_call.function.name == "execute_exploit_script" {
+                    let target_id = result.get("target_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let target = DatabaseQueries::get_target(self.db.conn(), target_id)?;
+                    if let Some(target) = target {
+                        let script_name = result.get("script_name").and_then(|v| v.as_str()).unwrap_or("exploit.py").to_string();
+                        let command_line = result.get("command_line").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                        self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
+                            target_id,
+                            target_ip: target.ip_host,
+                            kind: crate::app::state::ApprovalKind::ExecuteExploit {
+                                script_name: script_name.clone(),
+                                command_line,
+                            },
+                            tool_call: tool_call.clone(),
+                        });
+                        self.add_notification(
+                            format!("Approval required to execute {}", script_name),
+                            NotifLevel::Warning,
+                        );
+                        return Ok(());
+                    } else {
+                        self.append_chat_message(ChatMessage {
+                            role: "tool".to_string(),
+                            content: serde_json::json!({
+                                "error": format!("Target ID {} is not within current assessment scope", target_id)
+                            }).to_string(),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_call.id),
+                        });
+                        continue;
+                    }
+                }
+
                 if tool_call.function.name == "open_reverse_shell_tab" {
                     let target_id = result.get("target_id").and_then(|v| v.as_i64()).unwrap_or(0);
                     let target = DatabaseQueries::get_target(self.db.conn(), target_id)?;
@@ -1366,9 +1514,11 @@ impl App {
                         self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
                             target_id,
                             target_ip: target.ip_host,
-                            lhost,
-                            lport,
-                            shell_type,
+                            kind: crate::app::state::ApprovalKind::ReverseShellListener {
+                                lhost,
+                                lport,
+                                shell_type,
+                            },
                             tool_call: tool_call.clone(),
                         });
                         self.add_notification(
@@ -1472,6 +1622,7 @@ impl App {
             &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+            Some(&self.session_meta.workspace_path()),
         );
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -1480,16 +1631,33 @@ impl App {
             tool_call_id: None,
         });
 
-        // Filter valid OpenAI messages
-        for msg in &self.chat_log {
+        // Filter valid OpenAI messages within a bounded window (last 12 messages) to protect LLM context limits
+        let window_start = self.chat_log.len().saturating_sub(12);
+        let mut slice = &self.chat_log[window_start..];
+        
+        // Ensure we don't start slice with an orphaned 'tool' message without its preceding 'assistant' message
+        if let Some(first_tool_pos) = slice.iter().position(|m| m.role == "tool") {
+            if first_tool_pos == 0 && window_start > 0 {
+                slice = &self.chat_log[window_start - 1..];
+            }
+        }
+
+        for msg in slice {
             match msg.role.as_str() {
                 "user" | "assistant" | "system" | "tool" => {
                     messages.push(msg.clone());
                 }
                 "output" => {
+                    let lines: Vec<&str> = msg.content.lines().collect();
+                    let truncated_content = if lines.len() > 25 {
+                        let top = lines[..20].join("\n");
+                        format!("{}\n... [truncated {} lines; full output stored in workspace/outputs/] ...", top, lines.len() - 20)
+                    } else {
+                        msg.content.clone()
+                    };
                     messages.push(ChatMessage {
                         role: "user".to_string(),
-                        content: format!("[Command Output]:\n{}", msg.content),
+                        content: format!("[Command Output]:\n{}", truncated_content),
                         tool_calls: None,
                         tool_call_id: None,
                     });

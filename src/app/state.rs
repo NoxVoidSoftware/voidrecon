@@ -44,12 +44,23 @@ pub struct SidebarNode {
 }
 
 #[derive(Debug, Clone)]
+pub enum ApprovalKind {
+    ReverseShellListener {
+        lhost: String,
+        lport: u16,
+        shell_type: String,
+    },
+    ExecuteExploit {
+        script_name: String,
+        command_line: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct ExploitApproval {
     pub target_id: i64,
     pub target_ip: String,
-    pub lhost: String,
-    pub lport: u16,
-    pub shell_type: String,
+    pub kind: ApprovalKind,
     pub tool_call: crate::llm::types::ToolCall,
 }
 
@@ -388,12 +399,16 @@ impl App {
         } else {
             let meta = SessionMeta::new(session_name);
             std::fs::create_dir_all(&meta.path())?;
-            std::fs::create_dir_all(meta.workspace_path().join("outputs"))?;
-            std::fs::create_dir_all(meta.workspace_path().join("evidence"))?;
-            std::fs::create_dir_all(meta.workspace_path().join("artifacts"))?;
             meta.save()?;
             meta
         };
+
+        // Ensure session workspace subdirectories always exist
+        let ws = session_meta.workspace_path();
+        let _ = std::fs::create_dir_all(ws.join("outputs"));
+        let _ = std::fs::create_dir_all(ws.join("evidence"));
+        let _ = std::fs::create_dir_all(ws.join("artifacts"));
+        let _ = std::fs::create_dir_all(ws.join("exploits"));
 
         self.db = Database::new(&session_meta.db_path())?;
         self.chat_log = session_meta.load_chat_history();

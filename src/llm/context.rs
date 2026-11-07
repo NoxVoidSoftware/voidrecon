@@ -13,6 +13,7 @@ pub fn build_system_prompt(
     _recent_commands: &[Command],
     command_count: i64,
     last_activity: Option<String>,
+    workspace_path: Option<&std::path::Path>,
 ) -> String {
     let mut prompt = String::from(
         r#"You are an expert cybersecurity auditor and penetration tester in voidrecon.
@@ -26,6 +27,50 @@ If answering a general question or explaining concepts, provide clear direct ass
     prompt.push_str(session_created);
     prompt.push_str("\nTargets in scope: ");
     prompt.push_str(&targets_count.to_string());
+
+    if let Some(ws) = workspace_path {
+        prompt.push_str("\n\n## Session Workspace: ");
+        prompt.push_str(&ws.to_string_lossy());
+        prompt.push_str(
+            r#"
+Workspace structure:
+  - outputs/   : Raw outputs of executed commands
+  - evidence/  : Reconnaissance & scan evidence
+  - artifacts/ : Reports and assessment notes
+  - exploits/  : Python exploit & PoC scripts"#,
+        );
+
+        let exploits_dir = ws.join("exploits");
+        let mut exploits_list = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(exploits_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        if fname.ends_with(".py") {
+                            exploits_list.push(format!("  - {} ({} bytes) -> `python workspace/exploits/{}`", fname, meta.len(), fname));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !exploits_list.is_empty() {
+            prompt.push_str("\n\n## Saved Exploits in Workspace:\n");
+            prompt.push_str(&exploits_list.join("\n"));
+        } else {
+            prompt.push_str("\n\n## Saved Exploits:\n  (None saved yet. Use `save_exploit_script` when you identify or write an exploit).");
+        }
+
+        prompt.push_str(
+            r#"
+
+Exploit Workflow:
+1. To inspect already-saved exploits, call `read_exploit_script` with its filename.
+2. To create or refine an exploit, call `save_exploit_script`. Voidrecon automatically runs a Python syntax check (`py_compile`).
+3. To test or execute an exploit, call `execute_exploit_script`. Voidrecon will ask the user for Action Approval before running."#,
+        );
+    }
 
     if let Some(target) = active_target {
         let ports_json: Vec<PortInfo> = target

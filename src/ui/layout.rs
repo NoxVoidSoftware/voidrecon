@@ -238,16 +238,28 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
     render_chat_log(f, app, chunks[0]);
     
     if let Some(approval) = &app.pending_exploit_approval {
+        let (prompt_title, prompt_detail, approve_label) = match &approval.kind {
+            crate::app::state::ApprovalKind::ReverseShellListener { lhost, lport, shell_type } => (
+                " LLM requests reverse shell listener:",
+                format!(" Target: {} (ID {}) │ Interface: {}:{} │ Shell: {}", approval.target_ip, approval.target_id, lhost, lport, shell_type),
+                " [y / Enter] Approve & Spawn Listener ",
+            ),
+            crate::app::state::ApprovalKind::ExecuteExploit { script_name, command_line } => (
+                " LLM requests exploit script execution:",
+                format!(" Target: {} (ID {}) │ Script: {} │ Command: {}", approval.target_ip, approval.target_id, script_name, command_line),
+                " [y / Enter] Approve & Execute Exploit ",
+            ),
+        };
         let content = vec![
             Line::from(vec![
                 Span::styled(" [EXPLOIT APPROVAL REQUIRED] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::raw(" LLM requests reverse shell listener:"),
+                Span::raw(prompt_title),
             ]),
             Line::from(vec![
-                Span::styled(format!(" Target: {} (ID {}) │ Interface: {}:{} │ Shell: {}", approval.target_ip, approval.target_id, approval.lhost, approval.lport, approval.shell_type), Style::default().fg(Color::Yellow)),
+                Span::styled(prompt_detail, Style::default().fg(Color::Yellow)),
             ]),
             Line::from(vec![
-                Span::styled(" [y / Enter] Approve & Spawn Listener ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                Span::styled(approve_label, Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
                 Span::raw("   "),
                 Span::styled(" [n / Esc] Reject ", Style::default().bg(Color::DarkGray).fg(Color::White)),
             ]),
