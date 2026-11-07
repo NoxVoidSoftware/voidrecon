@@ -451,30 +451,51 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_notifications(f: &mut Frame, app: &App) {
     let size = f.size();
-    let mut y_offset = 0;
+    if size.width < 30 || size.height < 8 {
+        return;
+    }
+    let notif_width = 56.min(size.width.saturating_sub(4));
+    let mut y_offset: u16 = 0;
+    
     for (idx, notif) in app.notifications.iter().enumerate() {
         if idx >= 3 { break; }
         
         let color = match notif.level {
-            NotifLevel::Info => Color::Blue,
+            NotifLevel::Info => Color::Cyan,
             NotifLevel::Warning => Color::Yellow,
             NotifLevel::Error => Color::Red,
         };
-        
+
+        let tag = match notif.level {
+            NotifLevel::Info => " [Info] ",
+            NotifLevel::Warning => " [Notice] ",
+            NotifLevel::Error => " [Error] ",
+        };
+
+        let card_height: u16 = 3;
+        if size.height <= 3 + y_offset + card_height {
+            break;
+        }
+
         let area = Rect {
-            x: size.width.saturating_sub(60),
-            y: size.height.saturating_sub(4 + y_offset),
-            width: 58,
-            height: 1,
+            x: size.width.saturating_sub(notif_width + 2),
+            y: size.height.saturating_sub(3 + y_offset + card_height),
+            width: notif_width,
+            height: card_height,
         };
         
-        let notif_widget = Paragraph::new(notif.message.clone())
-            .style(Style::default().fg(color).bg(Color::Black))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(color)));
+        let notif_widget = Paragraph::new(format!(" {}", notif.message))
+            .style(Style::default().fg(Color::White).bg(Color::Black))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(color))
+                    .title(Span::styled(tag, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+            );
         
         f.render_widget(Clear, area);
         f.render_widget(notif_widget, area);
         
-        y_offset += 2;
+        y_offset += card_height;
     }
 }

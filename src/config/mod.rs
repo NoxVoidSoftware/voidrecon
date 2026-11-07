@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use dirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -43,7 +44,7 @@ pub struct ModelArchitecture {
     pub tokenizer: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     OpenRouter,
@@ -60,6 +61,19 @@ pub const ALL_PROVIDERS: &[ProviderKind] = &[
     ProviderKind::Ollama,
     ProviderKind::Custom,
 ];
+
+pub fn mask_key(key: &str) -> String {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= 8 {
+        return "********".to_string();
+    }
+    let prefix = &trimmed[..6.min(trimmed.len())];
+    let suffix = &trimmed[trimmed.len().saturating_sub(4)..];
+    format!("{}...{}", prefix, suffix)
+}
 
 fn default_provider() -> ProviderKind {
     ProviderKind::OpenRouter
@@ -100,9 +114,19 @@ pub struct Config {
     pub provider: ProviderKind,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
+    pub provider_keys: HashMap<ProviderKind, String>,
+    #[serde(default)]
+    pub provider_models: HashMap<ProviderKind, Vec<ModelInfo>>,
+    #[serde(default)]
+    pub provider_models_updated_at: HashMap<ProviderKind, DateTime<Utc>>,
+    #[serde(default)]
     pub active_model: String,
+    #[serde(default)]
     pub models_cache: Vec<ModelInfo>,
+    #[serde(default)]
     pub models_cache_updated_at: Option<DateTime<Utc>>,
 }
 
@@ -123,6 +147,9 @@ impl Default for Config {
             provider: ProviderKind::OpenRouter,
             base_url: None,
             api_key: String::new(),
+            provider_keys: HashMap::new(),
+            provider_models: HashMap::new(),
+            provider_models_updated_at: HashMap::new(),
             active_model: String::new(),
             models_cache: Vec::new(),
             models_cache_updated_at: None,
@@ -144,7 +171,13 @@ impl Config {
             return Ok(Self::default());
         }
         let content = fs::read_to_string(&path).context("Failed to read config file")?;
-        let config: Config = serde_json::from_str(&content).context("Failed to parse config JSON")?;
+        let mut config: Config = serde_json::from_str(&content).context("Failed to parse config JSON")?;
+        if !config.api_key.trim().is_empty() && !config.provider_keys.contains_key(&config.provider) {
+            config.provider_keys.insert(config.provider, config.api_key.clone());
+        }
+        if !config.models_cache.is_empty() && !config.provider_models.contains_key(&config.provider) {
+            config.provider_models.insert(config.provider, config.models_cache.clone());
+        }
         Ok(config)
     }
 
@@ -155,8 +188,57 @@ impl Config {
         Ok(())
     }
 
+    pub fn get_api_key(&self, provider: ProviderKind) -> &str {
+        if let Some(key) = self.provider_keys.get(&provider) {
+            if !key.trim().is_empty() {
+                return key.as_str();
+            }
+        }
+        if self.provider == provider {
+            &self.api_key
+        } else {
+            ""
+        }
+    }
+
+    pub fn set_api_key(&mut self, provider: ProviderKind, key: String) {
+        let trimmed = key.trim().to_string();
+        self.provider_keys.insert(provider, trimmed.clone());
+        if self.provider == provider {
+            self.api_key = trimmed;
+        }
+    }
+
+    pub fn has_api_key(&self, provider: ProviderKind) -> bool {
+        if !provider.requires_api_key() {
+            return true;
+        }
+        !self.get_api_key(provider).trim().is_empty()
+    }
+
+    pub fn is_configured(&self, provider: ProviderKind) -> bool {
+        match provider {
+            ProviderKind::Ollama => true,
+            ProviderKind::Custom => self.base_url.is_some() || !self.get_api_key(provider).trim().is_empty(),
+            _ => self.has_api_key(provider),
+        }
+    }
+
+    pub fn configured_providers(&self) -> Vec<ProviderKind> {
+        let list: Vec<ProviderKind> = ALL_PROVIDERS
+            .iter()
+            .copied()
+            .filter(|p| self.is_configured(*p))
+            .collect();
+        if list.is_empty() {
+            ALL_PROVIDERS.to_vec()
+        } else {
+            list
+        }
+    }
+
     pub fn is_cache_stale(&self) -> bool {
-        match self.models_cache_updated_at {
+        match self.provider_models_updated_at.get(&self.provider).copied().or(self.models_cache_updated_at) {
             Some(updated) => {
                 let now = Utc::now();
                 (now - updated).num_hours() >= 24
@@ -168,14 +250,22 @@ impl Config {
     pub fn set_provider(&mut self, provider: ProviderKind, custom_base_url: Option<String>) {
         self.provider = provider;
         self.base_url = custom_base_url;
-        self.models_cache.clear();
-        self.active_model.clear();
-        self.models_cache_updated_at = None;
+        self.api_key = self.get_api_key(provider).to_string();
+        if let Some(cached) = self.provider_models.get(&provider) {
+            self.models_cache = cached.clone();
+            self.models_cache_updated_at = self.provider_models_updated_at.get(&provider).copied();
+        } else {
+            self.models_cache.clear();
+            self.models_cache_updated_at = None;
+        }
     }
 
     pub fn update_models_cache(&mut self, models: Vec<ModelInfo>) {
+        let now = Utc::now();
+        self.provider_models.insert(self.provider, models.clone());
+        self.provider_models_updated_at.insert(self.provider, now);
         self.models_cache = models;
-        self.models_cache_updated_at = Some(Utc::now());
+        self.models_cache_updated_at = Some(now);
     }
 
     pub fn get_free_models(&self) -> Vec<&ModelInfo> {

@@ -81,13 +81,13 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
 }
 
 pub fn render_api_key_modal(f: &mut Frame, app: &App) {
-    let area = centered_rect(72, 45, f.size());
+    let area = centered_rect(76, 52, f.size());
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" LLM Provider & API Key Setup (voidrecon) ");
+        .title(" LLM Provider & Multi-Key Configuration (voidrecon) ");
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -96,7 +96,7 @@ pub fn render_api_key_modal(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2), // Provider tabs
-            Constraint::Length(2), // Description / info
+            Constraint::Length(3), // Key status & instructions
             Constraint::Length(3), // Input box
             Constraint::Length(2), // Hints
         ])
@@ -106,66 +106,114 @@ pub fn render_api_key_modal(f: &mut Frame, app: &App) {
     let selected_idx = app.ui_state.provider_picker_selected.min(providers.len().saturating_sub(1));
     let selected_provider = providers[selected_idx];
 
-    // 1. Provider tabs
+    // 1. Provider tabs with configuration checkmarks
     let mut tab_spans = vec![Span::styled(" Provider: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))];
     for (i, p) in providers.iter().enumerate() {
         let is_selected = i == selected_idx;
+        let is_configured = app.config.has_api_key(*p);
+        let is_active = *p == app.config.provider;
+        let tag = if is_configured { " ✓" } else { "" };
+        let active_mark = if is_active { "*" } else { "" };
+        let label = format!("{}{}{}", active_mark, p.as_str(), tag);
+
         if is_selected {
             tab_spans.push(Span::styled(
-                format!(" [{}] ", p.as_str()),
+                format!(" [{}] ", label),
                 Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
+        } else if is_configured {
+            tab_spans.push(Span::styled(
+                format!("  {}  ", label),
+                Style::default().fg(Color::Green),
             ));
         } else {
             tab_spans.push(Span::styled(
-                format!("  {}  ", p.as_str()),
+                format!("  {}  ", label),
                 Style::default().fg(Color::DarkGray),
             ));
         }
     }
     f.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[0]);
 
-    // 2. Info / description
-    let desc = match selected_provider {
-        crate::config::ProviderKind::OpenRouter => {
-            "OpenRouter (openrouter.ai): 100+ models with free tier. API key format: sk-or-v1-..."
+    // 2. Info / Key status description
+    let has_key = app.config.has_api_key(selected_provider);
+    let current_key = app.config.get_api_key(selected_provider);
+    let endpoint = selected_provider.default_base_url();
+
+    let (status_line, action_line) = if selected_provider.requires_api_key() {
+        if has_key {
+            (
+                Line::from(vec![
+                    Span::styled(" Key status: ", Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("✓ KEY ALREADY SAVED [{}]", crate::config::mask_key(current_key)),
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  (Endpoint: {})", endpoint), Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::from(Span::styled(
+                    " Press [Enter] to activate this provider using the saved key, or type below to OVERWRITE it.",
+                    Style::default().fg(Color::Cyan),
+                )),
+            )
+        } else {
+            (
+                Line::from(vec![
+                    Span::styled(" Key status: ", Style::default().fg(Color::White)),
+                    Span::styled("✗ NO KEY SAVED FOR THIS PROVIDER", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  (Endpoint: {})", endpoint), Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::from(Span::styled(
+                    " Enter your API key below and press [Enter] to save and connect.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            )
         }
-        crate::config::ProviderKind::NvidiaNim => {
-            "NVIDIA NIM (build.nvidia.com): Fast Llama 3.3, DeepSeek R1 & Nemotron. API key format: nvapi-..."
-        }
-        crate::config::ProviderKind::OpenAi => {
-            "OpenAI (platform.openai.com): GPT-4o, o1, o3-mini. API key format: sk-..."
-        }
-        crate::config::ProviderKind::Ollama => {
-            "Ollama (Local): Runs offline via http://localhost:11434/v1. No API key needed!"
-        }
-        crate::config::ProviderKind::Custom => {
-            "Custom Endpoint: LM Studio, vLLM, Groq, or LocalAI. (API key optional)"
-        }
+    } else {
+        (
+            Line::from(vec![
+                Span::styled(" Key status: ", Style::default().fg(Color::White)),
+                Span::styled("✓ READY (Local service - no key needed)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  (Endpoint: {})", endpoint), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(Span::styled(
+                " Press [Enter] to activate this provider.",
+                Style::default().fg(Color::Cyan),
+            )),
+        )
     };
-    let desc_para = Paragraph::new(vec![
-        Line::from(Span::styled(desc, Style::default().fg(Color::White))),
-        Line::from(Span::styled(
-            format!("Endpoint: {}", selected_provider.default_base_url()),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
+
+    let desc_para = Paragraph::new(vec![status_line, action_line]);
     f.render_widget(desc_para, chunks[1]);
 
     // 3. Input box
     let title = if selected_provider.requires_api_key() {
-        format!(" {} API Key ", selected_provider.as_str())
+        if has_key {
+            format!(" {} API Key [Configured - Type to overwrite] ", selected_provider.as_str())
+        } else {
+            format!(" {} API Key ", selected_provider.as_str())
+        }
     } else {
-        format!(" {} API Key (Optional) ", selected_provider.as_str())
+        format!(" {} API Key (Not required) ", selected_provider.as_str())
     };
 
-    let placeholder = if !selected_provider.requires_api_key() && app.ui_state.api_key_input.is_empty() {
-        " (Not required - press Enter to continue) "
-    } else {
-        ""
-    };
-
-    let input_text = if app.ui_state.api_key_input.is_empty() && !placeholder.is_empty() {
-        Span::styled(placeholder, Style::default().fg(Color::Green).add_modifier(Modifier::ITALIC))
+    let input_text = if app.ui_state.api_key_input.is_empty() {
+        if has_key {
+            Span::styled(
+                format!(" [Saved: {}] (Press Enter to keep and activate)", crate::config::mask_key(current_key)),
+                Style::default().fg(Color::Green).add_modifier(Modifier::ITALIC),
+            )
+        } else if !selected_provider.requires_api_key() {
+            Span::styled(
+                " (Not required - press Enter to activate) ",
+                Style::default().fg(Color::Green).add_modifier(Modifier::ITALIC),
+            )
+        } else {
+            Span::styled(
+                format!(" (Type {} key here...) ", selected_provider.as_str()),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )
+        }
     } else {
         Span::styled(format!(" Key: {}█", app.ui_state.api_key_input), Style::default().fg(Color::White))
     };
@@ -180,19 +228,19 @@ pub fn render_api_key_modal(f: &mut Frame, app: &App) {
         Span::styled(" [Tab / ← / →] ", Style::default().bg(Color::Blue).fg(Color::White)),
         Span::raw(" Switch Provider    "),
         Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
-        Span::raw(" Save & Start    "),
+        Span::raw(" Save / Overwrite & Activate    "),
         Span::styled(" [Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" Skip"),
+        Span::raw(" Close"),
     ]));
     f.render_widget(footer, chunks[3]);
 }
 
 pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
-    let area = centered_rect(80, 80, f.size());
+    let area = centered_rect(82, 82, f.size());
     f.render_widget(Clear, area);
 
     let title = format!(
-        " Model Picker: {} (F2/Esc: Close | Enter: Select | F5: Fetch/Refresh | Tab: Toggle Free) ",
+        " Model Picker: {} (Tab: Switch Provider | F4: Free | F5: Refresh | Enter: Select | Esc: Close) ",
         app.config.provider.as_str()
     );
     let block = Block::default()
@@ -204,11 +252,40 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1), // Provider switch bar [Tab]
             Constraint::Length(1), // Search bar
             Constraint::Length(1), // Divider
             Constraint::Min(0),    // Models table
         ])
         .split(inner_area);
+
+    // Top: Connected Providers tab bar
+    let mut prov_spans = vec![
+        Span::styled(" Provider [Tab]: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ];
+    for p in crate::config::ALL_PROVIDERS {
+        let is_current = *p == app.config.provider;
+        let is_conf = app.config.has_api_key(*p);
+        let tag = if is_conf { " ✓" } else { "" };
+        let text = format!(" {}{} ", p.as_str(), tag);
+        if is_current {
+            prov_spans.push(Span::styled(
+                format!(" [{}] ", text.trim()),
+                Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
+        } else if is_conf {
+            prov_spans.push(Span::styled(
+                format!(" {} ", text.trim()),
+                Style::default().fg(Color::Green),
+            ));
+        } else {
+            prov_spans.push(Span::styled(
+                format!(" {} ", text.trim()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(prov_spans)), chunks[0]);
     
     let models: Vec<&crate::config::ModelInfo> = if app.ui_state.model_picker_free_only {
         app.config.get_free_models()
@@ -216,11 +293,11 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
         app.config.search_models(&app.ui_state.model_picker_search)
     };
     
-    // Search input at top
+    // Search input
     let free_indicator = if app.ui_state.model_picker_free_only {
-        " [FREE ONLY: ON]"
+        " [FREE ONLY: ON (F4/Ctrl+F)]"
     } else {
-        " [FREE ONLY: OFF (Tab to toggle)]"
+        " [FREE ONLY: OFF (F4/Ctrl+F)]"
     };
     let search_line = Line::from(vec![
         Span::styled("Search: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -235,10 +312,10 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
             },
         ),
     ]);
-    f.render_widget(Paragraph::new(search_line), chunks[0]);
+    f.render_widget(Paragraph::new(search_line), chunks[1]);
 
     // Separator line
-    f.render_widget(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)), chunks[1]);
+    f.render_widget(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)), chunks[2]);
     
     let mut rows = Vec::new();
     for (idx, model) in models.iter().enumerate() {
@@ -295,7 +372,7 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
         state.select(Some(app.ui_state.model_picker_selected.min(models.len().saturating_sub(1))));
     }
     
-    f.render_stateful_widget(table, chunks[2], &mut state);
+    f.render_stateful_widget(table, chunks[3], &mut state);
 }
 
 pub fn render_session_picker_modal(f: &mut Frame, app: &mut App) {

@@ -94,13 +94,15 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.ui_state.show_api_key_prompt = false;
+                    self.ui_state.api_key_input.clear();
                     self.add_notification(
-                        "Setup skipped - LLM features disabled until configured".to_string(),
-                        NotifLevel::Warning,
+                        "Provider configuration closed".to_string(),
+                        NotifLevel::Info,
                     );
                 }
                 KeyCode::Tab | KeyCode::Right => {
                     self.ui_state.provider_picker_selected = (self.ui_state.provider_picker_selected + 1) % total_providers;
+                    self.ui_state.api_key_input.clear();
                 }
                 KeyCode::BackTab | KeyCode::Left => {
                     if self.ui_state.provider_picker_selected == 0 {
@@ -108,20 +110,44 @@ impl App {
                     } else {
                         self.ui_state.provider_picker_selected -= 1;
                     }
+                    self.ui_state.api_key_input.clear();
                 }
                 KeyCode::Enter => {
                     let selected_provider = providers[self.ui_state.provider_picker_selected.min(total_providers - 1)];
                     let key_val = self.ui_state.api_key_input.trim().to_string();
+
+                    if !key_val.is_empty() {
+                        self.config.set_api_key(selected_provider, key_val);
+                        self.add_notification(
+                            format!("Saved key for {} and activated", selected_provider.as_str()),
+                            NotifLevel::Info,
+                        );
+                    } else if self.config.has_api_key(selected_provider) {
+                        self.add_notification(
+                            format!("Activated {} (using saved key)", selected_provider.as_str()),
+                            NotifLevel::Info,
+                        );
+                    } else if !selected_provider.requires_api_key() {
+                        self.add_notification(
+                            format!("Activated {}", selected_provider.as_str()),
+                            NotifLevel::Info,
+                        );
+                    } else {
+                        self.add_notification(
+                            format!("No API key entered for {}", selected_provider.as_str()),
+                            NotifLevel::Warning,
+                        );
+                        return Ok(());
+                    }
+
                     self.config.set_provider(selected_provider, None);
-                    self.config.api_key = key_val;
                     let _ = self.config.save();
                     self.llm_client = crate::llm::LlmClient::from_config(&self.config);
-                    self.add_notification(
-                        format!("Configured provider: {}", selected_provider.as_str()),
-                        NotifLevel::Info,
-                    );
                     self.ui_state.show_api_key_prompt = false;
-                    self.trigger_fetch_models();
+                    self.ui_state.api_key_input.clear();
+                    if self.config.models_cache.is_empty() {
+                        self.trigger_fetch_models();
+                    }
                 }
                 KeyCode::Char(c) => {
                     self.ui_state.api_key_input.push(c);
@@ -372,6 +398,36 @@ impl App {
                 }
             }
             KeyCode::Tab => {
+                let configured = self.config.configured_providers();
+                if configured.len() > 1 {
+                    let cur_idx = configured.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                    let next_idx = (cur_idx + 1) % configured.len();
+                    self.switch_to_provider(configured[next_idx]).await?;
+                } else {
+                    let all = crate::config::ALL_PROVIDERS;
+                    let cur_idx = all.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                    let next_idx = (cur_idx + 1) % all.len();
+                    self.switch_to_provider(all[next_idx]).await?;
+                }
+            }
+            KeyCode::BackTab => {
+                let configured = self.config.configured_providers();
+                if configured.len() > 1 {
+                    let cur_idx = configured.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                    let prev_idx = if cur_idx == 0 { configured.len() - 1 } else { cur_idx - 1 };
+                    self.switch_to_provider(configured[prev_idx]).await?;
+                } else {
+                    let all = crate::config::ALL_PROVIDERS;
+                    let cur_idx = all.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                    let prev_idx = if cur_idx == 0 { all.len() - 1 } else { cur_idx - 1 };
+                    self.switch_to_provider(all[prev_idx]).await?;
+                }
+            }
+            KeyCode::F(4) => {
+                self.ui_state.model_picker_free_only = !self.ui_state.model_picker_free_only;
+                self.ui_state.model_picker_selected = 0;
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.ui_state.model_picker_free_only = !self.ui_state.model_picker_free_only;
                 self.ui_state.model_picker_selected = 0;
             }
@@ -403,6 +459,40 @@ impl App {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    pub async fn switch_to_provider(&mut self, provider: crate::config::ProviderKind) -> Result<()> {
+        if self.config.provider == provider {
+            return Ok(());
+        }
+        self.config.set_provider(provider, None);
+        let _ = self.config.save();
+        self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+        self.ui_state.model_picker_selected = 0;
+        self.ui_state.model_picker_search.clear();
+
+        if let Some(cached) = self.config.provider_models.get(&provider) {
+            if !cached.is_empty() {
+                self.config.models_cache = cached.clone();
+                if !self.config.models_cache.iter().any(|m| m.id == self.config.active_model) {
+                    if let Some(first) = self.config.models_cache.first() {
+                        self.config.active_model = first.id.clone();
+                    }
+                }
+                self.add_notification(
+                    format!("Switched to {} ({} models loaded)", provider.as_str(), self.config.models_cache.len()),
+                    NotifLevel::Info,
+                );
+                return Ok(());
+            }
+        }
+
+        self.add_notification(
+            format!("Switched to {}. Fetching models...", provider.as_str()),
+            NotifLevel::Info,
+        );
+        self.trigger_fetch_models();
         Ok(())
     }
     
@@ -727,36 +817,24 @@ impl App {
                     }
                 }
             }
-            ":models" => {
+            ":models" | ":model" => {
                 if self.config.models_cache.is_empty() {
                     self.trigger_fetch_models();
                 }
                 self.ui_state.show_model_picker = true;
             }
-            ":provider" => {
+            ":provider" | ":providers" => {
                 if parts.len() > 1 {
                     let subparts: Vec<&str> = parts[1].split_whitespace().collect();
                     match subparts.first().copied().unwrap_or("") {
                         "openrouter" => {
-                            self.config.set_provider(crate::config::ProviderKind::OpenRouter, None);
-                            let _ = self.config.save();
-                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
-                            self.add_notification("Switched provider to OpenRouter".to_string(), NotifLevel::Info);
-                            self.trigger_fetch_models();
+                            self.switch_to_provider(crate::config::ProviderKind::OpenRouter).await?;
                         }
                         "nvidia" | "nvidianim" | "nim" => {
-                            self.config.set_provider(crate::config::ProviderKind::NvidiaNim, None);
-                            let _ = self.config.save();
-                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
-                            self.add_notification("Switched provider to NVIDIA NIM".to_string(), NotifLevel::Info);
-                            self.trigger_fetch_models();
+                            self.switch_to_provider(crate::config::ProviderKind::NvidiaNim).await?;
                         }
                         "openai" => {
-                            self.config.set_provider(crate::config::ProviderKind::OpenAi, None);
-                            let _ = self.config.save();
-                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
-                            self.add_notification("Switched provider to OpenAI".to_string(), NotifLevel::Info);
-                            self.trigger_fetch_models();
+                            self.switch_to_provider(crate::config::ProviderKind::OpenAi).await?;
                         }
                         "ollama" => {
                             let url = subparts.get(1).map(|u| u.to_string());
