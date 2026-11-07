@@ -261,10 +261,11 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
         .split(inner_area);
 
     // Top: Connected Providers tab bar
+    let configured = app.config.configured_providers();
     let mut prov_spans = vec![
         Span::styled(" Provider [Tab]: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ];
-    for p in crate::config::ALL_PROVIDERS {
+    for p in &configured {
         let is_viewing = *p == viewing_provider;
         let is_active_in_config = *p == app.config.provider;
         let is_conf = app.config.has_api_key(*p);
@@ -331,7 +332,12 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
             format!("${}/${}", model.pricing.prompt, model.pricing.completion)
         };
         
-        let ctx_len = model.context_length.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
+        let ctx_len = match model.context_length.or_else(|| crate::llm::client::infer_context_length(&model.id)) {
+            Some(len) if len >= 1_000_000 => format!("{}M", len / 1_000_000),
+            Some(len) if len >= 1_000 => format!("{}k", len / 1_000),
+            Some(len) if len > 0 => format!("{}", len),
+            _ => "-".to_string(),
+        };
         
         let prefix = if is_active { "* " } else { "  " };
         let name_display = format!("{}{}", prefix, model.name);
@@ -363,9 +369,9 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     }
 
     let table = Table::new(rows, [
-        Constraint::Percentage(50),
-        Constraint::Percentage(20),
-        Constraint::Percentage(30),
+        Constraint::Percentage(55),
+        Constraint::Length(12),
+        Constraint::Min(15),
     ])
     .header(Row::new(vec!["Model Name", "Context", "Price"]).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
     .highlight_style(Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD));

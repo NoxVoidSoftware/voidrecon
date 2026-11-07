@@ -81,7 +81,14 @@ impl LlmClient {
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or(id).to_string();
                     let description = item.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let context_length = item.get("context_length").and_then(|v| v.as_u64()).map(|n| n as u32);
+                    let context_length = item
+                        .get("context_length")
+                        .or_else(|| item.get("context_window"))
+                        .or_else(|| item.get("max_context_length"))
+                        .or_else(|| item.get("max_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32)
+                        .or_else(|| infer_context_length(id));
                     let prompt_price = item
                         .get("pricing")
                         .and_then(|p| p.get("prompt"))
@@ -119,7 +126,7 @@ impl LlmClient {
                         id: id.to_string(),
                         name,
                         description: Some("Local Ollama model".to_string()),
-                        context_length: None,
+                        context_length: infer_context_length(id),
                         pricing: ModelPricing {
                             prompt: "0".to_string(),
                             completion: "0".to_string(),
@@ -138,7 +145,7 @@ impl LlmClient {
                         id: id.to_string(),
                         name,
                         description: None,
-                        context_length: None,
+                        context_length: infer_context_length(id),
                         pricing: ModelPricing {
                             prompt: "0".to_string(),
                             completion: "0".to_string(),
@@ -149,7 +156,73 @@ impl LlmClient {
             }
         }
 
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        if self.inner.provider.kind() == ProviderKind::NvidiaNim && !models.is_empty() {
+            // Filter out non-chat models (embeddings, reward, detectors, calibration, etc.)
+            let candidate_models: Vec<ModelInfo> = models
+                .iter()
+                .filter(|m| {
+                    let id = m.id.to_lowercase();
+                    !id.contains("embed")
+                        && !id.contains("reward")
+                        && !id.contains("detector")
+                        && !id.contains("calibration")
+                        && !id.contains("nvclip")
+                })
+                .cloned()
+                .collect();
+
+            // Concurrently verify which models are actually accessible on this account
+            use futures_util::StreamExt;
+            let client = self.inner.client.clone();
+            let endpoint = self.inner.provider.chat_endpoint().to_string();
+            let key = self.inner.provider.api_key().map(|s| s.to_string());
+
+            let checks = futures_util::stream::iter(candidate_models.clone())
+                .map(|model| {
+                    let client = client.clone();
+                    let endpoint = endpoint.clone();
+                    let key = key.clone();
+                    async move {
+                        let mut req = client
+                            .post(&endpoint)
+                            .header(CONTENT_TYPE, "application/json")
+                            .timeout(Duration::from_millis(3000));
+                        if let Some(ref k) = key {
+                            if !k.trim().is_empty() {
+                                req = req.header("Authorization", format!("Bearer {}", k.trim()));
+                            }
+                        }
+                        let test_body = serde_json::json!({
+                            "model": model.id,
+                            "messages": [{"role": "user", "content": "1"}],
+                            "max_tokens": 1
+                        });
+                        let is_ok = match req.json(&test_body).send().await {
+                            Ok(resp) => resp.status().is_success(),
+                            Err(_) => false,
+                        };
+                        (model, is_ok)
+                    }
+                })
+                .buffer_unordered(16);
+
+            let results: Vec<(ModelInfo, bool)> = checks.collect().await;
+            let mut valid_models = Vec::new();
+            for (m, is_ok) in results {
+                if is_ok {
+                    valid_models.push(m);
+                }
+            }
+
+            if !valid_models.is_empty() {
+                valid_models.sort_by(|a, b| a.id.cmp(&b.id));
+                models = valid_models;
+            } else {
+                models = candidate_models;
+            }
+        } else {
+            models.sort_by(|a, b| a.id.cmp(&b.id));
+        }
 
         Ok(models)
     }
@@ -327,5 +400,45 @@ impl LlmClient {
             }],
             usage: None,
         })
+    }
+}
+
+pub fn infer_context_length(id: &str) -> Option<u32> {
+    let lower = id.to_lowercase();
+    if lower.contains("1000k") || lower.contains("1m") {
+        Some(1_000_000)
+    } else if lower.contains("512k") {
+        Some(512_000)
+    } else if lower.contains("256k") {
+        Some(256_000)
+    } else if lower.contains("200k") {
+        Some(200_000)
+    } else if lower.contains("128k") {
+        Some(128_000)
+    } else if lower.contains("64k") {
+        Some(64_000)
+    } else if lower.contains("32k") {
+        Some(32_000)
+    } else if lower.contains("16k") {
+        Some(16_000)
+    } else if lower.contains("8k") {
+        Some(8_000)
+    } else if lower.contains("4k") {
+        Some(4_096)
+    } else if lower.contains("nemotron")
+        || lower.contains("llama-3")
+        || lower.contains("mistral")
+        || lower.contains("deepseek")
+        || lower.contains("qwen2")
+        || lower.contains("qwen3")
+        || lower.contains("glm")
+        || lower.contains("gpt-4")
+        || lower.contains("claude")
+        || lower.contains("gemma-2")
+        || lower.contains("laguna")
+    {
+        Some(128_000)
+    } else {
+        Some(32_000)
     }
 }

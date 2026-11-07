@@ -250,9 +250,17 @@ impl Config {
 
     pub fn is_configured(&self, provider: ProviderKind) -> bool {
         match provider {
-            ProviderKind::Ollama => true,
-            ProviderKind::Custom => self.base_url.is_some() || !self.get_api_key(provider).trim().is_empty(),
-            _ => self.has_api_key(provider),
+            ProviderKind::Ollama => {
+                self.provider == ProviderKind::Ollama
+                    || self.has_api_key(provider)
+                    || (self.base_url.is_some() && self.provider == ProviderKind::Ollama)
+            }
+            ProviderKind::Custom => {
+                self.provider == ProviderKind::Custom
+                    || self.has_api_key(provider)
+                    || (self.base_url.is_some() && self.provider == ProviderKind::Custom)
+            }
+            _ => self.has_api_key(provider) || self.provider == provider,
         }
     }
 
@@ -263,7 +271,7 @@ impl Config {
             .filter(|p| self.is_configured(*p))
             .collect();
         if list.is_empty() {
-            ALL_PROVIDERS.to_vec()
+            vec![self.provider]
         } else {
             list
         }

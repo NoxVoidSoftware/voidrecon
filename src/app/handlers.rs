@@ -408,44 +408,34 @@ impl App {
             }
             KeyCode::Tab => {
                 let configured = self.config.configured_providers();
-                let cur = self.ui_state.model_picker_provider;
-                let next_provider = if configured.len() > 1 {
+                if configured.len() > 1 {
+                    let cur = self.ui_state.model_picker_provider;
                     let cur_idx = configured.iter().position(|&p| p == cur).unwrap_or(0);
                     let next_idx = (cur_idx + 1) % configured.len();
-                    configured[next_idx]
-                } else {
-                    let all = crate::config::ALL_PROVIDERS;
-                    let cur_idx = all.iter().position(|&p| p == cur).unwrap_or(0);
-                    let next_idx = (cur_idx + 1) % all.len();
-                    all[next_idx]
-                };
-                self.ui_state.model_picker_provider = next_provider;
-                self.ui_state.model_picker_selected = 0;
-                self.ui_state.model_picker_search.clear();
+                    let next_provider = configured[next_idx];
+                    self.ui_state.model_picker_provider = next_provider;
+                    self.ui_state.model_picker_selected = 0;
+                    self.ui_state.model_picker_search.clear();
 
-                if self.config.get_models_for_provider(next_provider).is_empty() {
-                    self.trigger_fetch_models_for_provider(next_provider);
+                    if self.config.get_models_for_provider(next_provider).is_empty() {
+                        self.trigger_fetch_models_for_provider(next_provider);
+                    }
                 }
             }
             KeyCode::BackTab => {
                 let configured = self.config.configured_providers();
-                let cur = self.ui_state.model_picker_provider;
-                let prev_provider = if configured.len() > 1 {
+                if configured.len() > 1 {
+                    let cur = self.ui_state.model_picker_provider;
                     let cur_idx = configured.iter().position(|&p| p == cur).unwrap_or(0);
                     let prev_idx = if cur_idx == 0 { configured.len() - 1 } else { cur_idx - 1 };
-                    configured[prev_idx]
-                } else {
-                    let all = crate::config::ALL_PROVIDERS;
-                    let cur_idx = all.iter().position(|&p| p == cur).unwrap_or(0);
-                    let prev_idx = if cur_idx == 0 { all.len() - 1 } else { cur_idx - 1 };
-                    all[prev_idx]
-                };
-                self.ui_state.model_picker_provider = prev_provider;
-                self.ui_state.model_picker_selected = 0;
-                self.ui_state.model_picker_search.clear();
+                    let prev_provider = configured[prev_idx];
+                    self.ui_state.model_picker_provider = prev_provider;
+                    self.ui_state.model_picker_selected = 0;
+                    self.ui_state.model_picker_search.clear();
 
-                if self.config.get_models_for_provider(prev_provider).is_empty() {
-                    self.trigger_fetch_models_for_provider(prev_provider);
+                    if self.config.get_models_for_provider(prev_provider).is_empty() {
+                        self.trigger_fetch_models_for_provider(prev_provider);
+                    }
                 }
             }
             KeyCode::F(4) => {
