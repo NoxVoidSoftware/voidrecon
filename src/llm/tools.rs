@@ -213,6 +213,43 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new_function(
+            "delete_evidence",
+            "Delete an evidence file from the workspace (workspace/evidence/) and remove its corresponding finding entry from the target database so it no longer appears in the targets list or sidebar.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Filename of the evidence file to delete (e.g. 'web_curl_80.txt' or 'smb_enum_shares.txt')"
+                    },
+                    "target_id": {
+                        "type": "integer",
+                        "description": "Target ID associated with the finding (optional, defaults to active target)"
+                    }
+                },
+                "required": ["filename"]
+            }),
+        ),
+        ToolDefinition::new_function(
+            "delete_workspace_file",
+            "Delete any workspace file (in evidence/, artifacts/, outputs/, or exploits/) and clean up any related database findings or notes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "folder": {
+                        "type": "string",
+                        "enum": ["evidence", "artifacts", "outputs", "exploits"],
+                        "description": "Folder in workspace containing the file"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Filename to delete"
+                    }
+                },
+                "required": ["folder", "filename"]
+            }),
+        ),
+        ToolDefinition::new_function(
             "save_exploit_script",
             "Save or update a Python exploit / PoC script in workspace/exploits/. Automatically validates Python syntax (py_compile). Returns compact status.",
             serde_json::json!({
@@ -900,6 +937,87 @@ pub async fn execute_tool_call(
                 "lines_returned": slice.len(),
                 "truncated": truncated || byte_truncated,
                 "content": display_content
+            }))
+        }
+        "delete_evidence" => {
+            let filename = args.get("filename").and_then(|v| v.as_str()).context("Missing filename")?;
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id);
+
+            let stem = std::path::Path::new(filename)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(filename);
+            let clean_name: String = stem
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
+                .collect();
+
+            let file_path = workspace_path.join("evidence").join(&clean_name);
+            let file_existed = file_path.exists();
+            if file_existed {
+                let _ = std::fs::remove_file(&file_path);
+            }
+
+            let removed_from_db = DatabaseQueries::delete_findings_by_evidence(conn, target_id, &clean_name)?;
+            let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
+
+            Ok(serde_json::json!({
+                "status": "deleted",
+                "filename": clean_name,
+                "file_removed_from_disk": file_existed,
+                "findings_removed_from_db": removed_from_db,
+                "message": format!(
+                    "Evidence '{}' deleted: file removed from disk ({}) and {} finding(s) deleted from database.",
+                    clean_name,
+                    if file_existed { "yes" } else { "was already missing" },
+                    removed_from_db
+                )
+            }))
+        }
+        "delete_workspace_file" => {
+            let folder = args.get("folder").and_then(|v| v.as_str()).unwrap_or("evidence");
+            let filename = args.get("filename").and_then(|v| v.as_str()).context("Missing filename")?;
+            let clean_folder = match folder {
+                "outputs" | "evidence" | "artifacts" | "exploits" => folder,
+                _ => anyhow::bail!("Invalid folder: {}", folder),
+            };
+
+            let stem = std::path::Path::new(filename)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(filename);
+            let clean_name: String = stem
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' })
+                .collect();
+
+            let file_path = workspace_path.join(clean_folder).join(&clean_name);
+            let file_existed = file_path.exists();
+            if file_existed {
+                let _ = std::fs::remove_file(&file_path);
+            }
+
+            let removed_from_db = if clean_folder == "evidence" {
+                DatabaseQueries::delete_findings_by_evidence(conn, active_target_id, &clean_name)?
+            } else {
+                0
+            };
+
+            let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
+
+            Ok(serde_json::json!({
+                "status": "deleted",
+                "folder": clean_folder,
+                "filename": clean_name,
+                "file_removed_from_disk": file_existed,
+                "findings_removed_from_db": removed_from_db,
+                "message": format!(
+                    "Workspace file '{}/{}' deleted from disk ({}) and {} finding(s) cleaned up.",
+                    clean_folder,
+                    clean_name,
+                    if file_existed { "yes" } else { "was already missing" },
+                    removed_from_db
+                )
             }))
         }
         _ => anyhow::bail!("Unknown tool: {}", name),

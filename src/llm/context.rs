@@ -27,6 +27,8 @@ Be concise.
   Call `save_workspace_file` or `save_exploit_script`. NOTE: Saving requires interactive user Action Approval in the TUI before any file is written.
 - To read existing workspace files (command outputs, saved evidence, artifacts, or exploits):
   Call `read_workspace_file`.
+- To delete evidence or clean up workspace files and their database entries:
+  Call `delete_evidence(filename="...")` or `delete_workspace_file(folder="...", filename="...")`. This deletes the file from disk and removes the corresponding finding from the database and targets list.
 - When answering informational questions (about targets, findings, open ports, status):
   Use database read tools (`get_target_info`, `get_findings`, `list_targets`, `get_recent_commands`) and answer clearly.
 - Voidrecon automatically archives all command outputs into `workspace/outputs/`.
@@ -126,7 +128,8 @@ Tools & Workspace Workflow:
 4. `update_target` / `add_finding`: Record discovered ports, OS details, and vulnerabilities into the database.
 5. `save_workspace_file`: Save evidence or artifacts into `workspace/evidence/` or `workspace/artifacts/` (requires user Action Approval).
 6. `read_workspace_file`: Read full raw command outputs (`workspace/outputs/<uuid>.txt`) or saved evidence/artifacts.
-7. `save_exploit_script` / `execute_exploit_script`: Save Python exploits into `workspace/exploits/` and execute with Action Approval."#,
+7. `delete_evidence` / `delete_workspace_file`: Delete an evidence/workspace file and remove its finding from the database so it disappears from the targets list.
+8. `save_exploit_script` / `execute_exploit_script`: Save Python exploits into `workspace/exploits/` and execute with Action Approval."#,
         );
     }
 

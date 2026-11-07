@@ -166,6 +166,36 @@ impl DatabaseQueries {
         Self::add_finding(conn, target_id, "note", text, "info", None, Some(100), None)
     }
 
+    pub fn delete_finding(conn: &Connection, finding_id: i64) -> Result<()> {
+        conn.execute("DELETE FROM findings WHERE id = ?1", params![finding_id])
+            .context("Failed to delete finding")?;
+        Ok(())
+    }
+
+    pub fn delete_findings_by_evidence(
+        conn: &Connection,
+        target_id: Option<i64>,
+        filename: &str,
+    ) -> Result<usize> {
+        let stem = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(filename);
+        let pattern = format!("%{}%", stem);
+        let count = if let Some(tid) = target_id {
+            conn.execute(
+                "DELETE FROM findings WHERE target_id = ?1 AND (evidence_path LIKE ?2 OR title LIKE ?2)",
+                params![tid, pattern],
+            )?
+        } else {
+            conn.execute(
+                "DELETE FROM findings WHERE evidence_path LIKE ?1 OR title LIKE ?1",
+                params![pattern],
+            )?
+        };
+        Ok(count)
+    }
+
     pub fn get_findings_for_target(conn: &Connection, target_id: i64) -> Result<Vec<Finding>> {
         let mut stmt = conn
             .prepare(

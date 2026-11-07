@@ -2093,6 +2093,20 @@ impl App {
             let findings = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?;
             let mut by_severity: std::collections::HashMap<String, Vec<Finding>> = std::collections::HashMap::new();
             for finding in findings {
+                // If finding references an evidence file in workspace/evidence, verify it still exists on disk.
+                // If user deleted the file manually, automatically prune the orphaned finding from the DB.
+                if let Some(ref ep) = finding.evidence_path {
+                    if ep.starts_with("workspace/evidence") || ep.starts_with("evidence") {
+                        let rel = ep.trim_start_matches("workspace/").trim_start_matches("workspace\\");
+                        let sub = rel.trim_start_matches("evidence/").trim_start_matches("evidence\\");
+                        let full_p = self.session_meta.workspace_path().join("evidence").join(sub);
+                        let direct_p = self.session_meta.path().join(ep);
+                        if !full_p.exists() && !direct_p.exists() {
+                            let _ = DatabaseQueries::delete_finding(self.db.conn(), finding.id);
+                            continue;
+                        }
+                    }
+                }
                 by_severity.entry(finding.severity.clone()).or_default().push(finding);
             }
             let mut findings_by_severity: Vec<_> = by_severity.into_iter().collect();
