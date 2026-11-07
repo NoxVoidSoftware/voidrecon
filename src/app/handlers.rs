@@ -1862,7 +1862,15 @@ impl App {
             // Reload sidebar to reflect any target/findings DB changes
             self.reload_sidebar().await?;
 
-            // Continue conversation with tool results
+            // If an action requires user approval or a command is suggested for user execution,
+            // STOP querying the LLM and wait for user input!
+            if self.suggestion_visible || self.pending_exploit_approval.is_some() {
+                self.llm_request_state = LlmRequestState::Completed;
+                self.ui_state.log_at_bottom = true;
+                return Ok(());
+            }
+
+            // Continue conversation with tool results only when no pending user action
             self.continue_llm_conversation().await?;
         } else if self.post_exec_mode {
             // Post-execution analysis complete
