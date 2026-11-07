@@ -332,11 +332,11 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
             format!("${}/${}", model.pricing.prompt, model.pricing.completion)
         };
         
-        let ctx_len = match model.context_length.or_else(|| crate::llm::client::infer_context_length(&model.id)) {
+        let ctx_len = match model.context_length {
             Some(len) if len >= 1_000_000 => format!("{}M", len / 1_000_000),
             Some(len) if len >= 1_000 => format!("{}k", len / 1_000),
             Some(len) if len > 0 => format!("{}", len),
-            _ => "-".to_string(),
+            _ => "N/A".to_string(),
         };
         
         let prefix = if is_active { "* " } else { "  " };
