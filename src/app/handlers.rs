@@ -225,8 +225,16 @@ impl App {
                     self.continue_llm_conversation().await?;
                     return Ok(());
                 }
+                KeyCode::Char('?') => {
+                    self.pending_exploit_approval = None;
+                    self.input_mode = InputMode::LlmQuery;
+                    self.input_buffer.clear();
+                    self.ui_state.input_cursor = 0;
+                    self.add_notification("Action cancelled - entering LLM query mode".to_string(), NotifLevel::Info);
+                    return Ok(());
+                }
                 _ => {
-                    self.add_notification("Press [Y] or [Enter] to approve, [N] or [Esc] to reject".to_string(), NotifLevel::Warning);
+                    self.add_notification("Action pending: Press [Y/Enter] to approve, [N/Esc] to reject, or [?] to ask query".to_string(), NotifLevel::Warning);
                     return Ok(());
                 }
             }

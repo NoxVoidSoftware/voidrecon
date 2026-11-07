@@ -373,9 +373,17 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    let total_lines = lines.len();
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let total_visual_rows: usize = if inner_width > 0 {
+        lines.iter().map(|line| {
+            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            if len == 0 { 1 } else { (len + inner_width - 1) / inner_width }
+        }).sum()
+    } else {
+        lines.len()
+    };
     let inner_height = area.height.saturating_sub(2) as usize;
-    let max_scroll = total_lines.saturating_sub(inner_height);
+    let max_scroll = total_visual_rows.saturating_sub(inner_height);
 
     if app.ui_state.log_at_bottom {
         app.ui_state.log_scroll = max_scroll;

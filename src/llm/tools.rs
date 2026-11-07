@@ -75,7 +75,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new_function(
             "open_reverse_shell_tab",
-            "Set up a reverse shell listener and open a new PTY tab ready to receive the connection.",
+            "Set up a reverse shell listener tab. Call this ONLY when the user explicitly asks to exploit, gain shell access, or start a reverse shell listener.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
