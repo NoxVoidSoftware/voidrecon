@@ -47,14 +47,127 @@ impl App {
             AppEvent::Resize(cols, rows) => self.handle_resize(cols, rows).await?,
             AppEvent::Notification(msg, level) => self.add_notification(msg, level),
             AppEvent::SidebarReload => self.reload_sidebar().await?,
+            AppEvent::ModelsLoaded(models) => {
+                self.config.update_models_cache(models);
+                let _ = self.config.save();
+                self.add_notification(
+                    format!("Updated {} models from OpenRouter", self.config.models_cache.len()),
+                    NotifLevel::Info,
+                );
+            }
         }
         Ok(())
     }
     
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        // Global shortcuts
+        // Defensive check: ignore key release events to prevent double inputs and flickering
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return Ok(());
+        }
+
+        // If API key prompt modal is open, intercept keys
+        if self.ui_state.show_api_key_prompt {
+            match key.code {
+                KeyCode::Esc => {
+                    self.ui_state.show_api_key_prompt = false;
+                    self.add_notification(
+                        "API key prompt skipped - LLM features disabled until key is set".to_string(),
+                        NotifLevel::Warning,
+                    );
+                }
+                KeyCode::Enter => {
+                    let key_val = self.ui_state.api_key_input.trim().to_string();
+                    if !key_val.is_empty() {
+                        self.config.api_key = key_val.clone();
+                        let _ = self.config.save();
+                        self.llm_client = crate::llm::LlmClient::new(key_val);
+                        self.add_notification("OpenRouter API key saved".to_string(), NotifLevel::Info);
+                    }
+                    self.ui_state.show_api_key_prompt = false;
+                }
+                KeyCode::Char(c) => {
+                    self.ui_state.api_key_input.push(c);
+                }
+                KeyCode::Backspace => {
+                    self.ui_state.api_key_input.pop();
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // If Help modal is open, intercept keys
+        if self.ui_state.show_help {
+            match key.code {
+                KeyCode::F(1) | KeyCode::F(12) | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.ui_state.show_help = false;
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.ui_state.show_help = false;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // If Model Picker modal is open, handle picker keys
+        if self.ui_state.show_model_picker {
+            self.handle_model_picker_key(key).await?;
+            return Ok(());
+        }
+
+        // If on interactive Shell tab (Tab 1..N), pass raw input to PTY
+        if self.active_tab > 0 {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+                    self.ui_state.should_quit = true;
+                    return Ok(());
+                }
+                (KeyCode::F(1), _) | (KeyCode::F(12), _) => {
+                    self.ui_state.show_help = !self.ui_state.show_help;
+                    return Ok(());
+                }
+                (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                    self.ui_state.show_help = !self.ui_state.show_help;
+                    return Ok(());
+                }
+                (KeyCode::F(2), _) => {
+                    self.ui_state.show_model_picker = !self.ui_state.show_model_picker;
+                    return Ok(());
+                }
+                (KeyCode::F(3), _) => {
+                    self.new_shell_tab().await?;
+                    return Ok(());
+                }
+                (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
+                    self.cycle_tab();
+                    return Ok(());
+                }
+                (KeyCode::Esc, _) => {
+                    // Esc switches back from Shell tab to Workspace & LLM (Tab 0)
+                    self.active_tab = 0;
+                    self.input_mode = InputMode::Shell;
+                    return Ok(());
+                }
+                (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
+                    self.input_mode = InputMode::LlmQuery;
+                    self.active_tab = 0; // return to Workspace & LLM tab
+                    return Ok(());
+                }
+                _ => {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab - 1) {
+                        if let Some(bytes) = key_to_pty_bytes(key) {
+                            let _ = tab.write(&bytes);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // Tab 0 (Workspace & LLM) shortcuts
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) | (KeyCode::Char(':'), _) if self.input_buffer == "quit" => {
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
                 self.ui_state.should_quit = true;
                 return Ok(());
             }
@@ -63,19 +176,23 @@ impl App {
                 self.input_buffer.clear();
                 return Ok(());
             }
-            (KeyCode::F(1), _) => {
+            (KeyCode::F(1), _) | (KeyCode::F(12), _) => {
+                self.ui_state.show_help = !self.ui_state.show_help;
+                return Ok(());
+            }
+            (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
                 self.ui_state.show_help = !self.ui_state.show_help;
                 return Ok(());
             }
             (KeyCode::F(2), _) => {
-                self.ui_state.show_model_picker = true;
+                self.ui_state.show_model_picker = !self.ui_state.show_model_picker;
                 return Ok(());
             }
             (KeyCode::F(3), _) => {
                 self.new_shell_tab().await?;
                 return Ok(());
             }
-            (KeyCode::Tab, _) => {
+            (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
                 self.cycle_tab();
                 return Ok(());
             }
@@ -83,6 +200,9 @@ impl App {
                 self.input_mode = InputMode::Shell;
                 self.suggestion_visible = false;
                 self.history_index = None;
+                self.ui_state.show_help = false;
+                self.ui_state.show_model_picker = false;
+                self.ui_state.show_api_key_prompt = false;
                 return Ok(());
             }
             (KeyCode::Char('['), _) => {
@@ -97,6 +217,60 @@ impl App {
             InputMode::Shell => self.handle_shell_key(key).await?,
             InputMode::LlmQuery => self.handle_llm_query_key(key).await?,
             InputMode::EditCommand => self.handle_edit_command_key(key).await?,
+        }
+        Ok(())
+    }
+
+    async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let models_count = if self.ui_state.model_picker_free_only {
+            self.config.get_free_models().len()
+        } else {
+            self.config.search_models(&self.ui_state.model_picker_search).len()
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::F(2) => {
+                self.ui_state.show_model_picker = false;
+            }
+            KeyCode::Up => {
+                if self.ui_state.model_picker_selected > 0 {
+                    self.ui_state.model_picker_selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if models_count > 0 && self.ui_state.model_picker_selected + 1 < models_count {
+                    self.ui_state.model_picker_selected += 1;
+                }
+            }
+            KeyCode::Tab => {
+                self.ui_state.model_picker_free_only = !self.ui_state.model_picker_free_only;
+                self.ui_state.model_picker_selected = 0;
+            }
+            KeyCode::Enter => {
+                let models = if self.ui_state.model_picker_free_only {
+                    self.config.get_free_models()
+                } else {
+                    self.config.search_models(&self.ui_state.model_picker_search)
+                };
+                if let Some(selected) = models.get(self.ui_state.model_picker_selected) {
+                    self.config.active_model = selected.id.clone();
+                    if let Err(e) = self.config.save() {
+                        self.add_notification(format!("Failed to save config: {}", e), NotifLevel::Error);
+                    } else {
+                        self.add_notification(format!("Active model: {}", self.config.active_model), NotifLevel::Info);
+                    }
+                }
+                self.ui_state.show_model_picker = false;
+            }
+            KeyCode::Char(c) => {
+                self.ui_state.model_picker_search.push(c);
+                self.ui_state.model_picker_selected = 0;
+            }
+            KeyCode::Backspace => {
+                self.ui_state.model_picker_search.pop();
+                self.ui_state.model_picker_selected = 0;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -123,6 +297,42 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
+                if self.suggestion_visible && self.input_buffer.is_empty() {
+                    match c {
+                        'r' => {
+                            if let Some(sug) = self.suggestion.take() {
+                                self.suggestion_visible = false;
+                                if let Some(cmd) = sug.command {
+                                    if self.active_tab == 0 {
+                                        self.execute_workspace_command(&cmd).await?;
+                                    } else {
+                                        self.send_to_pty(&cmd).await?;
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        }
+                        'e' => {
+                            if let Some(sug) = &self.suggestion {
+                                if let Some(cmd) = &sug.command {
+                                    self.input_buffer = cmd.clone();
+                                    self.input_mode = InputMode::EditCommand;
+                                }
+                            }
+                            self.suggestion_visible = false;
+                            return Ok(());
+                        }
+                        's' => {
+                            self.suggestion_visible = false;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+                if self.input_buffer.is_empty() && c == '?' {
+                    self.input_mode = InputMode::LlmQuery;
+                    return Ok(());
+                }
                 self.input_buffer.push(c);
             }
             KeyCode::Backspace => {
@@ -262,11 +472,14 @@ impl App {
             ":newtab" => {
                 self.new_shell_tab().await?;
             }
+            ":help" | ":h" => {
+                self.ui_state.show_help = !self.ui_state.show_help;
+            }
             ":quit" => {
                 self.ui_state.should_quit = true;
             }
             ":closeshell" => {
-                self.close_tab(self.active_tab).await?;
+                self.close_current_shell().await?;
             }
             ":exploit" => {
                 if self.active_target_id.is_some() {
@@ -666,7 +879,7 @@ impl App {
         let tab = PtyTab::new_shell(self.next_tab_id, self.event_tx.clone())?;
         self.next_tab_id += 1;
         self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        self.active_tab = self.tabs.len(); // switch focus to the new shell tab (Tab 1..N)
         Ok(())
     }
     
@@ -674,24 +887,23 @@ impl App {
         let tab = PtyTab::new_listener(self.next_tab_id, lport, self.event_tx.clone())?;
         self.next_tab_id += 1;
         self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        self.active_tab = self.tabs.len(); // switch focus to the listener tab
         Ok(())
     }
     
-    async fn close_tab(&mut self, index: usize) -> Result<()> {
-        if index < self.tabs.len() {
-            self.tabs.remove(index);
-            if self.active_tab >= self.tabs.len() && !self.tabs.is_empty() {
-                self.active_tab = self.tabs.len() - 1;
+    async fn close_current_shell(&mut self) -> Result<()> {
+        if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
+            self.tabs.remove(self.active_tab - 1);
+            if self.active_tab > self.tabs.len() {
+                self.active_tab = self.tabs.len();
             }
         }
         Ok(())
     }
     
     fn cycle_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + 1) % self.tabs.len();
-        }
+        let total = 1 + self.tabs.len();
+        self.active_tab = (self.active_tab + 1) % total;
     }
     
     async fn show_targets_table(&mut self) -> Result<()> {
@@ -742,5 +954,39 @@ impl App {
         if self.notifications.len() > 3 {
             self.notifications.remove(0);
         }
+    }
+}
+
+/// Convert crossterm KeyEvent to raw terminal bytes for PTY master stream
+fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let ascii = (c as u8).to_ascii_uppercase();
+                if (b'@'..=b'_').contains(&ascii) {
+                    Some(vec![ascii - b'@'])
+                } else {
+                    None
+                }
+            } else {
+                let mut b = [0u8; 4];
+                let s = c.encode_utf8(&mut b);
+                Some(s.as_bytes().to_vec())
+            }
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![8]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Esc => Some(vec![27]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        _ => None,
     }
 }

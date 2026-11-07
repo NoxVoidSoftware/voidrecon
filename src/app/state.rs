@@ -62,9 +62,9 @@ impl SessionMeta {
     }
 
     pub fn path(&self) -> PathBuf {
-        dirs::config_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("voidrecon")
+            .join(".audit-tui")
             .join("sessions")
             .join(&self.name)
     }
@@ -178,8 +178,11 @@ impl App {
             use futures_util::StreamExt;
             while let Some(event) = reader.next().await {
                 if let Ok(crossterm::event::Event::Key(key)) = event {
-                    if tx_keys.send(AppEvent::Key(key)).is_err() {
-                        break;
+                    // Only forward Press events to prevent duplicate inputs and flickering on Windows
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        if tx_keys.send(AppEvent::Key(key)).is_err() {
+                            break;
+                        }
                     }
                 } else if let Ok(crossterm::event::Event::Resize(cols, rows)) = event {
                     if tx_keys.send(AppEvent::Resize(cols, rows)).is_err() {
@@ -189,12 +192,17 @@ impl App {
             }
         });
         
+        let prompt_api_key = config.api_key.is_empty();
+
         let mut app = Self {
             config,
             db,
             llm_client,
             session_meta,
-            ui_state: UiState::default(),
+            ui_state: UiState {
+                show_api_key_prompt: prompt_api_key,
+                ..UiState::default()
+            },
             input_mode: InputMode::Shell,
             input_buffer: String::new(),
             command_history: VecDeque::with_capacity(1000),
@@ -202,9 +210,9 @@ impl App {
             sidebar_nodes: Vec::new(),
             active_target_id: None,
             sidebar_scroll: 0,
-            tabs: Vec::new(),
+            tabs: Vec::new(), // Tab 0 is always Workspace & LLM; tabs holds Tab 1..N (Shell tabs)
             active_tab: 0,
-            next_tab_id: 0,
+            next_tab_id: 1,
             llm_request_id: 0,
             llm_request_state: LlmRequestState::Idle,
             llm_response_buffer: String::new(),
@@ -220,10 +228,23 @@ impl App {
             event_rx,
             last_tick: Instant::now(),
         };
-        
-        // Initialize first tab (Workspace & LLM)
-        app.tabs.push(PtyTab::new_shell(app.next_tab_id, app.event_tx.clone())?);
-        app.next_tab_id += 1;
+
+        // Dynamic model discovery on startup (fetch OpenRouter models if cache is older than 24 hours)
+        if app.config.is_cache_stale() {
+            let tx = app.event_tx.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build();
+                if let Ok(client) = client {
+                    if let Ok(res) = client.get("https://openrouter.ai/api/v1/models").send().await {
+                        if let Ok(list) = res.json::<crate::llm::types::ModelListResponse>().await {
+                            let _ = tx.send(AppEvent::ModelsLoaded(list.data));
+                        }
+                    }
+                }
+            });
+        }
         
         // Load sidebar
         app.reload_sidebar().await?;
@@ -256,6 +277,8 @@ pub struct UiState {
     pub should_quit: bool,
     pub show_help: bool,
     pub show_model_picker: bool,
+    pub show_api_key_prompt: bool,
+    pub api_key_input: String,
     pub model_picker_search: String,
     pub model_picker_free_only: bool,
     pub model_picker_selected: usize,

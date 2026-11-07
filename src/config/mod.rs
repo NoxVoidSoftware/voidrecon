@@ -42,10 +42,57 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let fallback_models = vec![
+            ModelInfo {
+                id: "google/gemini-2.0-flash-exp:free".to_string(),
+                name: "Google: Gemini 2.0 Flash (free)".to_string(),
+                description: Some("Fast multimodal model with 1M context".to_string()),
+                context_length: Some(1048576),
+                pricing: ModelPricing {
+                    prompt: "0".to_string(),
+                    completion: "0".to_string(),
+                },
+                architecture: None,
+            },
+            ModelInfo {
+                id: "meta-llama/llama-3.3-70b-instruct:free".to_string(),
+                name: "Meta: Llama 3.3 70B Instruct (free)".to_string(),
+                description: Some("State-of-the-art open weights 70B model".to_string()),
+                context_length: Some(131072),
+                pricing: ModelPricing {
+                    prompt: "0".to_string(),
+                    completion: "0".to_string(),
+                },
+                architecture: None,
+            },
+            ModelInfo {
+                id: "deepseek/deepseek-r1:free".to_string(),
+                name: "DeepSeek: R1 (free)".to_string(),
+                description: Some("Advanced reasoning and code analysis model".to_string()),
+                context_length: Some(65536),
+                pricing: ModelPricing {
+                    prompt: "0".to_string(),
+                    completion: "0".to_string(),
+                },
+                architecture: None,
+            },
+            ModelInfo {
+                id: "qwen/qwen-2.5-coder-32b-instruct:free".to_string(),
+                name: "Qwen: Qwen 2.5 Coder 32B Instruct (free)".to_string(),
+                description: Some("Specialized coding & CLI commands model".to_string()),
+                context_length: Some(32768),
+                pricing: ModelPricing {
+                    prompt: "0".to_string(),
+                    completion: "0".to_string(),
+                },
+                architecture: None,
+            },
+        ];
+
         Self {
             api_key: String::new(),
-            active_model: "google/gemini-flash-1.5".to_string(),
-            models_cache: Vec::new(),
+            active_model: "google/gemini-2.0-flash-exp:free".to_string(),
+            models_cache: fallback_models,
             models_cache_updated_at: None,
         }
     }
@@ -53,10 +100,9 @@ impl Default for Config {
 
 impl Config {
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
-            .context("Could not find config directory")?
-            .join("voidrecon");
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
+        let home = dirs::home_dir().context("Could not find user home directory")?;
+        let config_dir = home.join(".audit-tui");
+        fs::create_dir_all(&config_dir).context("Failed to create config directory ~/.audit-tui")?;
         Ok(config_dir.join("config.json"))
     }
 

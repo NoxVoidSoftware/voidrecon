@@ -35,6 +35,9 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
     if app.ui_state.show_model_picker {
         render_model_picker_modal(f, app);
     }
+    if app.ui_state.show_api_key_prompt {
+        crate::ui::modals::render_api_key_modal(f, app);
+    }
     
     // Notifications
     render_notifications(f, app);
@@ -55,8 +58,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     
     let tab_name = if app.active_tab == 0 {
         "Workspace & LLM"
-    } else if app.tabs.get(app.active_tab).map(|t| t.kind == crate::pty::tab::TerminalKind::Listener).unwrap_or(false) {
-        &app.tabs[app.active_tab].label
+    } else if let Some(tab) = app.tabs.get(app.active_tab - 1) {
+        if tab.kind == crate::pty::tab::TerminalKind::Listener {
+            &tab.label
+        } else {
+            "Shell"
+        }
     } else {
         "Shell"
     };
@@ -155,11 +162,42 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_main_full(f: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Tab bar
+            Constraint::Min(0),    // Active tab viewport
+        ])
+        .split(area);
+
+    render_tab_bar(f, app, chunks[0]);
+
     if app.active_tab == 0 {
-        render_workspace_tab(f, app, area);
+        render_workspace_tab(f, app, chunks[1]);
     } else {
-        render_shell_tab(f, app, area);
+        render_shell_tab(f, app, chunks[1]);
     }
+}
+
+fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let mut spans = Vec::new();
+    let total = 1 + app.tabs.len();
+    for i in 0..total {
+        let label = if i == 0 {
+            "Tab 0: Workspace & LLM".to_string()
+        } else {
+            format!("Tab {}: {}", i, app.tabs[i - 1].label)
+        };
+        let is_active = i == app.active_tab;
+        let style = if is_active {
+            Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        };
+        spans.push(Span::styled(format!(" [{}] ", label), style));
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
@@ -291,11 +329,12 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_shell_tab(f: &mut Frame, app: &mut App, area: Rect) {
-    if let Some(tab) = app.tabs.get(app.active_tab) {
+    if app.active_tab > 0 && app.active_tab - 1 < app.tabs.len() {
+        let tab = &app.tabs[app.active_tab - 1];
         let widget = crate::ui::widgets::VtScreenWidget { parser: &tab.parser };
         f.render_widget(widget, area);
     } else {
-        let msg = Paragraph::new("No active shell tab")
+        let msg = Paragraph::new("No active shell tab. Press F3 to create a new shell tab.")
             .block(Block::default().borders(Borders::ALL).title(" Shell "));
         f.render_widget(msg, area);
     }
@@ -309,11 +348,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     };
     
     let footer = Line::from(vec![
-        Span::styled(" F1:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(" F1/:help:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F2:Models ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F3:New Shell ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::styled(" Tab:Switch ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::styled(" Esc:Mode ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(" Tab:Switch Tab ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(" Esc:Workspace ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(format!(" [{}] ", mode_text), Style::default().bg(Color::Blue).fg(Color::White)),
     ]);
     
