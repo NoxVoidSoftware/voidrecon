@@ -4,9 +4,41 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ToolFunctionDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolFunctionDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+}
+
+impl ToolDefinition {
+    pub fn new_function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: ToolFunctionDefinition {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            },
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.function.name
+    }
+
+    pub fn parameters(&self) -> &serde_json::Value {
+        &self.function.parameters
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

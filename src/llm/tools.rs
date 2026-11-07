@@ -9,21 +9,21 @@ use crate::llm::types::{ToolCall, ToolDefinition};
 /// Get all tool definitions for the LLM
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     vec![
-        ToolDefinition {
-            name: "get_target_info".to_string(),
-            description: "Get full info for the active target: ports, OS, metadata, all findings.".to_string(),
-            parameters: serde_json::json!({
+        ToolDefinition::new_function(
+            "get_target_info",
+            "Get full info for the active target: ports, OS, metadata, all findings.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "integer", "description": "ID of the target to query"}
                 },
                 "required": ["target_id"]
             }),
-        },
-        ToolDefinition {
-            name: "get_recent_commands".to_string(),
-            description: "Get the last N commands run against a target, with outputs.".to_string(),
-            parameters: serde_json::json!({
+        ),
+        ToolDefinition::new_function(
+            "get_recent_commands",
+            "Get the last N commands run against a target, with outputs.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "integer"},
@@ -31,11 +31,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["target_id"]
             }),
-        },
-        ToolDefinition {
-            name: "update_target".to_string(),
-            description: "Update ports, OS or metadata for a target after a scan reveals new info.".to_string(),
-            parameters: serde_json::json!({
+        ),
+        ToolDefinition::new_function(
+            "update_target",
+            "Update ports, OS or metadata for a target after a scan reveals new info.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "integer"},
@@ -44,11 +44,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["target_id"]
             }),
-        },
-        ToolDefinition {
-            name: "add_finding".to_string(),
-            description: "Record a security finding discovered in command output.".to_string(),
-            parameters: serde_json::json!({
+        ),
+        ToolDefinition::new_function(
+            "add_finding",
+            "Record a security finding discovered in command output.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "integer"},
@@ -59,11 +59,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["target_id", "title", "severity"]
             }),
-        },
-        ToolDefinition {
-            name: "add_target".to_string(),
-            description: "Add a newly discovered host to the session targets.".to_string(),
-            parameters: serde_json::json!({
+        ),
+        ToolDefinition::new_function(
+            "add_target",
+            "Add a newly discovered host to the session targets.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "ip_host": {"type": "string"},
@@ -72,11 +72,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["ip_host"]
             }),
-        },
-        ToolDefinition {
-            name: "open_reverse_shell_tab".to_string(),
-            description: "Set up a reverse shell listener and open a new PTY tab ready to receive the connection.".to_string(),
-            parameters: serde_json::json!({
+        ),
+        ToolDefinition::new_function(
+            "open_reverse_shell_tab",
+            "Set up a reverse shell listener and open a new PTY tab ready to receive the connection.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "integer"},
@@ -86,18 +86,18 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["target_id"]
             }),
-        },
-        ToolDefinition {
-            name: "get_shell_context".to_string(),
-            description: "Get current shell session state: target info, what has been run in this shell so far, current working directory if known.".to_string(),
-            parameters: serde_json::json!({
+        ),
+        ToolDefinition::new_function(
+            "get_shell_context",
+            "Get current shell session state: target info, what has been run in this shell so far, current working directory if known.",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "integer"}
                 },
                 "required": ["target_id"]
             }),
-        },
+        ),
     ]
 }
 
@@ -199,14 +199,14 @@ pub async fn execute_tool_call(
 /// Validate tool call arguments against schema
 pub fn validate_tool_call(tool_call: &ToolCall) -> Result<()> {
     let definitions = get_tool_definitions();
-    let definition = definitions.iter().find(|d| d.name == tool_call.function.name)
+    let definition = definitions.iter().find(|d| d.name() == tool_call.function.name)
         .context(format!("Unknown tool: {}", tool_call.function.name))?;
     
     let args: Value = serde_json::from_str(&tool_call.function.arguments)
         .context("Invalid tool arguments JSON")?;
     
     // Basic required field validation
-    if let Some(required) = definition.parameters.get("required").and_then(|v| v.as_array()) {
+    if let Some(required) = definition.parameters().get("required").and_then(|v| v.as_array()) {
         for field in required {
             if let Some(field_name) = field.as_str() {
                 if args.get(field_name).is_none() {

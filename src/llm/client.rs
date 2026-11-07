@@ -26,7 +26,7 @@ impl LlmClient {
     pub fn new(provider: Provider) -> Self {
         let inner = LlmClientInner {
             client: Client::builder()
-                .timeout(Duration::from_secs(120))
+                .timeout(Duration::from_secs(30))
                 .build()
                 .expect("Failed to create HTTP client"),
             provider,
@@ -185,7 +185,11 @@ impl LlmClient {
         let response = match req.json(&request).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                let err_msg = format!("HTTP error: {}", e);
+                let err_msg = if e.is_timeout() {
+                    format!("Request timed out (30s) waiting for {}", self.inner.provider.name())
+                } else {
+                    format!("HTTP error: {}", e)
+                };
                 let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
                 anyhow::bail!(err_msg);
             }
@@ -193,8 +197,18 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let err = response.text().await.unwrap_or_default();
-            let err_msg = format!("HTTP {} from {}: {}", status, self.inner.provider.name(), err);
+            let raw_err = response.text().await.unwrap_or_default();
+            let detail = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_err) {
+                json.get("detail")
+                    .or_else(|| json.get("message"))
+                    .or_else(|| json.get("error").and_then(|e| e.get("message")))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or(raw_err)
+            } else {
+                raw_err
+            };
+            let err_msg = format!("HTTP {} from {}: {}", status, self.inner.provider.name(), detail);
             let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
             anyhow::bail!(err_msg);
         }
