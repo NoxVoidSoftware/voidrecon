@@ -182,56 +182,93 @@ impl LlmClient {
                 .header("X-Title", "voidrecon");
         }
 
-        let response = req.json(&request).send().await.context("Failed to send chat request")?;
+        let response = match req.json(&request).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err_msg = format!("HTTP error: {}", e);
+                let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
+                anyhow::bail!(err_msg);
+            }
+        };
 
         if !response.status().is_success() {
+            let status = response.status();
             let err = response.text().await.unwrap_or_default();
-            let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err.clone()));
-            anyhow::bail!("Chat request failed for {}: {}", self.inner.provider.name(), err);
+            let err_msg = format!("HTTP {} from {}: {}", status, self.inner.provider.name(), err);
+            let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
+            anyhow::bail!(err_msg);
         }
 
         let _ = tx.send(crate::app::AppEvent::LlmRequestStarted(request_id));
 
         let mut stream = response.bytes_stream();
         let mut tool_calls_accumulated: Vec<crate::llm::types::ToolCall> = Vec::new();
+        let mut line_buffer = String::new();
 
         use futures_util::StreamExt;
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.context("Stream error")?;
-            let text = String::from_utf8_lossy(&chunk);
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, format!("Stream chunk error: {}", e)));
+                    break;
+                }
+            };
+            line_buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            for line in text.lines() {
-                if line.starts_with("data: ") {
-                    let data = &line[6..];
+            while let Some(newline_pos) = line_buffer.find('\n') {
+                let line: String = line_buffer.drain(..=newline_pos).collect();
+                let trimmed = line.trim();
+                if trimmed.starts_with("data: ") {
+                    let data = trimmed[6..].trim();
                     if data == "[DONE]" {
-                        let _ = tx.send(crate::app::AppEvent::LlmDone(request_id));
                         break;
                     }
                     if let Ok(stream_chunk) = serde_json::from_str::<StreamChunk>(data) {
-                        if let Some(choice) = stream_chunk.choices.first() {
-                            // Handle content delta
-                            let content = &choice.delta.content;
-                            if !content.is_empty() {
-                                let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, content.clone()));
-                            }
-                            // Handle tool call delta
-                            if let Some(tool_calls) = &choice.delta.tool_calls {
-                                for tc in tool_calls {
-                                    if tc.id.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(existing) = tool_calls_accumulated.iter_mut().find(|t| t.id == tc.id) {
-                                        existing.function.arguments.push_str(&tc.function.arguments);
-                                    } else {
-                                        tool_calls_accumulated.push(tc.clone());
-                                    }
+                        for choice in stream_chunk.choices {
+                            // 1. Content delta
+                            if let Some(content) = &choice.delta.content {
+                                if !content.is_empty() {
+                                    let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, content.clone()));
                                 }
                             }
-                            // Handle finish reason
-                            if let Some(finish_reason) = &choice.finish_reason {
-                                if finish_reason == "tool_calls" && !tool_calls_accumulated.is_empty() {
-                                    for tc in &tool_calls_accumulated {
-                                        let _ = tx.send(crate::app::AppEvent::LlmToolCall(request_id, tc.clone()));
+                            // 2. Reasoning delta (DeepSeek R1 / V4.1)
+                            if let Some(reasoning) = &choice.delta.reasoning_content {
+                                if !reasoning.is_empty() {
+                                    let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, reasoning.clone()));
+                                }
+                            }
+                            // 3. Tool call delta
+                            if let Some(tool_calls) = &choice.delta.tool_calls {
+                                for tc in tool_calls {
+                                    let idx = tc.index.unwrap_or_else(|| {
+                                        if tool_calls_accumulated.is_empty() { 0 } else { tool_calls_accumulated.len() - 1 }
+                                    });
+                                    if idx >= tool_calls_accumulated.len() {
+                                        tool_calls_accumulated.push(crate::llm::types::ToolCall {
+                                            id: tc.id.clone().unwrap_or_default(),
+                                            call_type: tc.call_type.clone().unwrap_or_else(|| "function".to_string()),
+                                            function: crate::llm::types::ToolFunction {
+                                                name: tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default(),
+                                                arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default(),
+                                            },
+                                        });
+                                    } else {
+                                        if let Some(id) = &tc.id {
+                                            if !id.is_empty() {
+                                                tool_calls_accumulated[idx].id = id.clone();
+                                            }
+                                        }
+                                        if let Some(func) = &tc.function {
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    tool_calls_accumulated[idx].function.name.push_str(name);
+                                                }
+                                            }
+                                            if let Some(args) = &func.arguments {
+                                                tool_calls_accumulated[idx].function.arguments.push_str(args);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -240,6 +277,14 @@ impl LlmClient {
                 }
             }
         }
+
+        // Dispatch tool calls if any accumulated
+        if !tool_calls_accumulated.is_empty() {
+            for tc in &tool_calls_accumulated {
+                let _ = tx.send(crate::app::AppEvent::LlmToolCall(request_id, tc.clone()));
+            }
+        }
+        let _ = tx.send(crate::app::AppEvent::LlmDone(request_id));
 
         // Build final response
         let final_message = if !tool_calls_accumulated.is_empty() {

@@ -337,6 +337,8 @@ pub struct UiState {
     pub model_picker_search: String,
     pub model_picker_free_only: bool,
     pub model_picker_selected: usize,
+    pub model_picker_provider: crate::config::ProviderKind,
+    pub tick_count: usize,
     pub sidebar_collapsed: bool,
     pub sidebar_selected: usize,
     pub log_scroll: usize,

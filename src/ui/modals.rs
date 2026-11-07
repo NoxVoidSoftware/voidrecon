@@ -239,9 +239,10 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     let area = centered_rect(82, 82, f.size());
     f.render_widget(Clear, area);
 
+    let viewing_provider = app.ui_state.model_picker_provider;
     let title = format!(
-        " Model Picker: {} (Tab: Switch Provider | F4: Free | F5: Refresh | Enter: Select | Esc: Close) ",
-        app.config.provider.as_str()
+        " Model Picker: {} (Tab: Switch Provider | F4: Free | F5: Refresh | Enter: Select | Esc: Cancel) ",
+        viewing_provider.as_str()
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -264,11 +265,13 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
         Span::styled(" Provider [Tab]: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ];
     for p in crate::config::ALL_PROVIDERS {
-        let is_current = *p == app.config.provider;
+        let is_viewing = *p == viewing_provider;
+        let is_active_in_config = *p == app.config.provider;
         let is_conf = app.config.has_api_key(*p);
         let tag = if is_conf { " ✓" } else { "" };
-        let text = format!(" {}{} ", p.as_str(), tag);
-        if is_current {
+        let active_badge = if is_active_in_config { "*" } else { "" };
+        let text = format!(" {}{}{} ", active_badge, p.as_str(), tag);
+        if is_viewing {
             prov_spans.push(Span::styled(
                 format!(" [{}] ", text.trim()),
                 Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD),
@@ -288,9 +291,9 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(prov_spans)), chunks[0]);
     
     let models: Vec<&crate::config::ModelInfo> = if app.ui_state.model_picker_free_only {
-        app.config.get_free_models()
+        app.config.get_free_models_for_provider(viewing_provider)
     } else {
-        app.config.search_models(&app.ui_state.model_picker_search)
+        app.config.search_models_for_provider(viewing_provider, &app.ui_state.model_picker_search)
     };
     
     // Search input
@@ -320,7 +323,7 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     let mut rows = Vec::new();
     for (idx, model) in models.iter().enumerate() {
         let is_selected = idx == app.ui_state.model_picker_selected;
-        let is_active = model.id == app.config.active_model;
+        let is_active = model.id == app.config.active_model && viewing_provider == app.config.provider;
         
         let price = if model.id.ends_with(":free") || (model.pricing.prompt == "0" && model.pricing.completion == "0") {
             "FREE".to_string()
@@ -351,7 +354,7 @@ pub fn render_model_picker_modal(f: &mut Frame, app: &mut App) {
     if rows.is_empty() {
         rows.push(
             Row::new(vec![
-                "[No models loaded yet - press F5/Ctrl+R to fetch from provider]".to_string(),
+                format!("[No models cached for {} - press F5/Ctrl+R to fetch]", viewing_provider.as_str()),
                 "-".to_string(),
                 "-".to_string(),
             ])

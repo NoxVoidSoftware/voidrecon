@@ -44,9 +44,10 @@ pub struct ModelArchitecture {
     pub tokenizer: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[default]
     OpenRouter,
     NvidiaNim,
     OpenAi,
@@ -123,6 +124,8 @@ pub struct Config {
     #[serde(default)]
     pub provider_models_updated_at: HashMap<ProviderKind, DateTime<Utc>>,
     #[serde(default)]
+    pub provider_active_models: HashMap<ProviderKind, String>,
+    #[serde(default)]
     pub active_model: String,
     #[serde(default)]
     pub models_cache: Vec<ModelInfo>,
@@ -150,6 +153,7 @@ impl Default for Config {
             provider_keys: HashMap::new(),
             provider_models: HashMap::new(),
             provider_models_updated_at: HashMap::new(),
+            provider_active_models: HashMap::new(),
             active_model: String::new(),
             models_cache: Vec::new(),
             models_cache_updated_at: None,
@@ -178,6 +182,9 @@ impl Config {
         if !config.models_cache.is_empty() && !config.provider_models.contains_key(&config.provider) {
             config.provider_models.insert(config.provider, config.models_cache.clone());
         }
+        if !config.active_model.is_empty() && !config.provider_active_models.contains_key(&config.provider) {
+            config.provider_active_models.insert(config.provider, config.active_model.clone());
+        }
         Ok(config)
     }
 
@@ -186,6 +193,31 @@ impl Config {
         let content = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
         fs::write(&path, content).context("Failed to write config file")?;
         Ok(())
+    }
+
+    pub fn get_models_for_provider(&self, provider: ProviderKind) -> &[ModelInfo] {
+        if let Some(list) = self.provider_models.get(&provider) {
+            list.as_slice()
+        } else if self.provider == provider {
+            self.models_cache.as_slice()
+        } else {
+            &[]
+        }
+    }
+
+    pub fn get_free_models_for_provider(&self, provider: ProviderKind) -> Vec<&ModelInfo> {
+        self.get_models_for_provider(provider)
+            .iter()
+            .filter(|m| m.is_free())
+            .collect()
+    }
+
+    pub fn search_models_for_provider(&self, provider: ProviderKind, query: &str) -> Vec<&ModelInfo> {
+        let query = query.to_lowercase();
+        self.get_models_for_provider(provider)
+            .iter()
+            .filter(|m| m.id.to_lowercase().contains(&query) || m.name.to_lowercase().contains(&query))
+            .collect()
     }
 
     pub fn get_api_key(&self, provider: ProviderKind) -> &str {
@@ -258,28 +290,21 @@ impl Config {
             self.models_cache.clear();
             self.models_cache_updated_at = None;
         }
+        if let Some(model) = self.provider_active_models.get(&provider) {
+            self.active_model = model.clone();
+        }
     }
 
-    pub fn update_models_cache(&mut self, models: Vec<ModelInfo>) {
+    pub fn update_models_cache_for_provider(&mut self, provider: ProviderKind, models: Vec<ModelInfo>) {
         let now = Utc::now();
-        self.provider_models.insert(self.provider, models.clone());
-        self.provider_models_updated_at.insert(self.provider, now);
-        self.models_cache = models;
-        self.models_cache_updated_at = Some(now);
-    }
-
-    pub fn get_free_models(&self) -> Vec<&ModelInfo> {
-        self.models_cache
-            .iter()
-            .filter(|m| m.is_free())
-            .collect()
-    }
-
-    pub fn search_models(&self, query: &str) -> Vec<&ModelInfo> {
-        let query = query.to_lowercase();
-        self.models_cache
-            .iter()
-            .filter(|m| m.id.to_lowercase().contains(&query) || m.name.to_lowercase().contains(&query))
-            .collect()
+        self.provider_models.insert(provider, models.clone());
+        self.provider_models_updated_at.insert(provider, now);
+        if self.provider == provider {
+            self.models_cache = models;
+            self.models_cache_updated_at = Some(now);
+            if self.active_model.is_empty() && !self.models_cache.is_empty() {
+                self.active_model = self.models_cache[0].id.clone();
+            }
+        }
     }
 }

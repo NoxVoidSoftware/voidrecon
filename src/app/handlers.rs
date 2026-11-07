@@ -49,19 +49,12 @@ impl App {
             AppEvent::Tick => self.handle_tick(),
             AppEvent::Resize(cols, rows) => self.handle_resize(cols, rows).await?,
             AppEvent::SidebarReload => self.reload_sidebar().await?,
-            AppEvent::ModelsLoaded(models) => {
+            AppEvent::ModelsLoadedForProvider(provider, models) => {
                 let count = models.len();
-                let provider_name = self.config.provider.as_str();
-                self.config.update_models_cache(models);
-                if !self.config.models_cache.is_empty()
-                    && (self.config.active_model.is_empty()
-                        || !self.config.models_cache.iter().any(|m| m.id == self.config.active_model))
-                {
-                    self.config.active_model = self.config.models_cache[0].id.clone();
-                }
+                self.config.update_models_cache_for_provider(provider, models);
                 let _ = self.config.save();
                 self.add_notification(
-                    format!("Fetched {} models from {}", count, provider_name),
+                    format!("Fetched {} models from {}", count, provider.as_str()),
                     NotifLevel::Info,
                 );
             }
@@ -70,12 +63,19 @@ impl App {
     }
 
     pub fn trigger_fetch_models(&self) {
+        self.trigger_fetch_models_for_provider(self.config.provider);
+    }
+
+    pub fn trigger_fetch_models_for_provider(&self, provider: crate::config::ProviderKind) {
         let tx = self.event_tx.clone();
-        let client = self.llm_client.clone();
+        let key = self.config.get_api_key(provider);
+        let base_url = self.config.base_url.clone();
+        let p = crate::llm::provider::Provider::from_config(provider, key, base_url);
+        let client = crate::llm::LlmClient::new(p);
         tokio::spawn(async move {
             if let Ok(models) = client.fetch_models().await {
                 if !models.is_empty() {
-                    let _ = tx.send(AppEvent::ModelsLoaded(models));
+                    let _ = tx.send(AppEvent::ModelsLoadedForProvider(provider, models));
                 }
             }
         });
@@ -234,7 +234,10 @@ impl App {
                     return Ok(());
                 }
                 (KeyCode::F(2), _) => {
-                    if self.config.models_cache.is_empty() {
+                    self.ui_state.model_picker_provider = self.config.provider;
+                    self.ui_state.model_picker_selected = 0;
+                    self.ui_state.model_picker_search.clear();
+                    if self.config.get_models_for_provider(self.config.provider).is_empty() {
                         self.trigger_fetch_models();
                     }
                     self.ui_state.show_model_picker = true;
@@ -285,7 +288,10 @@ impl App {
                 return Ok(());
             }
             (KeyCode::F(2), _) => {
-                if self.config.models_cache.is_empty() {
+                self.ui_state.model_picker_provider = self.config.provider;
+                self.ui_state.model_picker_selected = 0;
+                self.ui_state.model_picker_search.clear();
+                if self.config.get_models_for_provider(self.config.provider).is_empty() {
                     self.trigger_fetch_models();
                 }
                 self.ui_state.show_model_picker = true;
@@ -361,10 +367,11 @@ impl App {
     }
 
     async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        let provider = self.ui_state.model_picker_provider;
         let models_count = if self.ui_state.model_picker_free_only {
-            self.config.get_free_models().len()
+            self.config.get_free_models_for_provider(provider).len()
         } else {
-            self.config.search_models(&self.ui_state.model_picker_search).len()
+            self.config.search_models_for_provider(provider, &self.ui_state.model_picker_search).len()
         };
 
         match key.code {
@@ -374,16 +381,18 @@ impl App {
                 self.ui_state.model_picker_selected = 0;
             }
             KeyCode::F(5) => {
-                self.trigger_fetch_models();
+                let prov = self.ui_state.model_picker_provider;
+                self.trigger_fetch_models_for_provider(prov);
                 self.add_notification(
-                    format!("Fetching models from {}...", self.config.provider.as_str()),
+                    format!("Fetching models from {}...", prov.as_str()),
                     NotifLevel::Info,
                 );
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.trigger_fetch_models();
+                let prov = self.ui_state.model_picker_provider;
+                self.trigger_fetch_models_for_provider(prov);
                 self.add_notification(
-                    format!("Fetching models from {}...", self.config.provider.as_str()),
+                    format!("Fetching models from {}...", prov.as_str()),
                     NotifLevel::Info,
                 );
             }
@@ -399,28 +408,44 @@ impl App {
             }
             KeyCode::Tab => {
                 let configured = self.config.configured_providers();
-                if configured.len() > 1 {
-                    let cur_idx = configured.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                let cur = self.ui_state.model_picker_provider;
+                let next_provider = if configured.len() > 1 {
+                    let cur_idx = configured.iter().position(|&p| p == cur).unwrap_or(0);
                     let next_idx = (cur_idx + 1) % configured.len();
-                    self.switch_to_provider(configured[next_idx]).await?;
+                    configured[next_idx]
                 } else {
                     let all = crate::config::ALL_PROVIDERS;
-                    let cur_idx = all.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                    let cur_idx = all.iter().position(|&p| p == cur).unwrap_or(0);
                     let next_idx = (cur_idx + 1) % all.len();
-                    self.switch_to_provider(all[next_idx]).await?;
+                    all[next_idx]
+                };
+                self.ui_state.model_picker_provider = next_provider;
+                self.ui_state.model_picker_selected = 0;
+                self.ui_state.model_picker_search.clear();
+
+                if self.config.get_models_for_provider(next_provider).is_empty() {
+                    self.trigger_fetch_models_for_provider(next_provider);
                 }
             }
             KeyCode::BackTab => {
                 let configured = self.config.configured_providers();
-                if configured.len() > 1 {
-                    let cur_idx = configured.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                let cur = self.ui_state.model_picker_provider;
+                let prev_provider = if configured.len() > 1 {
+                    let cur_idx = configured.iter().position(|&p| p == cur).unwrap_or(0);
                     let prev_idx = if cur_idx == 0 { configured.len() - 1 } else { cur_idx - 1 };
-                    self.switch_to_provider(configured[prev_idx]).await?;
+                    configured[prev_idx]
                 } else {
                     let all = crate::config::ALL_PROVIDERS;
-                    let cur_idx = all.iter().position(|&p| p == self.config.provider).unwrap_or(0);
+                    let cur_idx = all.iter().position(|&p| p == cur).unwrap_or(0);
                     let prev_idx = if cur_idx == 0 { all.len() - 1 } else { cur_idx - 1 };
-                    self.switch_to_provider(all[prev_idx]).await?;
+                    all[prev_idx]
+                };
+                self.ui_state.model_picker_provider = prev_provider;
+                self.ui_state.model_picker_selected = 0;
+                self.ui_state.model_picker_search.clear();
+
+                if self.config.get_models_for_provider(prev_provider).is_empty() {
+                    self.trigger_fetch_models_for_provider(prev_provider);
                 }
             }
             KeyCode::F(4) => {
@@ -432,17 +457,25 @@ impl App {
                 self.ui_state.model_picker_selected = 0;
             }
             KeyCode::Enter => {
-                let models = if self.ui_state.model_picker_free_only {
-                    self.config.get_free_models()
+                let provider = self.ui_state.model_picker_provider;
+                let models: Vec<&crate::config::ModelInfo> = if self.ui_state.model_picker_free_only {
+                    self.config.get_free_models_for_provider(provider)
                 } else {
-                    self.config.search_models(&self.ui_state.model_picker_search)
+                    self.config.search_models_for_provider(provider, &self.ui_state.model_picker_search)
                 };
                 if let Some(selected) = models.get(self.ui_state.model_picker_selected) {
-                    self.config.active_model = selected.id.clone();
+                    let model_id = selected.id.clone();
+                    self.config.set_provider(provider, None);
+                    self.config.provider_active_models.insert(provider, model_id.clone());
+                    self.config.active_model = model_id.clone();
                     if let Err(e) = self.config.save() {
                         self.add_notification(format!("Failed to save config: {}", e), NotifLevel::Error);
                     } else {
-                        self.add_notification(format!("Active model: {}", self.config.active_model), NotifLevel::Info);
+                        self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                        self.add_notification(
+                            format!("Active model: {} ({})", self.config.active_model, provider.as_str()),
+                            NotifLevel::Info,
+                        );
                     }
                 }
                 self.ui_state.show_model_picker = false;
@@ -475,7 +508,7 @@ impl App {
         if let Some(cached) = self.config.provider_models.get(&provider) {
             if !cached.is_empty() {
                 self.config.models_cache = cached.clone();
-                if !self.config.models_cache.iter().any(|m| m.id == self.config.active_model) {
+                if self.config.active_model.is_empty() {
                     if let Some(first) = self.config.models_cache.first() {
                         self.config.active_model = first.id.clone();
                     }
@@ -563,6 +596,11 @@ impl App {
                     // Handle special commands
                     if cmd.starts_with(':') {
                         self.handle_special_command(&cmd).await?;
+                    } else if cmd.starts_with('?') {
+                        let query = cmd.trim_start_matches('?').trim().to_string();
+                        if !query.is_empty() {
+                            self.send_llm_query(&query).await?;
+                        }
                     } else if self.active_tab == 0 {
                         // Tab 0: execute as shell command in workspace
                         self.execute_workspace_command(&cmd).await?;
@@ -818,7 +856,10 @@ impl App {
                 }
             }
             ":models" | ":model" => {
-                if self.config.models_cache.is_empty() {
+                self.ui_state.model_picker_provider = self.config.provider;
+                self.ui_state.model_picker_selected = 0;
+                self.ui_state.model_picker_search.clear();
+                if self.config.get_models_for_provider(self.config.provider).is_empty() {
                     self.trigger_fetch_models();
                 }
                 self.ui_state.show_model_picker = true;
@@ -1128,6 +1169,13 @@ impl App {
         if request_id == self.llm_request_id {
             self.llm_request_state = LlmRequestState::Failed;
             self.add_notification(format!("LLM request failed: {}", error), NotifLevel::Error);
+            self.chat_log.push(ChatMessage {
+                role: "system".to_string(),
+                content: format!("⚠️ LLM Request Failed: {}", error),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            self.ui_state.log_at_bottom = true;
         }
     }
     
@@ -1140,9 +1188,15 @@ impl App {
         self.llm_request_state = LlmRequestState::Completed;
         
         if !self.pending_tool_calls.is_empty() {
-            // Collect tool calls first to avoid borrow issues
+            // Push assistant message with tool calls into chat log first (required by LLM APIs)
             let tool_calls = std::mem::take(&mut self.pending_tool_calls);
-            
+            self.chat_log.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: self.llm_response_buffer.clone(),
+                tool_calls: Some(tool_calls.clone()),
+                tool_call_id: None,
+            });
+
             // Execute tool calls
             for tool_call in tool_calls {
                 let result = crate::llm::tools::execute_tool_call(
@@ -1196,6 +1250,9 @@ impl App {
                 });
             }
             
+            // Reload sidebar to reflect any target/findings DB changes
+            self.reload_sidebar().await?;
+
             // Continue conversation with tool results
             self.continue_llm_conversation().await?;
         } else if self.post_exec_mode {
@@ -1241,7 +1298,57 @@ impl App {
     }
     
     async fn continue_llm_conversation(&mut self) -> Result<()> {
-        let messages = self.chat_log.clone();
+        let mut messages = Vec::new();
+
+        // System prompt with full context
+        let active_target = if let Some(id) = self.active_target_id {
+            DatabaseQueries::get_target(self.db.conn(), id).unwrap_or(None)
+        } else {
+            None
+        };
+        let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
+            let f = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id).unwrap_or_default();
+            let r = DatabaseQueries::get_recent_commands(self.db.conn(), target.id, 3).unwrap_or_default();
+            let c = DatabaseQueries::get_command_count(self.db.conn(), target.id).unwrap_or(0);
+            (f, r, c)
+        } else {
+            (Vec::new(), Vec::new(), 0)
+        };
+        let targets_count = DatabaseQueries::get_targets_count(self.db.conn()).unwrap_or(0);
+        let system_prompt = build_system_prompt(
+            &self.session_meta.name,
+            &self.session_meta.created_at.to_rfc3339(),
+            targets_count,
+            active_target.as_ref(),
+            &findings,
+            &recent_commands,
+            command_count,
+            recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+        );
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        // Filter valid OpenAI messages
+        for msg in &self.chat_log {
+            match msg.role.as_str() {
+                "user" | "assistant" | "system" | "tool" => {
+                    messages.push(msg.clone());
+                }
+                "output" => {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: format!("[Command Output]:\n{}", msg.content),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                _ => {}
+            }
+        }
         
         let request_id = self.next_request_id();
         let request = crate::llm::types::ChatCompletionRequest {
@@ -1293,6 +1400,7 @@ impl App {
     }
     
     fn handle_tick(&mut self) {
+        self.ui_state.tick_count = self.ui_state.tick_count.wrapping_add(1);
         // Clean up old notifications
         let now = Instant::now();
         self.notifications.retain(|n| now.duration_since(n.created_at).as_secs() < 5);

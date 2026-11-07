@@ -68,17 +68,54 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamChunk {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamChoice {
+    #[serde(default)]
     pub index: u32,
-    pub delta: ChatMessage,
+    #[serde(default)]
+    pub delta: ChatDelta,
+    #[serde(default)]
     pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatDelta {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<StreamToolCall>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamToolCall {
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(rename = "type", default)]
+    pub call_type: Option<String>,
+    #[serde(default)]
+    pub function: Option<StreamToolFunction>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamToolFunction {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 

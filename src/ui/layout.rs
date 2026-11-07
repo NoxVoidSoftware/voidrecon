@@ -70,6 +70,27 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         "Shell"
     };
     
+    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
+
+    let llm_indicator = match app.llm_request_state {
+        crate::llm::types::LlmRequestState::Streaming => {
+            Span::styled(format!(" [LLM {}] ", spinner), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+        }
+        crate::llm::types::LlmRequestState::ProcessingToolCalls => {
+            Span::styled(format!(" [Tools {}] ", spinner), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        }
+        crate::llm::types::LlmRequestState::Completed => {
+            Span::styled(" [LLM: Ready] ", Style::default().bg(Color::Green).fg(Color::Black))
+        }
+        crate::llm::types::LlmRequestState::Failed => {
+            Span::styled(" [LLM: Error] ", Style::default().bg(Color::Red).fg(Color::White))
+        }
+        crate::llm::types::LlmRequestState::Idle => {
+            Span::styled(" [LLM] ", Style::default().bg(Color::DarkGray).fg(Color::White))
+        }
+    };
+
     let header = Line::from(vec![
         Span::styled(format!(" session: {} ", app.session_meta.name), Style::default().bg(Color::Blue).fg(Color::White)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
@@ -78,6 +99,8 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!(" model: {} ", model_display), Style::default().bg(Color::Green).fg(Color::Black)),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!(" [{}] ", tab_name), Style::default().bg(Color::Yellow).fg(Color::Black)),
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        llm_indicator,
     ]);
     
     f.render_widget(Paragraph::new(header), area);
@@ -254,14 +277,17 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     for msg in &app.chat_log {
         match msg.role.as_str() {
             "user" => {
+                let is_llm = msg.content.starts_with('?');
+                let header = if is_llm { "You (LLM Query) " } else { "You ($) " };
+                let color = if is_llm { Color::Cyan } else { Color::Green };
                 lines.push(Line::from(vec![
-                    Span::styled("┌─ ", Style::default().fg(Color::Green)),
-                    Span::styled("You ($) ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled("┌─ ", Style::default().fg(color)),
+                    Span::styled(header, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     Span::styled("──────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
                 ]));
                 for line in msg.content.lines() {
                     lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(Color::Green)),
+                        Span::styled("│ ", Style::default().fg(color)),
                         Span::styled(line, Style::default().fg(Color::White)),
                     ]));
                 }
@@ -302,9 +328,12 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
                 lines.push(Line::from(""));
             }
             _ => {
+                lines.push(Line::from(vec![
+                    Span::styled("┌─ ⚠️ Notice / System ──────────────────────────────────────────", Style::default().fg(Color::Red)),
+                ]));
                 for line in msg.content.lines() {
                     lines.push(Line::from(vec![
-                        Span::styled("! ", Style::default().fg(Color::Red)),
+                        Span::styled("│ ", Style::default().fg(Color::Red)),
                         Span::styled(line, Style::default().fg(Color::White)),
                     ]));
                 }
@@ -314,19 +343,34 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     }
     
     // Add streaming LLM response
-    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming) && !app.llm_response_buffer.is_empty() {
+    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+        let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
+
+        let title = if app.llm_request_state == crate::llm::types::LlmRequestState::ProcessingToolCalls {
+            format!("┌─ 🤖 AI / LLM [Executing Tools... {}] ────────────────────────────", spinner)
+        } else {
+            format!("┌─ 🤖 AI / LLM [Thinking / Streaming... {}] ───────────────────────", spinner)
+        };
         lines.push(Line::from(vec![
-            Span::styled("┌─ 🤖 AI / LLM [Streaming...] ─────────────────────────────────", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]));
-        for line in app.llm_response_buffer.lines() {
+        if app.llm_response_buffer.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(Color::Yellow)),
-                Span::styled(line, Style::default().fg(Color::White)),
+                Span::styled(format!("Connecting to provider & generating response... {}", spinner), Style::default().fg(Color::Yellow)),
+            ]));
+        } else {
+            for line in app.llm_response_buffer.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(line, Style::default().fg(Color::White)),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("│ {}", spinner), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ]));
         }
-        lines.push(Line::from(vec![
-            Span::styled("│ ▌", Style::default().fg(Color::Yellow)),
-        ]));
         lines.push(Line::from(""));
     }
 
