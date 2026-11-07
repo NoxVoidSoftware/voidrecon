@@ -138,15 +138,11 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         
         if node.expanded {
             // Ports
-            if let Some(ports_json) = &node.target.ports_json {
-                if let Ok(ports) = serde_json::from_str::<Vec<crate::db::models::PortInfo>>(ports_json) {
-                    for port in ports {
-                        items.push(ListItem::new(Line::from(vec![
-                            Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(format!("{}/{}: {} {}", port.port, port.proto, port.service, port.version), Style::default().fg(Color::Cyan)),
-                        ])));
-                    }
-                }
+            for port in &node.ports {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}/{}: {} {}", port.port, port.proto, port.service, port.version), Style::default().fg(Color::Cyan)),
+                ])));
             }
             
             // Findings by severity
@@ -270,76 +266,101 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
     render_input_line(f, app, chunks[3]);
 }
 
-fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
+pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    
-    for msg in &app.chat_log {
-        match msg.role.as_str() {
-            "user" => {
-                let is_llm = msg.content.starts_with('?');
-                let header = if is_llm { "You (LLM Query) " } else { "You ($) " };
-                let color = if is_llm { Color::Cyan } else { Color::Green };
+    match msg.role.as_str() {
+        "user" => {
+            let is_llm = msg.content.starts_with('?');
+            let header = if is_llm { "You (LLM Query) " } else { "You ($) " };
+            let color = if is_llm { Color::Cyan } else { Color::Green };
+            lines.push(Line::from(vec![
+                Span::styled("┌─ ", Style::default().fg(color)),
+                Span::styled(header, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled("──────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
+            ]));
+            for line in msg.content.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled("┌─ ", Style::default().fg(color)),
-                    Span::styled(header, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::styled("──────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
+                    Span::styled("│ ", Style::default().fg(color)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
                 ]));
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(color)),
-                        Span::styled(line, Style::default().fg(Color::White)),
-                    ]));
-                }
-                lines.push(Line::from(""));
             }
-            "output" => {
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("  ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(line, Style::default().fg(Color::Gray)),
-                    ]));
-                }
-                lines.push(Line::from(""));
-            }
-            "assistant" => {
+            lines.push(Line::from(""));
+        }
+        "output" => {
+            for line in msg.content.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled("┌─ ", Style::default().fg(Color::Cyan)),
-                    Span::styled("🤖 AI / LLM ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("[{}] ", app.config.active_model), Style::default().fg(Color::Yellow)),
-                    Span::styled("──────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::Gray)),
                 ]));
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(Color::Cyan)),
-                        Span::styled(line, Style::default().fg(Color::White)),
-                    ]));
-                }
-                lines.push(Line::from(vec![
-                    Span::styled("└────────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
-                ]));
-                lines.push(Line::from(""));
             }
-            "tool" => {
+            lines.push(Line::from(""));
+        }
+        "assistant" => {
+            lines.push(Line::from(vec![
+                Span::styled("┌─ ", Style::default().fg(Color::Cyan)),
+                Span::styled("🤖 AI / LLM ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("[{}] ", active_model), Style::default().fg(Color::Yellow)),
+                Span::styled("──────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
+            ]));
+            for line in msg.content.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
-                    Span::styled(&msg.content, Style::default().fg(Color::DarkGray)),
+                    Span::styled("│ ", Style::default().fg(Color::Cyan)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
                 ]));
-                lines.push(Line::from(""));
             }
-            _ => {
+            lines.push(Line::from(vec![
+                Span::styled("└────────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+        }
+        "tool" => {
+            lines.push(Line::from(vec![
+                Span::styled("# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
+                Span::styled(msg.content.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+        }
+        _ => {
+            lines.push(Line::from(vec![
+                Span::styled("┌─ ⚠️ Notice / System ──────────────────────────────────────────", Style::default().fg(Color::Red)),
+            ]));
+            for line in msg.content.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled("┌─ ⚠️ Notice / System ──────────────────────────────────────────", Style::default().fg(Color::Red)),
+                    Span::styled("│ ", Style::default().fg(Color::Red)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
                 ]));
-                for line in msg.content.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(Color::Red)),
-                        Span::styled(line, Style::default().fg(Color::White)),
-                    ]));
-                }
-                lines.push(Line::from(""));
             }
+            lines.push(Line::from(""));
         }
     }
+    lines
+}
+
+fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+
+    let estimate_visual_rows = |lines_slice: &[Line]| -> usize {
+        if inner_width == 0 {
+            return lines_slice.len();
+        }
+        lines_slice
+            .iter()
+            .map(|l| {
+                let len: usize = l.spans.iter().map(|s| s.content.len()).sum();
+                if len == 0 { 1 } else { (len + inner_width - 1) / inner_width }
+            })
+            .sum()
+    };
+
+    // When at bottom, slice only the tail lines to keep Ratatui paragraph wrapping ultra-fast
+    let mut display_lines = if app.ui_state.log_at_bottom && app.cached_chat_lines.len() > 150 {
+        let tail_count = (inner_height * 3).max(100);
+        let start_idx = app.cached_chat_lines.len().saturating_sub(tail_count);
+        app.cached_chat_lines[start_idx..].to_vec()
+    } else {
+        app.cached_chat_lines.clone()
+    };
     
     // Add streaming LLM response
     if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
@@ -351,57 +372,49 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             format!("┌─ 🤖 AI / LLM [Thinking / Streaming... {}] (Ctrl+C: Cancel) ───", spinner)
         };
-        lines.push(Line::from(vec![
+        display_lines.push(Line::from(vec![
             Span::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]));
         if app.llm_response_buffer.is_empty() {
-            lines.push(Line::from(vec![
+            display_lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(Color::Yellow)),
                 Span::styled(format!("Connecting to provider & generating response... {}", spinner), Style::default().fg(Color::Yellow)),
             ]));
         } else {
             for line in app.llm_response_buffer.lines() {
-                lines.push(Line::from(vec![
+                display_lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::Yellow)),
-                    Span::styled(line, Style::default().fg(Color::White)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
                 ]));
             }
-            lines.push(Line::from(vec![
+            display_lines.push(Line::from(vec![
                 Span::styled(format!("│ {}", spinner), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ]));
         }
-        lines.push(Line::from(""));
+        display_lines.push(Line::from(""));
     }
 
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let total_visual_rows: usize = if inner_width > 0 {
-        lines.iter().map(|line| {
-            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            if len == 0 { 1 } else { (len + inner_width - 1) / inner_width }
-        }).sum()
-    } else {
-        lines.len()
-    };
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let total_visual_rows = estimate_visual_rows(&display_lines);
     let max_scroll = total_visual_rows.saturating_sub(inner_height);
 
-    if app.ui_state.log_at_bottom {
-        app.ui_state.log_scroll = max_scroll;
+    let (scroll_offset, title) = if app.ui_state.log_at_bottom {
+        (max_scroll, " Workspace & LLM ".to_string())
     } else {
-        app.ui_state.log_scroll = app.ui_state.log_scroll.min(max_scroll);
-    }
-
-    let title = if app.ui_state.log_scroll < max_scroll {
-        format!(" Workspace & LLM [Scrolled: line {}/{} - PgDn/Ctrl+End to bottom] ", app.ui_state.log_scroll, max_scroll)
-    } else {
-        " Workspace & LLM ".to_string()
+        let scroll = app.ui_state.log_scroll.min(max_scroll);
+        app.ui_state.log_scroll = scroll;
+        let title = if scroll < max_scroll {
+            format!(" Workspace & LLM [Scrolled: line {}/{} - PgDn/Ctrl+End to bottom] ", scroll, max_scroll)
+        } else {
+            " Workspace & LLM ".to_string()
+        };
+        (scroll, title)
     };
-    
-    let log = Paragraph::new(lines)
+
+    let log = Paragraph::new(display_lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false })
-        .scroll((app.ui_state.log_scroll as u16, 0));
-    
+        .scroll((scroll_offset as u16, 0));
+
     f.render_widget(log, area);
 }
 

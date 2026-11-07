@@ -19,36 +19,73 @@ use crate::ui::render_ui;
 
 impl App {
     pub async fn run<B: Backend>(&mut self, terminal: &mut ratatui::Terminal<B>) -> Result<()> {
-        loop {
-            // Render
-            terminal.draw(|f| render_ui(f, self))?;
+        // Initial render
+        terminal.draw(|f| render_ui(f, self))?;
+        
+        while !self.ui_state.should_quit {
+            let Some(first_event) = self.event_rx.recv().await else {
+                break;
+            };
             
-            // Handle events
-            if let Some(event) = self.event_rx.recv().await {
-                self.handle_event(event).await?;
+            let mut needs_render = self.handle_event(first_event).await?;
+            
+            // Drain and batch any already-queued events before drawing
+            while let Ok(event) = self.event_rx.try_recv() {
+                if self.handle_event(event).await? {
+                    needs_render = true;
+                }
             }
             
-            // Check for quit
-            if self.ui_state.should_quit {
-                break;
+            if needs_render && !self.ui_state.should_quit {
+                terminal.draw(|f| render_ui(f, self))?;
             }
         }
         Ok(())
     }
     
-    async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
+    async fn handle_event(&mut self, event: AppEvent) -> Result<bool> {
         match event {
-            AppEvent::Key(key) => self.handle_key(key).await?,
-            AppEvent::PtyData(tab_id, data) => self.handle_pty_data(tab_id, data).await?,
-            AppEvent::PtyExited(tab_id, exit_code) => self.handle_pty_exited(tab_id, exit_code).await?,
-            AppEvent::LlmChunk(request_id, chunk) => self.handle_llm_chunk(request_id, chunk),
-            AppEvent::LlmToolCall(request_id, tool_call) => self.handle_llm_tool_call(request_id, tool_call).await?,
-            AppEvent::LlmRequestStarted(request_id) => self.handle_llm_request_started(request_id),
-            AppEvent::LlmRequestFailed(request_id, error) => self.handle_llm_request_failed(request_id, error),
-            AppEvent::LlmDone(request_id) => self.handle_llm_done(request_id).await?,
-            AppEvent::Tick => self.handle_tick(),
-            AppEvent::Resize(cols, rows) => self.handle_resize(cols, rows).await?,
-            AppEvent::SidebarReload => self.reload_sidebar().await?,
+            AppEvent::Key(key) => {
+                self.handle_key(key).await?;
+                Ok(true)
+            }
+            AppEvent::PtyData(tab_id, data) => {
+                self.handle_pty_data(tab_id, data).await?;
+                Ok(true)
+            }
+            AppEvent::PtyExited(tab_id, exit_code) => {
+                self.handle_pty_exited(tab_id, exit_code).await?;
+                Ok(true)
+            }
+            AppEvent::LlmChunk(request_id, chunk) => {
+                self.handle_llm_chunk(request_id, chunk);
+                Ok(true)
+            }
+            AppEvent::LlmToolCall(request_id, tool_call) => {
+                self.handle_llm_tool_call(request_id, tool_call).await?;
+                Ok(true)
+            }
+            AppEvent::LlmRequestStarted(request_id) => {
+                self.handle_llm_request_started(request_id);
+                Ok(true)
+            }
+            AppEvent::LlmRequestFailed(request_id, error) => {
+                self.handle_llm_request_failed(request_id, error);
+                Ok(true)
+            }
+            AppEvent::LlmDone(request_id) => {
+                self.handle_llm_done(request_id).await?;
+                Ok(true)
+            }
+            AppEvent::Tick => Ok(self.handle_tick()),
+            AppEvent::Resize(cols, rows) => {
+                self.handle_resize(cols, rows).await?;
+                Ok(true)
+            }
+            AppEvent::SidebarReload => {
+                self.reload_sidebar().await?;
+                Ok(true)
+            }
             AppEvent::ModelsLoadedForProvider(provider, models) => {
                 let count = models.len();
                 self.config.update_models_cache_for_provider(provider, models);
@@ -57,9 +94,9 @@ impl App {
                     format!("Fetched {} models from {}", count, provider.as_str()),
                     NotifLevel::Info,
                 );
+                Ok(true)
             }
         }
-        Ok(())
     }
 
     pub fn trigger_fetch_models(&self) {
@@ -1511,15 +1548,27 @@ impl App {
         Ok(())
     }
     
-    fn handle_tick(&mut self) {
-        self.ui_state.tick_count = self.ui_state.tick_count.wrapping_add(1);
-        // Clean up old notifications
+    fn handle_tick(&mut self) -> bool {
         let now = Instant::now();
+        let had_notifications = !self.notifications.is_empty();
         self.notifications.retain(|n| now.duration_since(n.created_at).as_secs() < 5);
         if self.notifications.len() > 3 {
             self.notifications.drain(0..self.notifications.len() - 3);
         }
+        let has_notifications = !self.notifications.is_empty();
         self.last_tick = now;
+
+        let is_animating = matches!(
+            self.llm_request_state,
+            LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
+        );
+
+        if is_animating {
+            self.ui_state.tick_count = self.ui_state.tick_count.wrapping_add(1);
+            true
+        } else {
+            had_notifications || has_notifications
+        }
     }
     
     pub async fn update_pty_dimensions(&mut self) -> Result<()> {
@@ -1563,8 +1612,15 @@ impl App {
                 severity_order(&a.0).cmp(&severity_order(&b.0))
             });
             
+            let ports = if let Some(ports_json) = &target.ports_json {
+                serde_json::from_str::<Vec<crate::db::models::PortInfo>>(ports_json).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            
             self.sidebar_nodes.push(SidebarNode {
                 target,
+                ports,
                 expanded: true,
                 findings_by_severity,
             });

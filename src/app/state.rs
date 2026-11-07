@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use ratatui::text::Line;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -37,6 +38,7 @@ pub struct Notification {
 #[derive(Debug, Clone)]
 pub struct SidebarNode {
     pub target: Target,
+    pub ports: Vec<crate::db::models::PortInfo>,
     pub expanded: bool,
     pub findings_by_severity: Vec<(String, Vec<Finding>)>,
 }
@@ -181,6 +183,7 @@ pub struct App {
     
     // Chat history (for display only)
     pub chat_log: Vec<ChatMessage>,
+    pub cached_chat_lines: Vec<Line<'static>>,
     
     // Notifications
     pub notifications: Vec<Notification>,
@@ -283,6 +286,7 @@ impl App {
             suggestion: None,
             suggestion_visible: false,
             chat_log: Vec::new(),
+            cached_chat_lines: Vec::new(),
             notifications: Vec::new(),
             event_tx,
             event_rx,
@@ -329,7 +333,17 @@ impl App {
         let _ = self.session_meta.save_chat_history(&self.chat_log);
     }
 
+    pub fn rebuild_cached_chat_lines(&mut self) {
+        self.cached_chat_lines.clear();
+        for msg in &self.chat_log {
+            let lines = crate::ui::layout::format_chat_message(msg, &self.config.active_model);
+            self.cached_chat_lines.extend(lines);
+        }
+    }
+
     pub fn append_chat_message(&mut self, msg: ChatMessage) {
+        let lines = crate::ui::layout::format_chat_message(&msg, &self.config.active_model);
+        self.cached_chat_lines.extend(lines);
         self.chat_log.push(msg);
         self.save_chat_history();
     }
@@ -341,6 +355,7 @@ impl App {
             self.db = Database::in_memory()?;
             self.session_meta = SessionMeta::new("None".to_string());
             self.chat_log.clear();
+            self.cached_chat_lines.clear();
             self.tabs.clear();
             self.sidebar_nodes.clear();
             self.active_target_id = None;
@@ -382,6 +397,7 @@ impl App {
 
         self.db = Database::new(&session_meta.db_path())?;
         self.chat_log = session_meta.load_chat_history();
+        self.rebuild_cached_chat_lines();
         self.session_meta = session_meta;
         self.tabs.clear();
         self.active_tab = 0;
