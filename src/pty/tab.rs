@@ -155,32 +155,119 @@ impl PtyTab {
             })
             .context("Failed to open PTY for listener")?;
 
-        // Try nc, ncat, socat in order
-        let listeners = ["nc", "ncat", "socat"];
-        let mut cmd = None;
-        for listener in listeners {
+        // Try nc, ncat, socat, python, powershell in order
+        let mut builder: Option<CommandBuilder> = None;
+
+        for listener in ["nc", "ncat", "socat"] {
             if which::which(listener).is_ok() {
-                cmd = Some(listener);
+                let mut b = CommandBuilder::new(listener);
+                for (k, v) in std::env::vars() {
+                    b.env(k, v);
+                }
+                match listener {
+                    "nc" | "ncat" => {
+                        b.arg("-lvnp");
+                        b.arg(lport.to_string());
+                    }
+                    "socat" => {
+                        b.arg(format!("TCP-LISTEN:{},reuseaddr,fork", lport));
+                        b.arg("EXEC:bash,pty,stderr,setsid,sigint,sane");
+                    }
+                    _ => {}
+                }
+                builder = Some(b);
                 break;
             }
         }
-        let listener = cmd.context("No netcat listener found (nc, ncat, socat)")?;
 
-        let mut builder = CommandBuilder::new(listener);
-        for (k, v) in std::env::vars() {
-            builder.env(k, v);
-        }
-        match listener {
-            "nc" | "ncat" => {
-                builder.arg("-lvnp");
-                builder.arg(lport.to_string());
+        if builder.is_none() {
+            // Check for python3 or python
+            let py = if which::which("python3").is_ok() {
+                Some("python3")
+            } else if which::which("python").is_ok() {
+                Some("python")
+            } else {
+                None
+            };
+
+            if let Some(py_bin) = py {
+                let script = format!(
+                    "import socket, sys, threading\n\
+                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n\
+                     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
+                     s.bind(('0.0.0.0', {port}))\n\
+                     s.listen(1)\n\
+                     print('[*] Python Reverse Shell Listener active on 0.0.0.0:{port}', flush=True)\n\
+                     print('[*] Waiting for incoming connection...', flush=True)\n\
+                     conn, addr = s.accept()\n\
+                     print(f'[+] Shell connection received from {{addr[0]}}:{{addr[1]}}!', flush=True)\n\
+                     def rx():\n\
+                         while True:\n\
+                             try:\n\
+                                 d = conn.recv(1024)\n\
+                                 if not d: break\n\
+                                 sys.stdout.buffer.write(d)\n\
+                                 sys.stdout.buffer.flush()\n\
+                             except: break\n\
+                     threading.Thread(target=rx, daemon=True).start()\n\
+                     while True:\n\
+                         try:\n\
+                             d = sys.stdin.buffer.read(1)\n\
+                             if not d: break\n\
+                             conn.sendall(d)\n\
+                         except: break\n",
+                    port = lport
+                );
+                let mut b = CommandBuilder::new(py_bin);
+                for (k, v) in std::env::vars() {
+                    b.env(k, v);
+                }
+                b.arg("-u");
+                b.arg("-c");
+                b.arg(script);
+                builder = Some(b);
             }
-            "socat" => {
-                builder.arg(format!("TCP-LISTEN:{},reuseaddr,fork", lport));
-                builder.arg("EXEC:bash,pty,stderr,setsid,sigint,sane");
-            }
-            _ => {}
         }
+
+        if builder.is_none() {
+            // Fallback to powershell / pwsh on Windows
+            let ps = if which::which("pwsh").is_ok() {
+                Some("pwsh")
+            } else if which::which("powershell").is_ok() {
+                Some("powershell")
+            } else {
+                None
+            };
+
+            if let Some(ps_bin) = ps {
+                let ps_cmd = format!(
+                    "$port = {port}; \
+                     Write-Host '[*] Reverse shell listener active on 0.0.0.0:'$port; \
+                     Write-Host '[*] Waiting for connection...'; \
+                     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $port); \
+                     $listener.Start(); \
+                     $client = $listener.AcceptTcpClient(); \
+                     Write-Host ('[+] Shell connection received from ' + $client.Client.RemoteEndPoint); \
+                     $stream = $client.GetStream(); \
+                     $buf = New-Object byte[] 1024; \
+                     [System.Threading.Tasks.Task]::Run({{ while(($r = $stream.Read($buf, 0, $buf.Length)) -gt 0){{ [Console]::OpenStandardOutput().Write($buf, 0, $r) }} }}); \
+                     while($true){{ if([Console]::KeyAvailable){{ $k = [Console]::ReadKey($true); [byte[]]$b = [System.Text.Encoding]::ASCII.GetBytes($k.KeyChar); $stream.Write($b, 0, $b.Length) }} Start-Sleep -Milliseconds 20 }}",
+                    port = lport
+                );
+                let mut b = CommandBuilder::new(ps_bin);
+                for (k, v) in std::env::vars() {
+                    b.env(k, v);
+                }
+                b.arg("-NoProfile");
+                b.arg("-ExecutionPolicy");
+                b.arg("Bypass");
+                b.arg("-Command");
+                b.arg(ps_cmd);
+                builder = Some(b);
+            }
+        }
+
+        let builder = builder.context("No listener executable found (nc, ncat, socat, python, powershell)")?;
 
         let child = pty_pair
             .slave

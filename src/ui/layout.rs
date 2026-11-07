@@ -227,7 +227,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
-    let approval_height = if app.pending_exploit_approval.is_some() { 4 } else { 0 };
+    let approval_height = if app.pending_exploit_approval.is_some() { 5 } else { 0 };
     let suggestion_height = if app.suggestion_visible { 5 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -251,9 +251,9 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!(" Target: {} (ID {}) │ Interface: {}:{} │ Shell: {}", approval.target_ip, approval.target_id, approval.lhost, approval.lport, approval.shell_type), Style::default().fg(Color::Yellow)),
             ]),
             Line::from(vec![
-                Span::styled(" [y] Approve & Spawn Listener ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+                Span::styled(" [y / Enter] Approve & Spawn Listener ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
                 Span::raw("   "),
-                Span::styled(" [n/Esc] Reject ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+                Span::styled(" [n / Esc] Reject ", Style::default().bg(Color::DarkGray).fg(Color::White)),
             ]),
         ];
         let block = Block::default()
@@ -439,6 +439,19 @@ fn render_suggestion_panel(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
+    if app.pending_exploit_approval.is_some() {
+        let line = Line::from(vec![
+            Span::styled(" [ACTION APPROVAL] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Press ", Style::default().fg(Color::White)),
+            Span::styled(" [Y / Enter] ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+            Span::styled(" to Approve listener or ", Style::default().fg(Color::White)),
+            Span::styled(" [N / Esc] ", Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" to Reject", Style::default().fg(Color::White)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let (mode_indicator, mode_style) = match app.input_mode {
         InputMode::Shell => ("> ", Style::default().fg(Color::Green)),
         InputMode::LlmQuery => ("? ", Style::default().fg(Color::Cyan)),
@@ -487,6 +500,9 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Tab:Switch Tab ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" Esc:Workspace ", Style::default().bg(Color::DarkGray).fg(Color::White)),
     ];
+    if app.pending_exploit_approval.is_some() {
+        footer_spans.push(Span::styled(" [Y: Approve | N: Reject] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+    }
     if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
         footer_spans.push(Span::styled(" Ctrl+C: Cancel LLM ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }

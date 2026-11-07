@@ -166,25 +166,47 @@ impl App {
             return Ok(());
         }
 
-        // If Exploit Approval is pending, intercept y/n/Esc
+        // If Exploit Approval is pending, intercept y/n/Enter/Esc
         if let Some(approval) = self.pending_exploit_approval.clone() {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.pending_exploit_approval = None;
-                    self.spawn_listener_tab(approval.lport).await?;
-                    self.append_chat_message(ChatMessage {
-                        role: "tool".to_string(),
-                        content: serde_json::json!({
-                            "status": "approved",
-                            "message": format!("Listener spawned on port {}", approval.lport),
-                            "target_id": approval.target_id,
-                            "lhost": approval.lhost,
-                            "lport": approval.lport,
-                            "shell_type": approval.shell_type,
-                        }).to_string(),
-                        tool_calls: None,
-                        tool_call_id: Some(approval.tool_call.id),
-                    });
+                    match self.spawn_listener_tab(approval.lport).await {
+                        Ok(()) => {
+                            self.append_chat_message(ChatMessage {
+                                role: "tool".to_string(),
+                                content: serde_json::json!({
+                                    "status": "approved",
+                                    "message": format!("Listener spawned on port {}", approval.lport),
+                                    "target_id": approval.target_id,
+                                    "lhost": approval.lhost,
+                                    "lport": approval.lport,
+                                    "shell_type": approval.shell_type,
+                                }).to_string(),
+                                tool_calls: None,
+                                tool_call_id: Some(approval.tool_call.id),
+                            });
+                            self.add_notification(
+                                format!("Spawned listener on port {}", approval.lport),
+                                NotifLevel::Info,
+                            );
+                        }
+                        Err(e) => {
+                            self.append_chat_message(ChatMessage {
+                                role: "tool".to_string(),
+                                content: serde_json::json!({
+                                    "status": "error",
+                                    "message": format!("Failed to spawn listener on port {}: {}", approval.lport, e),
+                                }).to_string(),
+                                tool_calls: None,
+                                tool_call_id: Some(approval.tool_call.id),
+                            });
+                            self.add_notification(
+                                format!("Failed to spawn listener: {}", e),
+                                NotifLevel::Error,
+                            );
+                        }
+                    }
                     self.continue_llm_conversation().await?;
                     return Ok(());
                 }
@@ -199,10 +221,14 @@ impl App {
                         tool_calls: None,
                         tool_call_id: Some(approval.tool_call.id),
                     });
+                    self.add_notification("Reverse shell listener rejected".to_string(), NotifLevel::Info);
                     self.continue_llm_conversation().await?;
                     return Ok(());
                 }
-                _ => return Ok(()),
+                _ => {
+                    self.add_notification("Press [Y] or [Enter] to approve, [N] or [Esc] to reject".to_string(), NotifLevel::Warning);
+                    return Ok(());
+                }
             }
         }
 
