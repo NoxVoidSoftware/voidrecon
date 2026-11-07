@@ -22,6 +22,53 @@ struct LlmClientInner {
     provider: Provider,
 }
 
+pub fn parse_retry_delay(headers: &reqwest::header::HeaderMap, response_body: &str) -> Duration {
+    // 1. Check Retry-After header
+    if let Some(retry_after) = headers.get(reqwest::header::RETRY_AFTER) {
+        if let Ok(val) = retry_after.to_str() {
+            if let Ok(secs) = val.trim().parse::<u64>() {
+                return Duration::from_secs(secs.clamp(1, 60));
+            }
+            if let Ok(secs_f) = val.trim().parse::<f64>() {
+                if secs_f > 0.0 {
+                    return Duration::from_millis((secs_f * 1000.0).clamp(1000.0, 60000.0) as u64);
+                }
+            }
+        }
+    }
+
+    // 2. Check JSON error body
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(response_body) {
+        if let Some(secs) = json.get("retry_after").and_then(|v| v.as_f64()).or_else(|| {
+            json.get("error").and_then(|e| e.get("retry_after")).and_then(|v| v.as_f64())
+        }) {
+            if secs > 0.0 {
+                return Duration::from_millis((secs * 1000.0).clamp(1000.0, 60000.0) as u64);
+            }
+        }
+    }
+
+    // 3. Search in text for regex-like patterns: "try again in X", "retry after X", "retry in X"
+    let lower = response_body.to_lowercase();
+    for pattern in ["try again in ", "retry after ", "retry in "] {
+        if let Some(pos) = lower.find(pattern) {
+            let after = &lower[pos + pattern.len()..];
+            let num_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(secs) = num_str.parse::<f64>() {
+                if secs > 0.0 {
+                    return Duration::from_millis((secs * 1000.0).clamp(1000.0, 60000.0) as u64);
+                }
+            }
+        }
+    }
+
+    // Default: 10 seconds (as requested by user)
+    Duration::from_secs(10)
+}
+
 impl LlmClient {
     pub fn new(provider: Provider) -> Self {
         let inner = LlmClientInner {
@@ -183,56 +230,80 @@ impl LlmClient {
         let mut request = request;
         request.stream = true;
 
-        let mut req = self
-            .inner
-            .client
-            .post(self.inner.provider.chat_endpoint())
-            .header(CONTENT_TYPE, "application/json");
+        let mut retry_count = 0;
+        let response = loop {
+            let mut req = self
+                .inner
+                .client
+                .post(self.inner.provider.chat_endpoint())
+                .header(CONTENT_TYPE, "application/json");
 
-        if let Some(key) = self.inner.provider.api_key() {
-            if !key.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", key.trim()));
+            if let Some(key) = self.inner.provider.api_key() {
+                if !key.trim().is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", key.trim()));
+                }
             }
-        }
 
-        if self.inner.provider.kind() == ProviderKind::OpenRouter {
-            req = req
-                .header("HTTP-Referer", "https://github.com/NoxVoid/voidrecon")
-                .header("X-Title", "voidrecon");
-        }
+            if self.inner.provider.kind() == ProviderKind::OpenRouter {
+                req = req
+                    .header("HTTP-Referer", "https://github.com/NoxVoid/voidrecon")
+                    .header("X-Title", "voidrecon");
+            }
 
-        let response = match req.json(&request).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                let err_msg = if e.is_connect() {
-                    format!("Connection failed to {}: {}", self.inner.provider.name(), e)
-                } else if e.is_timeout() {
-                    format!("Request timed out connecting to {}", self.inner.provider.name())
+            let resp = match req.json(&request).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let err_msg = if e.is_connect() {
+                        format!("Connection failed to {}: {}", self.inner.provider.name(), e)
+                    } else if e.is_timeout() {
+                        format!("Request timed out connecting to {}", self.inner.provider.name())
+                    } else {
+                        format!("HTTP error: {}", e)
+                    };
+                    let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
+                    anyhow::bail!(err_msg);
+                }
+            };
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                retry_count += 1;
+                let headers = resp.headers().clone();
+                let raw_err = resp.text().await.unwrap_or_default();
+                let wait_duration = parse_retry_delay(&headers, &raw_err);
+                let wait_secs = wait_duration.as_secs_f32();
+
+                let retry_msg = format!(
+                    "\n[⚠️ HTTP 429 Rate Limited from {}. Retrying in {:.1}s (attempt #{})... Press Ctrl+C to cancel]\n",
+                    self.inner.provider.name(),
+                    wait_secs,
+                    retry_count
+                );
+                let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, retry_msg));
+
+                tokio::time::sleep(wait_duration).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let raw_err = resp.text().await.unwrap_or_default();
+                let detail = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_err) {
+                    json.get("detail")
+                        .or_else(|| json.get("message"))
+                        .or_else(|| json.get("error").and_then(|e| e.get("message")))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or(raw_err)
                 } else {
-                    format!("HTTP error: {}", e)
+                    raw_err
                 };
+                let err_msg = format!("HTTP {} from {}: {}", status, self.inner.provider.name(), detail);
                 let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
                 anyhow::bail!(err_msg);
             }
-        };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let raw_err = response.text().await.unwrap_or_default();
-            let detail = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_err) {
-                json.get("detail")
-                    .or_else(|| json.get("message"))
-                    .or_else(|| json.get("error").and_then(|e| e.get("message")))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or(raw_err)
-            } else {
-                raw_err
-            };
-            let err_msg = format!("HTTP {} from {}: {}", status, self.inner.provider.name(), detail);
-            let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, err_msg.clone()));
-            anyhow::bail!(err_msg);
-        }
+            break resp;
+        };
 
         let _ = tx.send(crate::app::AppEvent::LlmRequestStarted(request_id));
 
@@ -360,5 +431,42 @@ impl LlmClient {
             }],
             usage: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_retry_delay_from_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "5".parse().unwrap());
+        let duration = parse_retry_delay(&headers, "");
+        assert_eq!(duration, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_parse_retry_delay_from_json() {
+        let headers = reqwest::header::HeaderMap::new();
+        let body = r#"{"error": {"retry_after": 7.5}}"#;
+        let duration = parse_retry_delay(&headers, body);
+        assert_eq!(duration, Duration::from_millis(7500));
+    }
+
+    #[test]
+    fn test_parse_retry_delay_from_text() {
+        let headers = reqwest::header::HeaderMap::new();
+        let body = "Rate limit reached. Try again in 4.2s.";
+        let duration = parse_retry_delay(&headers, body);
+        assert_eq!(duration, Duration::from_millis(4200));
+    }
+
+    #[test]
+    fn test_parse_retry_delay_default_10s() {
+        let headers = reqwest::header::HeaderMap::new();
+        let body = "Too many requests";
+        let duration = parse_retry_delay(&headers, body);
+        assert_eq!(duration, Duration::from_secs(10));
     }
 }
