@@ -23,6 +23,7 @@ pub enum AppEvent {
     LlmRequestFailed(u64, String),
     LlmDone(u64),
     CommandStarted(u64, String),
+    CommandChunk(u64, String),
     CommandCompleted(u64, CommandResult),
     Tick,
     Resize(u16, u16),

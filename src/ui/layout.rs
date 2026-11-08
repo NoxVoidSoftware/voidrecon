@@ -639,7 +639,35 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
         display_lines.push(Line::from(vec![
             Span::styled(format!(" {} Executing: {} ({}s)...", spinner, cmd, elapsed), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" [Ctrl+C: Cancel | Type below for stdin]", Style::default().fg(Color::DarkGray)),
         ]));
+
+        if !app.running_command_output.is_empty() {
+            let max_display = 25;
+            let count = app.running_command_output.len();
+            let start = count.saturating_sub(max_display);
+            let slice = &app.running_command_output[start..];
+
+            display_lines.push(Line::from(vec![
+                Span::styled(format!("┌── Live Process Output (last {} lines) ──────────────────────────", slice.len()), Style::default().fg(Color::Cyan)),
+            ]));
+            for line in slice {
+                push_chunked_line(
+                    &mut display_lines,
+                    "│ ",
+                    Style::default().fg(Color::Cyan),
+                    line,
+                    Style::default().fg(Color::White),
+                );
+            }
+            display_lines.push(Line::from(vec![
+                Span::styled("└─────────────────────────────────────────────────────────────", Style::default().fg(Color::Cyan)),
+            ]));
+        } else {
+            display_lines.push(Line::from(vec![
+                Span::styled("  (Waiting for process output... If tool is prompting, type below and hit Enter)", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
         display_lines.push(Line::from(""));
     }
 
@@ -738,9 +766,12 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let is_running_cmd = app.running_command.is_some() && app.active_tab == 0;
     let (mode_indicator, mode_style) = match app.input_mode {
         InputMode::Shell => {
-            if app.ui_state.focus == crate::app::state::WindowFocus::Input {
+            if is_running_cmd {
+                ("[stdin] > ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else if app.ui_state.focus == crate::app::state::WindowFocus::Input {
                 ("> ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
             } else {
                 ("> ", Style::default().fg(Color::DarkGray))
@@ -756,9 +787,22 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
         ),
     };
     
+    let input_span = if app.input_buffer.is_empty() {
+        if is_running_cmd {
+            Span::styled(
+                "(Process running - type here & Enter to send stdin, or Ctrl+C to cancel)",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )
+        } else {
+            Span::raw("")
+        }
+    } else {
+        Span::raw(&app.input_buffer)
+    };
+
     let input = Paragraph::new(Line::from(vec![
         Span::styled(mode_indicator, mode_style),
-        Span::raw(&app.input_buffer),
+        input_span,
     ]))
     .style(Style::default().fg(Color::White))
     .block(Block::default().borders(Borders::NONE));
@@ -793,15 +837,22 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         InputMode::EditCommand => "EDIT CMD",
     };
     
+    let mouse_label = if app.mouse_capture_enabled { "F4/Alt+M:Mouse[ON]" } else { "F4/Alt+M:Mouse[OFF]" };
+    let mouse_fg = if app.mouse_capture_enabled { Color::Green } else { Color::Yellow };
+
     let mut footer_spans = vec![
-        Span::styled(" F1/Alt+H/:help:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(" F1/Alt+H:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F2:Models ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" F3:New Shell ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(format!(" {} ", mouse_label), Style::default().bg(Color::DarkGray).fg(mouse_fg)),
         Span::styled(" Tab:Switch Tab ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::styled(" Esc:Workspace ", Style::default().bg(Color::DarkGray).fg(Color::White)),
     ];
     if app.pending_exploit_approval.is_some() {
         footer_spans.push(Span::styled(" [Y: Approve | N: Reject] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+    }
+    if app.running_command.is_some() {
+        footer_spans.push(Span::styled(" Ctrl+C: Cancel Process ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
     if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
         footer_spans.push(Span::styled(" Ctrl+C: Cancel LLM ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));

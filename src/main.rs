@@ -11,7 +11,7 @@ mod ui;
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::DisableMouseCapture,
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 
     // Setup terminal
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout(), EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 

@@ -217,7 +217,13 @@ pub struct App {
 
     // Background workspace command execution (Tab 0)
     pub running_command: Option<(u64, String, Instant)>,
+    pub running_command_output: Vec<String>,
+    pub running_command_raw: String,
+    pub command_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     pub command_abort_handle: Option<tokio::task::AbortHandle>,
+
+    // Mouse mode
+    pub mouse_capture_enabled: bool,
 
     // Timing
     pub last_tick: Instant,
@@ -318,7 +324,11 @@ impl App {
             terminal_size: crossterm::terminal::size().unwrap_or((80, 24)),
             pending_exploit_approval: None,
             running_command: None,
+            running_command_output: Vec::new(),
+            running_command_raw: String::new(),
+            command_stdin_tx: None,
             command_abort_handle: None,
+            mouse_capture_enabled: false,
             last_tick: Instant::now(),
         };
 

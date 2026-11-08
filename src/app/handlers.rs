@@ -85,6 +85,10 @@ impl App {
                 self.handle_command_started(request_id, cmd);
                 Ok(true)
             }
+            AppEvent::CommandChunk(request_id, chunk) => {
+                self.handle_command_chunk(request_id, chunk);
+                Ok(true)
+            }
             AppEvent::CommandCompleted(request_id, result) => {
                 self.handle_command_completed(request_id, result).await?;
                 Ok(true)
@@ -486,6 +490,10 @@ impl App {
                     self.new_shell_tab().await?;
                     return Ok(());
                 }
+                (KeyCode::F(4), _) | (KeyCode::Char('m'), KeyModifiers::ALT) => {
+                    self.toggle_mouse_capture()?;
+                    return Ok(());
+                }
                 (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
                     self.cycle_tab();
                     return Ok(());
@@ -520,6 +528,9 @@ impl App {
                 if let Some(handle) = self.command_abort_handle.take() {
                     handle.abort();
                     self.running_command = None;
+                    self.command_stdin_tx = None;
+                    self.running_command_output.clear();
+                    self.running_command_raw.clear();
                     self.append_chat_message(ChatMessage {
                         role: "system".to_string(),
                         content: "⚠️ Command cancelled by user (Ctrl+C)".to_string(),
@@ -564,6 +575,10 @@ impl App {
             }
             (KeyCode::F(3), _) => {
                 self.new_shell_tab().await?;
+                return Ok(());
+            }
+            (KeyCode::F(4), _) | (KeyCode::Char('m'), KeyModifiers::ALT) => {
+                self.toggle_mouse_capture()?;
                 return Ok(());
             }
             (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
@@ -911,27 +926,50 @@ impl App {
     async fn handle_shell_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Enter => {
-                let cmd = self.input_buffer.trim().to_string();
+                let cmd = self.input_buffer.clone();
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
-                if !cmd.is_empty() {
-                    self.command_history.push_back(cmd.clone());
+
+                // If a command is running in workspace tab, forward input to its stdin
+                if self.running_command.is_some() && self.active_tab == 0 {
+                    if let Some(tx) = &self.command_stdin_tx {
+                        let _ = tx.send(format!("{}\n", cmd));
+                        self.append_chat_message(ChatMessage {
+                            role: "user".to_string(),
+                            content: if cmd.trim().is_empty() {
+                                "[stdin] > <Enter>".to_string()
+                            } else {
+                                format!("[stdin] > {}", cmd.trim())
+                            },
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        self.add_notification("Sent input to running process".to_string(), NotifLevel::Info);
+                    } else {
+                        self.add_notification("Command is running (stdin closed). Press Ctrl+C to cancel.".to_string(), NotifLevel::Warning);
+                    }
+                    return Ok(());
+                }
+
+                let trimmed = cmd.trim().to_string();
+                if !trimmed.is_empty() {
+                    self.command_history.push_back(trimmed.clone());
                     self.history_index = None;
                     
                     // Handle special commands
-                    if cmd.starts_with(':') {
-                        self.handle_special_command(&cmd).await?;
-                    } else if cmd.starts_with('?') {
-                        let query = cmd.trim_start_matches('?').trim().to_string();
+                    if trimmed.starts_with(':') {
+                        self.handle_special_command(&trimmed).await?;
+                    } else if trimmed.starts_with('?') {
+                        let query = trimmed.trim_start_matches('?').trim().to_string();
                         if !query.is_empty() {
                             self.send_llm_query(&query).await?;
                         }
                     } else if self.active_tab == 0 {
                         // Tab 0: execute as shell command in workspace
-                        self.execute_workspace_command(&cmd).await?;
+                        self.execute_workspace_command(&trimmed).await?;
                     } else {
                         // Other tabs: send to PTY
-                        self.send_to_pty(&cmd).await?;
+                        self.send_to_pty(&trimmed).await?;
                     }
                 }
             }
@@ -1301,6 +1339,27 @@ impl App {
             ":closeshell" => {
                 self.close_current_shell().await?;
             }
+            ":mouse" => {
+                if parts.len() > 1 {
+                    match parts[1].trim() {
+                        "on" | "enable" | "1" => {
+                            if !self.mouse_capture_enabled {
+                                self.toggle_mouse_capture()?;
+                            }
+                        }
+                        "off" | "disable" | "0" => {
+                            if self.mouse_capture_enabled {
+                                self.toggle_mouse_capture()?;
+                            }
+                        }
+                        _ => {
+                            self.toggle_mouse_capture()?;
+                        }
+                    }
+                } else {
+                    self.toggle_mouse_capture()?;
+                }
+            }
             ":exploit" => {
                 if self.active_target_id.is_some() {
                     self.send_llm_query("give me a shell on this target").await?;
@@ -1315,6 +1374,51 @@ impl App {
     
     fn handle_command_started(&mut self, request_id: u64, cmd: String) {
         self.running_command = Some((request_id, cmd, Instant::now()));
+        self.running_command_output.clear();
+        self.running_command_raw.clear();
+    }
+
+    fn handle_command_chunk(&mut self, request_id: u64, chunk: String) {
+        if let Some((cur_id, _, _)) = &self.running_command {
+            if *cur_id != request_id {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        // Cap raw buffer to prevent unbounded memory growth during large scans
+        if self.running_command_raw.len() > 100_000 {
+            let keep_from = self.running_command_raw.len() - 80_000;
+            self.running_command_raw = self.running_command_raw[keep_from..].to_string();
+        }
+        self.running_command_raw.push_str(&chunk);
+
+        let sanitized = crate::ui::layout::sanitize_terminal_output(&self.running_command_raw);
+        let mut lines = Vec::new();
+        for line in sanitized.lines() {
+            let trimmed = line.trim_end_matches('\r');
+            if trimmed.len() > 160 {
+                for chunk_str in trimmed.as_bytes().chunks(160) {
+                    if let Ok(s) = std::str::from_utf8(chunk_str) {
+                        lines.push(s.to_string());
+                    }
+                }
+            } else {
+                lines.push(trimmed.to_string());
+            }
+        }
+
+        // Retain last 100 lines for live preview box
+        if lines.len() > 100 {
+            let start = lines.len() - 100;
+            lines = lines[start..].to_vec();
+        }
+        self.running_command_output = lines;
+
+        if self.ui_state.log_at_bottom {
+            self.ui_state.log_scroll = usize::MAX;
+        }
     }
 
     async fn handle_command_completed(&mut self, request_id: u64, result: crate::app::events::CommandResult) -> Result<()> {
@@ -1325,6 +1429,9 @@ impl App {
         }
         self.running_command = None;
         self.command_abort_handle = None;
+        self.command_stdin_tx = None;
+        self.running_command_output.clear();
+        self.running_command_raw.clear();
 
         let target_id = self.active_target_id;
 
@@ -1392,6 +1499,8 @@ impl App {
         self.ui_state.log_at_bottom = true;
 
         self.running_command = Some((req_id, cmd_str.clone(), Instant::now()));
+        self.running_command_output.clear();
+        self.running_command_raw.clear();
 
         let ws_path = self.session_meta.workspace_path();
         let _ = std::fs::create_dir_all(&ws_path);
@@ -1401,20 +1510,120 @@ impl App {
 
         let _ = tx.send(AppEvent::CommandStarted(req_id, cmd_str.clone()));
 
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        self.command_stdin_tx = Some(stdin_tx);
+
         let handle = tokio::spawn(async move {
             let start = Instant::now();
-            let res = Self::run_process_in_dir(&cmd_for_task, &ws_path).await;
-            let duration_ms = start.elapsed().as_millis() as i64;
-            let (output, exit_code) = match res {
-                Ok(pair) => pair,
-                Err(e) => (format!("Failed to execute command: {}", e), 1),
+
+            #[cfg(target_os = "windows")]
+            let mut command = tokio::process::Command::new("cmd");
+            #[cfg(target_os = "windows")]
+            command.args(["/C", &cmd_for_task]);
+
+            #[cfg(not(target_os = "windows"))]
+            let mut command = tokio::process::Command::new("sh");
+            #[cfg(not(target_os = "windows"))]
+            command.args(["-c", &cmd_for_task]);
+
+            command.current_dir(&ws_path);
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::piped());
+            command.stdin(std::process::Stdio::piped());
+            command.kill_on_drop(true);
+
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::CommandCompleted(
+                        req_id,
+                        crate::app::events::CommandResult {
+                            cmd: cmd_for_task,
+                            output: format!("Failed to execute process: {}", e),
+                            exit_code: 1,
+                            duration_ms: 0,
+                        },
+                    ));
+                    return;
+                }
             };
+
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let stdin = child.stdin.take();
+
+            if let Some(mut stdin_writer) = stdin {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    while let Some(line) = stdin_rx.recv().await {
+                        if stdin_writer.write_all(line.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = stdin_writer.flush().await;
+                    }
+                });
+            }
+
+            let tx_out = tx.clone();
+            let stdout_task = tokio::spawn(async move {
+                let mut full = Vec::new();
+                if let Some(mut r) = stdout {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                        full.push(chunk.clone());
+                        let _ = tx_out.send(AppEvent::CommandChunk(req_id, chunk));
+                    }
+                }
+                full.concat()
+            });
+
+            let tx_err = tx.clone();
+            let stderr_task = tokio::spawn(async move {
+                let mut full = Vec::new();
+                if let Some(mut r) = stderr {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                        full.push(chunk.clone());
+                        let _ = tx_err.send(AppEvent::CommandChunk(req_id, chunk));
+                    }
+                }
+                full.concat()
+            });
+
+            let status = child.wait().await;
+            let exit_code = match status {
+                Ok(s) => s.code().unwrap_or(0),
+                Err(_) => 1,
+            };
+
+            let stdout_res = stdout_task.await.unwrap_or_default();
+            let stderr_res = stderr_task.await.unwrap_or_default();
+            let duration_ms = start.elapsed().as_millis() as i64;
+
+            let combined = if stderr_res.is_empty() {
+                stdout_res
+            } else if stdout_res.is_empty() {
+                stderr_res
+            } else {
+                format!("{}\n{}", stdout_res, stderr_res)
+            };
+            let cleaned = crate::ui::layout::sanitize_terminal_output(&combined);
 
             let _ = tx.send(AppEvent::CommandCompleted(
                 req_id,
                 crate::app::events::CommandResult {
                     cmd: cmd_for_task,
-                    output,
+                    output: cleaned,
                     exit_code,
                     duration_ms,
                 },
@@ -2222,7 +2431,29 @@ impl App {
         Ok(())
     }
     
+    pub fn toggle_mouse_capture(&mut self) -> Result<()> {
+        self.mouse_capture_enabled = !self.mouse_capture_enabled;
+        if self.mouse_capture_enabled {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+            self.add_notification(
+                "Mouse Mode ON: Wheel scrolling & tab clicks active (Hold Shift to select text)".to_string(),
+                NotifLevel::Info,
+            );
+        } else {
+            crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+            self.add_notification(
+                "Mouse Mode OFF: Native terminal text selection & copy enabled".to_string(),
+                NotifLevel::Info,
+            );
+        }
+        Ok(())
+    }
+
     pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        if !self.mouse_capture_enabled {
+            return Ok(());
+        }
+
         use crossterm::event::{MouseButton, MouseEventKind};
         use crate::app::state::WindowFocus;
 
