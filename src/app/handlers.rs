@@ -1681,6 +1681,84 @@ impl App {
         Ok(())
     }
     
+    fn build_recent_chat_messages(&self, max_turns: usize) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        let history_start = self.chat_log.len().saturating_sub(max_turns);
+
+        for msg in &self.chat_log[history_start..] {
+            match msg.role.as_str() {
+                "user" => {
+                    let content = if msg.content.starts_with("? ") {
+                        format!("User query: {}", msg.content.trim_start_matches("? "))
+                    } else if msg.content.starts_with("$ ") {
+                        format!("Executed command: {}", msg.content)
+                    } else if msg.content.starts_with("[stdin] >") {
+                        format!("User input to process: {}", msg.content)
+                    } else {
+                        msg.content.clone()
+                    };
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                "output" => {
+                    // Provide recent command outputs so the LLM sees what actually happened and what worked or failed
+                    let content = if msg.content.len() > 3000 {
+                        let lines: Vec<&str> = msg.content.lines().collect();
+                        if lines.len() > 50 {
+                            let head = lines[..30].join("\n");
+                            let tail = lines[lines.len().saturating_sub(15)..].join("\n");
+                            format!("{}\n... [truncated {} lines] ...\n{}", head, lines.len() - 45, tail)
+                        } else {
+                            format!("{}... [truncated]", &msg.content[..3000])
+                        }
+                    } else {
+                        msg.content.clone()
+                    };
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: format!("Command output:\n{}", content),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                "assistant" => {
+                    if !msg.content.is_empty() || msg.tool_calls.is_some() {
+                        let content = if msg.content.len() > 1500 {
+                            format!("{}... [truncated]", &msg.content[..1500])
+                        } else {
+                            msg.content.clone()
+                        };
+                        messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content,
+                            tool_calls: msg.tool_calls.clone(),
+                            tool_call_id: None,
+                        });
+                    }
+                }
+                "tool" => {
+                    let content = if msg.content.len() > 1500 {
+                        format!("{}... [truncated]", &msg.content[..1500])
+                    } else {
+                        msg.content.clone()
+                    };
+                    messages.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content,
+                        tool_calls: None,
+                        tool_call_id: msg.tool_call_id.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        messages
+    }
+
     async fn send_llm_query(&mut self, query: &str) -> Result<()> {
         if self.llm_client.provider().requires_api_key() && self.config.api_key.trim().is_empty() {
             self.add_notification(
@@ -1739,30 +1817,9 @@ impl App {
             },
         ];
 
-        // Include recent conversational turns (last 6 messages) for multi-turn coherence
-        let history_start = self.chat_log.len().saturating_sub(6);
-        for msg in &self.chat_log[history_start..] {
-            if msg.role == "user" && msg.content.starts_with('?') {
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: msg.content.trim_start_matches("? ").to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-            } else if msg.role == "assistant" && !msg.content.is_empty() {
-                let content = if msg.content.len() > 800 {
-                    format!("{}...", &msg.content[..800])
-                } else {
-                    msg.content.clone()
-                };
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content,
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-            }
-        }
+        // Include recent conversational turns and command history for multi-turn coherence
+        let mut history = self.build_recent_chat_messages(16);
+        messages.append(&mut history);
 
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -1801,21 +1858,72 @@ impl App {
         if self.llm_client.provider().requires_api_key() && self.config.api_key.trim().is_empty() {
             return Ok(());
         }
-        
-        let messages = vec![
+
+        let active_target = if let Some(id) = self.active_target_id {
+            DatabaseQueries::get_target(self.db.conn(), id).unwrap_or(None)
+        } else {
+            None
+        };
+        let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
+            let f = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id).unwrap_or_default();
+            let r = DatabaseQueries::get_recent_commands(self.db.conn(), target.id, 3).unwrap_or_default();
+            let c = DatabaseQueries::get_command_count(self.db.conn(), target.id).unwrap_or(0);
+            (f, r, c)
+        } else {
+            (Vec::new(), Vec::new(), 0)
+        };
+        let targets_count = DatabaseQueries::get_targets_count(self.db.conn()).unwrap_or(0);
+        let all_targets = DatabaseQueries::get_all_targets(self.db.conn()).unwrap_or_default();
+
+        let base_prompt = build_system_prompt(
+            &self.session_meta.name,
+            &self.session_meta.created_at.to_rfc3339(),
+            targets_count,
+            &all_targets,
+            active_target.as_ref(),
+            &findings,
+            &recent_commands,
+            command_count,
+            recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+            Some(&self.session_meta.workspace_path()),
+        );
+
+        let system_prompt = format!(
+            "{}\n\n## Post-Execution Recon & Analysis Mode\nYou are analyzing the output of a command that just completed.\nCRITICAL RULES:\n1. STRICTLY RESPECT USER INSTRUCTIONS: Review previous messages. If the user previously instructed NOT to do something or to avoid certain tools, techniques, flags, or endpoints, DO NOT attempt or suggest them.\n2. DO NOT DUPLICATE TARGETS OR FINDINGS: Use `update_target` on the active target rather than `add_target`. Only invoke `add_finding` if the vulnerability is genuine, novel, and not already listed above.\n3. Suggest the next logical pentest step that strictly complies with the user's directions.",
+            base_prompt
+        );
+
+        let mut messages = vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: "You are an automated security recon engine in voidrecon. Analyze the command output. If you identify new targets, open ports, services, operating system details, or security findings, invoke the appropriate tools (set_target, update_target, add_finding, add_target) to record them into the session database. Provide a concise 1-2 sentence summary.".to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: format!("Command: {}\n\nOutput:\n{}\n\n{}", cmd, output, POST_EXEC_PROMPT),
+                content: system_prompt,
                 tool_calls: None,
                 tool_call_id: None,
             },
         ];
+
+        let mut history = self.build_recent_chat_messages(10);
+        messages.append(&mut history);
+
+        let truncated_output = if output.len() > 16_000 {
+            let lines: Vec<&str> = output.lines().collect();
+            if lines.len() > 80 {
+                let head = lines[..50].join("\n");
+                let tail = lines[lines.len().saturating_sub(25)..].join("\n");
+                format!("{}\n... [truncated {} lines, full output archived to workspace] ...\n{}", head, lines.len() - 75, tail)
+            } else {
+                format!("{}... [truncated]", &output[..16_000])
+            }
+        } else {
+            output.to_string()
+        };
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: format!("Command executed: {}\n\nOutput:\n{}\n\n{}", cmd, truncated_output, POST_EXEC_PROMPT),
+            tool_calls: None,
+            tool_call_id: None,
+        });
         
         let request_id = self.next_request_id();
         let request = crate::llm::types::ChatCompletionRequest {
@@ -2303,8 +2411,15 @@ impl App {
     }
     
     pub async fn reload_sidebar(&mut self) -> Result<()> {
+        let _ = DatabaseQueries::deduplicate_targets_and_findings(self.db.conn());
         let targets = DatabaseQueries::get_all_targets(self.db.conn())?;
         self.sidebar_nodes.clear();
+
+        if let Some(act_id) = self.active_target_id {
+            if !targets.iter().any(|t| t.id == act_id) {
+                self.active_target_id = targets.first().map(|t| t.id);
+            }
+        }
         
         for target in targets {
             let findings = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?;

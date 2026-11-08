@@ -67,12 +67,38 @@ fn save_output_artifact(session_path: &Path, output: &str) -> Result<(String, St
 
 pub struct DatabaseQueries;
 
+pub fn normalize_target_host(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(idx) = s.find("://") {
+        s = &s[idx + 3..];
+    }
+    if let Some(slash) = s.find('/') {
+        s = &s[..slash];
+    }
+    if let Some(colon) = s.rfind(':') {
+        if !s.contains(']') {
+            s = &s[..colon];
+        }
+    }
+    s.trim_matches(|c| c == '\'' || c == '"' || c == '/' || c == '[' || c == ']').to_lowercase()
+}
+
 impl DatabaseQueries {
     // Target operations
     pub fn add_target(conn: &Connection, ip_host: &str, ports_json: Option<&str>, notes: Option<&str>) -> Result<i64> {
+        let normalized = normalize_target_host(ip_host);
+        let host_to_store = if normalized.is_empty() { ip_host.trim().to_string() } else { normalized };
+
+        if let Ok(Some(existing)) = Self::get_target_by_ip(conn, &host_to_store) {
+            if ports_json.is_some() || notes.is_some() {
+                let _ = Self::update_target(conn, existing.id, ports_json, None);
+            }
+            return Ok(existing.id);
+        }
+
         conn.execute(
             "INSERT INTO targets (ip_host, ports_json, notes) VALUES (?1, ?2, ?3)",
-            params![ip_host, ports_json, notes],
+            params![host_to_store, ports_json, notes],
         )
         .context("Failed to insert target")?;
         Ok(conn.last_insert_rowid())
@@ -98,9 +124,10 @@ impl DatabaseQueries {
     }
 
     pub fn get_target_by_ip(conn: &Connection, ip_host: &str) -> Result<Option<Target>> {
+        let normalized = normalize_target_host(ip_host);
         conn.query_row(
-            "SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets WHERE ip_host = ?1",
-            params![ip_host],
+            "SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets WHERE LOWER(ip_host) = ?1 OR LOWER(ip_host) = ?2 LIMIT 1",
+            params![ip_host.to_lowercase(), normalized],
             |row| Self::row_to_target(row),
         )
         .optional()
@@ -152,11 +179,36 @@ impl DatabaseQueries {
         confidence: Option<i32>,
         evidence_path: Option<&str>,
     ) -> Result<i64> {
+        let title_clean = title.trim();
         let description = truncate(description, 200);
         let confidence = confidence.unwrap_or(100).clamp(0, 100);
+
+        // Deduplication: check if identical finding already exists for this target
+        let existing_id: Option<i64> = if let Some(ep) = evidence_path {
+            conn.query_row(
+                "SELECT id FROM findings WHERE target_id = ?1 AND (LOWER(title) = ?2 OR (evidence_path IS NOT NULL AND evidence_path = ?3)) LIMIT 1",
+                params![target_id, title_clean.to_lowercase(), ep],
+                |row| row.get(0),
+            ).optional().unwrap_or(None)
+        } else {
+            conn.query_row(
+                "SELECT id FROM findings WHERE target_id = ?1 AND LOWER(title) = ?2 LIMIT 1",
+                params![target_id, title_clean.to_lowercase()],
+                |row| row.get(0),
+            ).optional().unwrap_or(None)
+        };
+
+        if let Some(id) = existing_id {
+            let _ = conn.execute(
+                "UPDATE findings SET description = ?1, severity = ?2, confidence = MAX(confidence, ?3) WHERE id = ?4",
+                params![description, severity, confidence, id],
+            );
+            return Ok(id);
+        }
+
         conn.execute(
             "INSERT INTO findings (target_id, title, description, severity, source_cmd, confidence, evidence_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![target_id, title, description, severity, source_cmd, confidence, evidence_path],
+            params![target_id, title_clean, description, severity, source_cmd, confidence, evidence_path],
         )
         .context("Failed to insert finding")?;
         Ok(conn.last_insert_rowid())
@@ -323,6 +375,88 @@ impl DatabaseQueries {
         Ok(count)
     }
 
+    /// Deduplicates targets by normalized hostname/IP and deduplicates findings per target.
+    /// Merges findings and ports to the canonical target record and removes orphaned duplicates.
+    pub fn deduplicate_targets_and_findings(conn: &Connection) -> Result<()> {
+        // 1. Group targets by normalized host
+        let targets = Self::get_all_targets(conn)?;
+        let mut grouped: std::collections::HashMap<String, Vec<Target>> = std::collections::HashMap::new();
+        for t in targets {
+            let key = normalize_target_host(&t.ip_host);
+            if !key.is_empty() {
+                grouped.entry(key).or_default().push(t);
+            }
+        }
+
+        for (_key, group) in grouped {
+            if group.len() > 1 {
+                // Canonical target is the one with the lowest ID
+                let canonical = group.iter().min_by_key(|t| t.id).unwrap();
+                let canonical_id = canonical.id;
+                let duplicate_ids: Vec<i64> = group.iter()
+                    .filter(|t| t.id != canonical_id)
+                    .map(|t| t.id)
+                    .collect();
+
+                // Merge open ports
+                let mut all_ports: Vec<crate::db::models::PortInfo> = Vec::new();
+                for t in &group {
+                    if let Some(ref pj) = t.ports_json {
+                        if let Ok(ports) = serde_json::from_str::<Vec<crate::db::models::PortInfo>>(pj) {
+                            for p in ports {
+                                if !all_ports.iter().any(|ep| ep.port == p.port && ep.proto == p.proto) {
+                                    all_ports.push(p);
+                                }
+                            }
+                        }
+                    }
+                }
+                all_ports.sort_by_key(|p| p.port);
+                let ports_json_str = if !all_ports.is_empty() {
+                    serde_json::to_string(&all_ports).ok()
+                } else {
+                    None
+                };
+                let _ = Self::update_target(conn, canonical_id, ports_json_str.as_deref(), None);
+
+                // Re-point findings, commands, and chat history to canonical target
+                for dup_id in duplicate_ids {
+                    let _ = conn.execute("UPDATE findings SET target_id = ?1 WHERE target_id = ?2", params![canonical_id, dup_id]);
+                    let _ = conn.execute("UPDATE commands SET target_id = ?1 WHERE target_id = ?2", params![canonical_id, dup_id]);
+                    let _ = conn.execute("UPDATE chat_history SET target_id = ?1 WHERE target_id = ?2", params![canonical_id, dup_id]);
+                    let _ = conn.execute("DELETE FROM targets WHERE id = ?1", params![dup_id]);
+                }
+            }
+        }
+
+        // 2. Deduplicate findings: for each target, remove duplicate findings with the same title or evidence_path
+        let all_targets = Self::get_all_targets(conn)?;
+        for target in all_targets {
+            let findings = Self::get_findings_for_target(conn, target.id)?;
+            let mut seen_titles = std::collections::HashSet::new();
+            let mut seen_evidences = std::collections::HashSet::new();
+
+            // Reverse order so we retain the newest finding ID
+            for f in findings.into_iter().rev() {
+                let norm_title = f.title.trim().to_lowercase();
+                let is_dup_title = !seen_titles.insert(norm_title);
+                
+                let is_dup_evidence = if let Some(ref ep) = f.evidence_path {
+                    let clean_ep = ep.trim().to_lowercase();
+                    !clean_ep.is_empty() && !seen_evidences.insert(clean_ep)
+                } else {
+                    false
+                };
+
+                if is_dup_title || is_dup_evidence {
+                    let _ = conn.execute("DELETE FROM findings WHERE id = ?1", params![f.id]);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Automatically parses scan outputs (such as nmap) to extract discovered open ports, services,
     /// versions, and operating system details, persisting them directly into the session database.
     pub fn parse_nmap_and_update_target(
@@ -338,12 +472,14 @@ impl DatabaseQueries {
 
         // 1. Extract target host or IP
         let mut target_ip = None;
+        let mut target_hostname = None;
         for line in output.lines() {
             if line.contains("Nmap scan report for ") {
                 let part = line.trim_start_matches("Nmap scan report for ").trim();
                 if let Some(open) = part.find('(') {
                     if let Some(close) = part.find(')') {
                         if close > open {
+                            target_hostname = Some(part[..open].trim().to_string());
                             target_ip = Some(part[open + 1..close].trim().to_string());
                         }
                     }
@@ -431,26 +567,38 @@ impl DatabaseQueries {
         }
 
         // 4. Update or insert target
-        let target_to_update = if let Some(ip) = &target_ip {
-            if let Ok(Some(existing)) = Self::get_target_by_ip(conn, ip) {
+        let target_to_update = if let Some(host) = &target_hostname {
+            if let Ok(Some(existing)) = Self::get_target_by_ip(conn, host) {
                 Some(existing)
+            } else if let Some(ip) = &target_ip {
+                Self::get_target_by_ip(conn, ip).ok().flatten()
             } else {
-                let ports_json_str = if !ports.is_empty() {
-                    Some(serde_json::to_string(&ports)?)
-                } else {
-                    None
-                };
-                let id = Self::add_target(conn, ip, ports_json_str.as_deref(), None)?;
-                if let Some(os) = &os_detected {
-                    let meta = serde_json::json!({ "os": os });
-                    let _ = Self::update_target(conn, id, None, Some(&meta.to_string()));
-                }
-                return Ok(Some(id));
+                None
             }
+        } else if let Some(ip) = &target_ip {
+            Self::get_target_by_ip(conn, ip).ok().flatten()
         } else if let Some(fid) = fallback_target_id {
             Self::get_target(conn, fid).unwrap_or(None)
         } else {
             None
+        };
+
+        let target_to_update = match target_to_update {
+            Some(t) => Some(t),
+            None => {
+                let host_to_add = target_hostname.as_deref().or(target_ip.as_deref());
+                if let Some(h) = host_to_add {
+                    let ports_json_str = if !ports.is_empty() {
+                        Some(serde_json::to_string(&ports)?)
+                    } else {
+                        None
+                    };
+                    let id = Self::add_target(conn, h, ports_json_str.as_deref(), None)?;
+                    Self::get_target(conn, id).ok().flatten()
+                } else {
+                    None
+                }
+            }
         };
 
         if let Some(target) = target_to_update {
@@ -475,18 +623,26 @@ impl DatabaseQueries {
             merged_ports.sort_by_key(|p| p.port);
 
             let ports_json = serde_json::to_string(&merged_ports)?;
-            let metadata_json = if let Some(os) = os_detected {
-                let mut meta: serde_json::Value = target.metadata_json
-                    .as_deref()
-                    .and_then(|m| serde_json::from_str(m).ok())
-                    .unwrap_or_else(|| serde_json::json!({}));
-                meta["os"] = serde_json::Value::String(os);
-                Some(meta.to_string())
-            } else {
-                target.metadata_json
-            };
+            let mut meta: serde_json::Value = target.metadata_json
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
 
-            Self::update_target(conn, target.id, Some(&ports_json), metadata_json.as_deref())?;
+            if let Some(os) = os_detected {
+                meta["os"] = serde_json::Value::String(os);
+            }
+            if let Some(hostname) = target_hostname {
+                let mut hostnames_arr = meta.get("hostnames")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if !hostnames_arr.iter().any(|v| v.as_str() == Some(&hostname)) {
+                    hostnames_arr.push(serde_json::Value::String(hostname));
+                }
+                meta["hostnames"] = serde_json::Value::Array(hostnames_arr);
+            }
+
+            Self::update_target(conn, target.id, Some(&ports_json), Some(&meta.to_string()))?;
             Ok(Some(target.id))
         } else {
             Ok(None)
@@ -538,5 +694,37 @@ Nmap done: 1 IP address (1 host up) scanned in 16.65 seconds
 
         let meta: serde_json::Value = serde_json::from_str(&target.metadata_json.unwrap()).unwrap();
         assert_eq!(meta["os"], "Windows");
+    }
+
+    #[test]
+    fn test_normalize_target_host() {
+        assert_eq!(normalize_target_host("http://unclaimed.htb/"), "unclaimed.htb");
+        assert_eq!(normalize_target_host("https://unclaimed.htb:80/ask"), "unclaimed.htb");
+        assert_eq!(normalize_target_host("UNCLAIMED.HTB"), "unclaimed.htb");
+        assert_eq!(normalize_target_host("10.129.90.124:8080"), "10.129.90.124");
+    }
+
+    #[test]
+    fn test_deduplicate_targets_and_findings() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_database(&conn).unwrap();
+
+        // Simulate duplicates from multiple tools
+        let id1 = DatabaseQueries::add_target(&conn, "unclaimed.htb", None, None).unwrap();
+        conn.execute("INSERT INTO targets (ip_host) VALUES ('http://unclaimed.htb/')", []).unwrap();
+        let id2 = conn.last_insert_rowid();
+
+        DatabaseQueries::add_finding(&conn, id1, "SQLi in /ask", "SQL Injection", "critical", None, Some(90), None).unwrap();
+        DatabaseQueries::add_finding(&conn, id2, "SQLi in /ask", "Duplicate finding", "critical", None, Some(95), None).unwrap();
+
+        DatabaseQueries::deduplicate_targets_and_findings(&conn).unwrap();
+
+        let targets = DatabaseQueries::get_all_targets(&conn).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].ip_host, "unclaimed.htb");
+
+        let findings = DatabaseQueries::get_findings_for_target(&conn, targets[0].id).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].title, "SQLi in /ask");
     }
 }

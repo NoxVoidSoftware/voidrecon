@@ -203,7 +203,11 @@ Suggest the next logical step based on findings and open ports. Do not repeat co
 }
 
 /// Post-execution analysis prompt
-pub const POST_EXEC_PROMPT: &str = "CRITICAL: If the scan output reveals open ports, services, operating system details, or vulnerabilities, invoke `update_target` or `add_target` to record them into the session database, and `add_finding` for any security issues. Summarize the key findings in 1-2 sentences.";
+pub const POST_EXEC_PROMPT: &str = r#"Analyze the command output in the context of our ongoing assessment.
+- If the output reveals new open ports, services, or OS details for the target, invoke `update_target`. Do NOT re-add existing targets with `add_target`.
+- If new vulnerabilities are found, invoke `add_finding`. Do NOT re-add findings already listed above.
+- STRICTLY RESPECT USER INSTRUCTIONS: Review previous conversation messages. If the user asked not to use certain tools, flags, or techniques, do NOT suggest or invoke them.
+- Provide a concise 1-2 sentence summary, and if appropriate, suggest the next logical pentest step via `run_command`."#;
 
 /// Parse LLM response JSON into typed suggestion
 pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSuggestion> {
