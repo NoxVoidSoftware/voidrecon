@@ -78,6 +78,17 @@ impl App {
                         tool_call_id: msg.tool_call_id.clone(),
                     });
                 }
+                "system" => {
+                    // Persisted system messages are compaction summaries; UI-only notices are skipped.
+                    if msg.content.starts_with("[Compacted earlier conversation summary]") {
+                        messages.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: msg.content.clone(),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -113,18 +124,30 @@ impl App {
             .unwrap_or(200_000)
     }
 
+    fn estimate_text_tokens(text: &str) -> usize {
+        text.chars().count() / 4 + 8
+    }
+
     fn estimate_chat_tokens(chat_log: &[ChatMessage]) -> usize {
         chat_log
             .iter()
-            .map(|m| m.content.chars().count() / 4 + 8)
+            .map(|m| Self::estimate_text_tokens(&m.content))
             .sum()
+    }
+
+    /// Approximate token cost of the tool schemas sent with every request.
+    fn tool_definitions_tokens() -> usize {
+        serde_json::to_string(&get_tool_definitions())
+            .map(|s| Self::estimate_text_tokens(&s))
+            .unwrap_or(0)
     }
 
     /// When the history grows past the token budget, summarize the oldest part
     /// with the LLM and replace it with a single summary message.
-    async fn maybe_compact_history(&mut self) -> Result<()> {
+    /// `overhead_tokens` accounts for the system prompt and tool schemas.
+    async fn maybe_compact_history(&mut self, overhead_tokens: usize) -> Result<()> {
         let limit = self.compaction_limit();
-        if Self::estimate_chat_tokens(&self.llm.chat_log) <= limit {
+        if Self::estimate_chat_tokens(&self.llm.chat_log) + overhead_tokens <= limit {
             return Ok(());
         }
 
@@ -208,8 +231,6 @@ impl App {
             return Ok(());
         }
 
-        self.maybe_compact_history().await?;
-
         // Add user question to visible chat log
         self.append_chat_message(ChatMessage {
             role: "user".to_string(),
@@ -251,7 +272,10 @@ impl App {
             false,
             Some(&self.session_meta.workspace_path()),
         );
-        
+
+        let overhead = Self::estimate_text_tokens(&system_prompt) + Self::tool_definitions_tokens();
+        self.maybe_compact_history(overhead).await?;
+
         let mut messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -296,8 +320,6 @@ impl App {
             return Ok(());
         }
 
-        self.maybe_compact_history().await?;
-
         let active_target = if let Some(id) = self.active_target_id {
             DatabaseQueries::get_target(&self.db.conn(), id).unwrap_or(None)
         } else {
@@ -334,6 +356,9 @@ impl App {
             base_prompt
         );
 
+        let overhead = Self::estimate_text_tokens(&system_prompt) + Self::tool_definitions_tokens();
+        self.maybe_compact_history(overhead).await?;
+
         let mut messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -344,6 +369,13 @@ impl App {
         ];
 
         let mut history = self.build_chat_messages();
+        // The command output was just appended to the chat log; it is included explicitly
+        // below with a larger truncation limit, so drop the duplicate history entry.
+        if self.llm.chat_log.last().map(|m| m.role == "output").unwrap_or(false)
+            && history.last().map(|m| m.content.starts_with("Command output:")).unwrap_or(false)
+        {
+            history.pop();
+        }
         messages.append(&mut history);
 
         let truncated_output = if output.len() > 16_000 {
@@ -678,7 +710,6 @@ impl App {
     }
     
     pub async fn continue_llm_conversation(&mut self) -> Result<()> {
-        self.maybe_compact_history().await?;
         let mut messages = Vec::new();
 
         // System prompt with full context
@@ -711,6 +742,10 @@ impl App {
             true,
             Some(&self.session_meta.workspace_path()),
         );
+
+        let overhead = Self::estimate_text_tokens(&system_prompt) + Self::tool_definitions_tokens();
+        self.maybe_compact_history(overhead).await?;
+
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: system_prompt,
