@@ -13,6 +13,13 @@ impl App {
     
     pub async fn handle_pty_exited(&mut self, tab_id: usize, exit_code: i32) -> Result<()> {
         if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
+            if self.tabs[pos].kind == crate::pty::tab::TerminalKind::Command {
+                if self.tabs[pos].exit_code.is_none() {
+                    self.tabs[pos].exit_code = Some(exit_code);
+                    self.tabs[pos].label.push_str(&format!(" (exited {exit_code})"));
+                }
+                return Ok(());
+            }
             let label = self.tabs[pos].label.clone();
             self.tabs.remove(pos);
             let tab_index = pos + 1;
@@ -28,6 +35,23 @@ impl App {
             self.add_notification(format!("{} closed (exit code {})", label, exit_code), NotifLevel::Info);
         }
         Ok(())
+    }
+
+    pub fn close_terminal_tab(&mut self, tab_id: usize) -> Result<String> {
+        let pos = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .ok_or_else(|| anyhow::anyhow!("Terminal tab {} is not open", tab_id))?;
+        let label = self.tabs[pos].label.clone();
+        self.tabs.remove(pos);
+        let tab_index = pos + 1;
+        if self.active_tab == tab_index {
+            self.active_tab = pos;
+        } else if self.active_tab > tab_index {
+            self.active_tab -= 1;
+        }
+        Ok(label)
     }
     
     pub fn handle_tick(&mut self) -> bool {

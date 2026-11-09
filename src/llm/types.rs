@@ -167,6 +167,8 @@ pub enum LlmRequestState {
 pub struct LlmSuggestion {
     pub command: Option<String>,
     pub explanation: String,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl LlmSuggestion {

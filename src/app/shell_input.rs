@@ -357,7 +357,10 @@ impl App {
                             if let Some(sug) = self.llm.suggestion.take() {
                                 self.llm.suggestion_visible = false;
                                 if let Some(cmd) = sug.command {
-                                    if self.active_tab == 0 {
+                                    if sug.interactive {
+                                        self.spawn_command_tab(&cmd).await?;
+                                        self.continue_llm_conversation().await?;
+                                    } else if self.active_tab == 0 {
                                         self.execute_workspace_command(&cmd).await?;
                                     } else {
                                         self.send_to_pty(&cmd).await?;

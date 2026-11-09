@@ -402,6 +402,100 @@ impl App {
                                 }
                             }
                         }
+                        crate::app::state::ApprovalKind::TerminalInput {
+                            tab_id,
+                            input,
+                            press_enter,
+                        } => {
+                            let result = if let Some(tab) =
+                                self.tabs.iter_mut().find(|tab| tab.id == *tab_id)
+                            {
+                                if tab.exit_code.is_some() {
+                                    Err(anyhow::anyhow!(
+                                        "Terminal tab {} has already exited",
+                                        tab_id
+                                    ))
+                                } else {
+                                    let mut bytes = input.as_bytes().to_vec();
+                                    if *press_enter {
+                                        bytes.push(b'\n');
+                                    }
+                                    tab.write(&bytes).map(|()| {
+                                        serde_json::json!({
+                                            "status": "input_sent",
+                                            "tab_id": tab_id,
+                                            "press_enter": press_enter
+                                        })
+                                    })
+                                }
+                            } else {
+                                Err(anyhow::anyhow!("Terminal tab {} is no longer open", tab_id))
+                            };
+                            match result {
+                                Ok(result) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: result.to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(
+                                        format!("Sent approved input to terminal tab {}", tab_id),
+                                        NotifLevel::Info,
+                                    );
+                                }
+                                Err(error) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "error",
+                                            "message": error.to_string()
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(
+                                        format!("Failed to send terminal input: {}", error),
+                                        NotifLevel::Error,
+                                    );
+                                }
+                            }
+                        }
+                        crate::app::state::ApprovalKind::CloseTerminalTab { tab_id, .. } => {
+                            match self.close_terminal_tab(*tab_id) {
+                                Ok(label) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "closed",
+                                            "tab_id": tab_id,
+                                            "label": label
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(
+                                        format!("Closed terminal tab {}", tab_id),
+                                        NotifLevel::Info,
+                                    );
+                                }
+                                Err(error) => {
+                                    self.append_chat_message(ChatMessage {
+                                        role: "tool".to_string(),
+                                        content: serde_json::json!({
+                                            "status": "error",
+                                            "message": error.to_string()
+                                        }).to_string(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(approval.tool_call.id),
+                                    });
+                                    self.add_notification(
+                                        format!("Failed to close terminal tab: {}", error),
+                                        NotifLevel::Error,
+                                    );
+                                }
+                            }
+                        }
                     }
                     self.continue_llm_conversation().await?;
                     return Ok(());
@@ -412,6 +506,8 @@ impl App {
                         crate::app::state::ApprovalKind::ReverseShellListener { .. } => "User rejected spawning reverse shell listener",
                         crate::app::state::ApprovalKind::ExecuteExploit { .. } => "User rejected exploit script execution",
                         crate::app::state::ApprovalKind::SaveWorkspaceFile { .. } => "User rejected saving workspace file",
+                        crate::app::state::ApprovalKind::TerminalInput { .. } => "User rejected sending terminal input",
+                        crate::app::state::ApprovalKind::CloseTerminalTab { .. } => "User rejected closing terminal tab",
                     };
                     self.append_chat_message(ChatMessage {
                         role: "tool".to_string(),

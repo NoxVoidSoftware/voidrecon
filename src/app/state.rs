@@ -61,6 +61,15 @@ pub enum ApprovalKind {
         description: String,
         content: String,
     },
+    TerminalInput {
+        tab_id: usize,
+        input: String,
+        press_enter: bool,
+    },
+    CloseTerminalTab {
+        tab_id: usize,
+        label: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -30,6 +30,7 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
         Line::from("   Esc         - Return to Workspace (Tab 0) / dismiss"),
         Line::from("   Ctrl+L      - Enter LLM query mode"),
         Line::from("   Ctrl+C      - Abort running process or LLM query"),
+        Line::from("   Interactive commands run in PTY tabs; LLM terminal input/close requests need approval"),
         Line::from("   Ctrl+Q      - Quit (or type :quit)"),
         Line::from("   [           - Toggle sidebar"),
         Line::from(""),

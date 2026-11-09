@@ -125,7 +125,7 @@ impl App {
         let all_targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
         let (all_findings, all_facts) = self.build_sidebar_context(&all_targets)?;
 
-        build_system_prompt(
+        let mut prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),
             targets_count,
@@ -137,7 +137,43 @@ impl App {
             command_count,
             suggest_next_step,
             Some(&self.session_meta.workspace_path()),
-        )
+        )?;
+        prompt.push_str(&format!(
+            "\n\n## Open Terminal Tabs\nTab 0: Workspace & LLM [{}].",
+            if self.active_tab == 0 { "active" } else { "inactive" }
+        ));
+        for tab in &self.tabs {
+            let kind = match tab.kind {
+                crate::pty::tab::TerminalKind::LocalShell => "shell",
+                crate::pty::tab::TerminalKind::Listener => "listener",
+                crate::pty::tab::TerminalKind::Command => "command",
+            };
+            let status = tab
+                .exit_code
+                .map_or_else(|| "running".to_string(), |code| format!("exited ({code})"));
+            prompt.push_str(&format!(
+                "\nTab ID {}: {} [type: {}, {}, {}]",
+                tab.id,
+                Self::quote_untrusted(&tab.label),
+                kind,
+                status,
+                if self.active_tab > 0
+                    && self
+                        .tabs
+                        .get(self.active_tab - 1)
+                        .map(|active| active.id == tab.id)
+                        .unwrap_or(false)
+                {
+                    "active"
+                } else {
+                    "inactive"
+                }
+            ));
+        }
+        if self.tabs.is_empty() {
+            prompt.push_str("\nNo terminal tabs are currently open.");
+        }
+        Ok(prompt)
     }
 
     fn context_prompt_or_notify(&mut self, suggest_next_step: bool) -> Option<String> {
@@ -822,6 +858,158 @@ impl App {
         None
     }
 
+    fn handle_terminal_management_tool(
+        &mut self,
+        tool_call: &ToolCall,
+    ) -> Result<Option<serde_json::Value>> {
+        let name = tool_call.function.name.as_str();
+        if !matches!(
+            name,
+            "list_terminal_tabs"
+                | "read_terminal_tab"
+                | "send_terminal_input"
+                | "close_terminal_tab"
+        ) {
+            return Ok(None);
+        }
+        crate::tools::validate_tool_call(tool_call)?;
+        let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+            .context("Failed to parse terminal tool arguments")?;
+
+        match name {
+            "list_terminal_tabs" => {
+                let mut tabs = vec![serde_json::json!({
+                    "tab_id": 0,
+                    "label": "Workspace & LLM",
+                    "kind": "workspace",
+                    "state": "open",
+                    "active": self.active_tab == 0,
+                    "manageable": false
+                })];
+                tabs.extend(self.tabs.iter().map(|tab| serde_json::json!({
+                    "tab_id": tab.id,
+                    "label": tab.label,
+                    "kind": match tab.kind {
+                        crate::pty::tab::TerminalKind::LocalShell => "shell",
+                        crate::pty::tab::TerminalKind::Listener => "listener",
+                        crate::pty::tab::TerminalKind::Command => "command",
+                    },
+                    "state": tab.exit_code.map_or_else(
+                        || "running".to_string(),
+                        |code| format!("exited ({code})")
+                    ),
+                    "active": self.active_tab > 0
+                        && self.tabs.get(self.active_tab - 1).map(|active| active.id) == Some(tab.id)
+                })));
+                Ok(Some(serde_json::json!({"tabs": tabs})))
+            }
+            "read_terminal_tab" => {
+                let tab_id = args
+                    .get("tab_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|id| usize::try_from(id).ok())
+                    .context("Invalid tab_id")?;
+                let tab = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .with_context(|| format!("Terminal tab {} is not open", tab_id))?;
+                let max_chars = args
+                    .get("max_chars")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(8_000)
+                    .clamp(1, 12_000) as usize;
+                let screen = tab.screen_text();
+                let tail = screen
+                    .char_indices()
+                    .rev()
+                    .nth(max_chars.saturating_sub(1))
+                    .map(|(index, _)| &screen[index..])
+                    .unwrap_or(&screen);
+                Ok(Some(serde_json::json!({
+                    "tab_id": tab_id,
+                    "label": tab.label,
+                    "state": tab.exit_code.map_or_else(
+                        || "running".to_string(),
+                        |code| format!("exited ({code})")
+                    ),
+                    "screen": tail
+                })))
+            }
+            "send_terminal_input" => {
+                let tab_id = args
+                    .get("tab_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|id| usize::try_from(id).ok())
+                    .context("Invalid tab_id")?;
+                let tab = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .with_context(|| format!("Terminal tab {} is not open", tab_id))?;
+                if tab.exit_code.is_some() {
+                    anyhow::bail!("Terminal tab {} has already exited", tab_id);
+                }
+                let input = args
+                    .get("input")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Missing terminal input")?;
+                if input.len() > 100
+                    || input.chars().any(|character| character.is_control())
+                {
+                    anyhow::bail!(
+                        "Terminal input must be at most 100 UTF-8 bytes and contain no control characters"
+                    );
+                }
+                let press_enter = args
+                    .get("press_enter")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
+                    target_id: self.active_target_id.unwrap_or_default(),
+                    target_ip: "terminal session".to_string(),
+                    kind: crate::app::state::ApprovalKind::TerminalInput {
+                        tab_id,
+                        input: input.to_string(),
+                        press_enter,
+                    },
+                    tool_call: tool_call.clone(),
+                });
+                self.add_notification(
+                    format!("Approval required to send input to terminal tab {}", tab_id),
+                    NotifLevel::Warning,
+                );
+                Ok(Some(serde_json::json!({"status": "requires_user_approval"})))
+            }
+            "close_terminal_tab" => {
+                let tab_id = args
+                    .get("tab_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|id| usize::try_from(id).ok())
+                    .context("Invalid tab_id")?;
+                let label = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .with_context(|| format!("Terminal tab {} is not open", tab_id))?
+                    .label
+                    .clone();
+                self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
+                    target_id: self.active_target_id.unwrap_or_default(),
+                    target_ip: "terminal session".to_string(),
+                    kind: crate::app::state::ApprovalKind::CloseTerminalTab { tab_id, label },
+                    tool_call: tool_call.clone(),
+                });
+                self.add_notification(
+                    format!("Approval required to close terminal tab {}", tab_id),
+                    NotifLevel::Warning,
+                );
+                Ok(Some(serde_json::json!({"status": "requires_user_approval"})))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub async fn handle_llm_done(&mut self, request_id: u64) -> Result<()> {
         // Ignore stale requests
         if request_id != self.llm.request_id {
@@ -844,26 +1032,57 @@ impl App {
             });
 
             // Execute tool calls
-            for tool_call in tool_calls {
-                let result = match crate::tools::execute_tool_call(
-                    &tool_call,
-                    &self.db,
-                    self.active_target_id,
-                    &self.session_meta.workspace_path(),
-                    &self.event_tx,
-                )
-                .await
-                {
-                    Ok(res) => res,
-                    Err(e) => {
+            for (index, tool_call) in tool_calls.iter().enumerate() {
+                let managed_result = match self.handle_terminal_management_tool(tool_call) {
+                    Ok(result) => result,
+                    Err(error) => {
                         self.add_notification(
-                            format!("Tool {} error: {}", tool_call.function.name, e),
+                            format!("Tool {} error: {}", tool_call.function.name, error),
                             NotifLevel::Error,
                         );
-                        serde_json::json!({
+                        Some(serde_json::json!({
                             "status": "error",
-                            "error": e.to_string(),
-                        })
+                            "error": error.to_string()
+                        }))
+                    }
+                };
+                if self.pending_exploit_approval.is_some() {
+                    for deferred in tool_calls.iter().skip(index + 1) {
+                        self.append_chat_message(ChatMessage {
+                            role: "tool".to_string(),
+                            content: serde_json::json!({
+                                "status": "not_executed",
+                                "message": "A prior terminal action is waiting for user approval."
+                            }).to_string(),
+                            tool_calls: None,
+                            tool_call_id: Some(deferred.id.clone()),
+                        });
+                    }
+                    return Ok(());
+                }
+                let result = if let Some(result) = managed_result {
+                    result
+                } else {
+                    match crate::tools::execute_tool_call(
+                        tool_call,
+                        &self.db,
+                        self.active_target_id,
+                        &self.session_meta.workspace_path(),
+                        &self.event_tx,
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(e) => {
+                            self.add_notification(
+                                format!("Tool {} error: {}", tool_call.function.name, e),
+                                NotifLevel::Error,
+                            );
+                            serde_json::json!({
+                                "status": "error",
+                                "error": e.to_string(),
+                            })
+                        }
                     }
                 };
 
@@ -936,6 +1155,11 @@ impl App {
                                 self.llm.suggestion = Some(crate::llm::types::LlmSuggestion {
                                     command: Some(cmd.to_string()),
                                     explanation: explanation.to_string(),
+                                    interactive: result
+                                        .get("interactive")
+                                        .and_then(|value| value.as_bool())
+                                        .unwrap_or(false)
+                                        || Self::is_interactive_command(cmd),
                                 });
                                 self.llm.suggestion_visible = true;
                             }
@@ -1058,7 +1282,7 @@ impl App {
                                 "error": format!("Target ID {} is not within current assessment scope", target_id)
                             }).to_string(),
                             tool_calls: None,
-                            tool_call_id: Some(tool_call.id),
+                            tool_call_id: Some(tool_call.id.clone()),
                         });
                         continue;
                     }
@@ -1069,7 +1293,7 @@ impl App {
                     role: "tool".to_string(),
                     content: result.to_string(),
                     tool_calls: None,
-                    tool_call_id: Some(tool_call.id),
+                    tool_call_id: Some(tool_call.id.clone()),
                 });
             }
 

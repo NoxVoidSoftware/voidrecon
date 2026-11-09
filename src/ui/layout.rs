@@ -275,7 +275,11 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
-    let approval_height = if app.pending_exploit_approval.is_some() { 5 } else { 0 };
+    let approval_height = match app.pending_exploit_approval.as_ref().map(|approval| &approval.kind) {
+        Some(crate::app::state::ApprovalKind::TerminalInput { .. }) => 8,
+        Some(_) => 5,
+        None => 0,
+    };
     let suggestion_height = if app.llm.suggestion_visible { 5 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -306,10 +310,20 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" Target: {} (ID {}) │ File: workspace/{}/{} │ Desc: {}", approval.target_ip, approval.target_id, folder, filename, description),
                 " [y / Enter] Approve & Save File ",
             ),
+            crate::app::state::ApprovalKind::TerminalInput { tab_id, input, press_enter } => (
+                " LLM requests terminal input:",
+                format!(" Tab ID {} │ Input: {:?} │ Press Enter: {}", tab_id, input, press_enter),
+                " [y / Enter] Approve & Send Input ",
+            ),
+            crate::app::state::ApprovalKind::CloseTerminalTab { tab_id, label } => (
+                " LLM requests closing a terminal tab:",
+                format!(" Tab ID {} │ {}", tab_id, label),
+                " [y / Enter] Approve & Close Tab ",
+            ),
         };
         let content = vec![
             Line::from(vec![
-                Span::styled(" [EXPLOIT APPROVAL REQUIRED] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(" [ACTION APPROVAL REQUIRED] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::raw(prompt_title),
             ]),
             Line::from(vec![
@@ -325,7 +339,12 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Red))
             .title(" Action Approval ");
-        f.render_widget(Paragraph::new(content).block(block), chunks[1]);
+        f.render_widget(
+            Paragraph::new(content)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            chunks[1],
+        );
     }
 
     if app.llm.suggestion_visible {

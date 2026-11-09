@@ -5,6 +5,7 @@ use voidrecon::db::models::{Command, Target};
 use voidrecon::llm::{
     build_system_prompt, parse_llm_response, ChatMessage, ToolCall, ToolFunction,
 };
+use voidrecon::tools::get_tool_definitions;
 
 fn target(ports_json: Option<String>, notes: Option<String>) -> Target {
     Target {
@@ -47,6 +48,89 @@ fn context_limit_defaults_to_200k_and_compacts_at_80_percent_after_learning() {
     assert_eq!(
         config.context_limit_for(ProviderKind::OpenAi, "model-b"),
         200_000
+    );
+}
+
+#[test]
+fn terminal_management_tools_expose_user_approved_controls() {
+    let definitions = get_tool_definitions();
+    let find = |name: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.name() == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+    };
+
+    assert!(find("run_command")
+        .parameters()
+        .get("properties")
+        .unwrap()
+        .get("interactive")
+        .is_some());
+    for name in ["list_terminal_tabs", "read_terminal_tab", "send_terminal_input", "close_terminal_tab"] {
+        assert!(find(name).parameters().is_object(), "tool {name} has a schema");
+    }
+    assert!(find("send_terminal_input")
+        .function
+        .description
+        .contains("user must approve"));
+    assert!(find("close_terminal_tab")
+        .function
+        .description
+        .contains("user must approve"));
+}
+
+#[test]
+fn interactive_command_detection_avoids_batch_commands() {
+    assert!(App::is_interactive_command(
+        "evil-winrm -i 10.0.0.7 -u user"
+    ));
+    assert!(App::is_interactive_command(
+        "python3"
+    ));
+    assert!(App::is_interactive_command(
+        "nc -lvnp 4444"
+    ));
+    assert!(!App::is_interactive_command(
+        "python3 scan.py --target 10.0.0.7"
+    ));
+    assert!(!App::is_interactive_command(
+        "nmap -iL targets.txt"
+    ));
+}
+
+#[test]
+fn interactive_commands_launch_in_readable_terminal_tabs() {
+    let workspace =
+        std::env::temp_dir().join(format!("voidrecon-pty-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (kind, screen) = {
+        let tab = voidrecon::pty::tab::PtyTab::new_command(
+            1,
+            "printf 'interactive-ready'; sleep 3",
+            &workspace,
+            tx,
+            (80, 24),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let screen = loop {
+            let screen = tab.screen_text();
+            if screen.contains("interactive-ready")
+                || std::time::Instant::now() >= deadline
+            {
+                break screen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        (tab.kind, screen)
+    };
+    std::fs::remove_dir_all(workspace).unwrap();
+    assert_eq!(kind, voidrecon::pty::tab::TerminalKind::Command);
+    assert!(
+        screen.contains("interactive-ready"),
+        "terminal screen did not contain expected output: {screen:?}"
     );
 }
 

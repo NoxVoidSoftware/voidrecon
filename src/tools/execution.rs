@@ -494,7 +494,8 @@ pub async fn execute_tool_call(
             Ok(serde_json::json!({
                 "status": "suggested",
                 "command": command,
-                "explanation": explanation
+                "explanation": explanation,
+                "interactive": args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
             }))
         }
         "save_workspace_file" => {

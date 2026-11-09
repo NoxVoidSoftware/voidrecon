@@ -296,6 +296,9 @@ impl App {
         if cmd_str.is_empty() {
             return Ok(());
         }
+        if Self::is_interactive_command(&cmd_str) {
+            return self.spawn_command_tab(&cmd_str).await;
+        }
 
         let req_id = self.next_request_id();
 
@@ -490,6 +493,61 @@ impl App {
         }
         Ok(())
     }
-    
+
+    pub async fn spawn_command_tab(&mut self, command: &str) -> Result<()> {
+        let workspace = self.session_meta.workspace_path();
+        std::fs::create_dir_all(&workspace)
+            .with_context(|| format!("Failed to create workspace {}", workspace.display()))?;
+        let tab = crate::pty::tab::PtyTab::new_command(
+            self.next_tab_id,
+            command,
+            &workspace,
+            self.event_tx.clone(),
+            self.pty_dimensions(),
+        )?;
+        self.append_chat_message(ChatMessage {
+            role: "user".to_string(),
+            content: format!("Started interactive command in tab {}: {}", tab.id, command),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        self.next_tab_id += 1;
+        let label = tab.label.clone();
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len();
+        self.add_notification(format!("Started {}", label), NotifLevel::Info);
+        Ok(())
+    }
+
+    pub fn is_interactive_command(command: &str) -> bool {
+        let parts = command.split_whitespace().collect::<Vec<_>>();
+        let executable_index = if parts.first().copied() == Some("sudo") {
+            1
+        } else {
+            0
+        };
+        let executable = parts
+            .get(executable_index)
+            .copied()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .rsplit('\\')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let args = parts.iter().skip(executable_index + 1).copied();
+        match executable.as_str() {
+            "evil-winrm" | "ssh" | "telnet" | "ftp" | "sftp" | "mysql" | "psql"
+            | "sqlplus" | "redis-cli" | "smbclient" | "msfconsole" | "irb" => true,
+            "python" | "python3" | "node" | "pwsh" | "powershell" => {
+                parts.len() == executable_index + 1 || args.clone().any(|arg| arg == "-i")
+            }
+            "nc" | "ncat" => args.clone().any(|arg| arg.starts_with('-') && arg.contains('l')),
+            "socat" => args.clone().any(|arg| arg.to_ascii_uppercase().contains("TCP-LISTEN")),
+            _ => false,
+        }
+    }
 
 }

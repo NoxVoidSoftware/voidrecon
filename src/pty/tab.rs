@@ -14,6 +14,7 @@ use crate::app::AppEvent;
 pub enum TerminalKind {
     LocalShell,
     Listener,
+    Command,
 }
 
 /// A PTY terminal tab
@@ -21,6 +22,7 @@ pub struct PtyTab {
     pub id: usize,
     pub label: String,
     pub kind: TerminalKind,
+    pub exit_code: Option<i32>,
     pub master: Box<dyn MasterPty + Send>,
     pub _slave: Option<Box<dyn SlavePty + Send>>,
     pub child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
@@ -102,8 +104,6 @@ impl PtyTab {
                     }
                 }
             }
-            // Send exit event
-            let _ = tx_clone.send(AppEvent::PtyExited(tab_id, 0));
         });
 
         let child_arc = Arc::new(Mutex::new(child));
@@ -136,6 +136,7 @@ impl PtyTab {
             id,
             label: format!("Shell {}", id),
             kind: TerminalKind::LocalShell,
+            exit_code: None,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -309,7 +310,6 @@ impl PtyTab {
                     Err(_) => break,
                 }
             }
-            let _ = tx_clone.send(AppEvent::PtyExited(tab_id, 0));
         });
 
         let child_arc = Arc::new(Mutex::new(child));
@@ -340,6 +340,120 @@ impl PtyTab {
             id,
             label: format!("Listener: :{}", lport),
             kind: TerminalKind::Listener,
+            exit_code: None,
+            master: pty_pair.master,
+            _slave: Some(pty_pair.slave),
+            child: child_arc,
+            parser,
+            writer,
+            _reader_thread: Some(reader_thread),
+            _watcher_thread: Some(watcher_thread),
+        })
+    }
+
+    /// Run one approved command in its own PTY tab.
+    pub fn new_command(
+        id: usize,
+        command: &str,
+        workspace: &std::path::Path,
+        tx: mpsc::UnboundedSender<AppEvent>,
+        size: (u16, u16),
+    ) -> Result<Self> {
+        let (cols, rows) = size;
+        let pty_system = native_pty_system();
+        let pty_pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("Failed to open PTY for command")?;
+
+        let mut cmd = Self::build_shell_command();
+        #[cfg(windows)]
+        cmd.args(["/C", command]);
+        #[cfg(not(windows))]
+        cmd.args(["-lc", command]);
+        cmd.cwd(workspace);
+
+        let child = pty_pair
+            .slave
+            .spawn_command(cmd)
+            .context("Failed to spawn interactive command")?;
+        let mut reader = pty_pair
+            .master
+            .try_clone_reader()
+            .context("Failed to clone reader")?;
+        let writer = pty_pair
+            .master
+            .take_writer()
+            .context("Failed to take writer")?;
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
+        let parser_clone = parser.clone();
+        let tx_clone = tx.clone();
+        let tab_id = id;
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut parser) = parser_clone.lock() {
+                            parser.process(&buf[..n]);
+                        }
+                        if tx_clone
+                            .send(AppEvent::PtyData(tab_id, buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("PTY read error: {}", error);
+                        break;
+                    }
+                }
+            }
+        });
+
+        let child_arc = Arc::new(Mutex::new(child));
+        let child_clone = child_arc.clone();
+        let tx_exit = tx;
+        let watcher_thread = std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Ok(mut child) = child_clone.lock() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let _ = tx_exit.send(AppEvent::PtyExited(
+                            tab_id,
+                            status.exit_code() as i32,
+                        ));
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(_) => {
+                        let _ = tx_exit.send(AppEvent::PtyExited(tab_id, 0));
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        });
+
+        let label = command
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(36)
+            .collect::<String>();
+        Ok(Self {
+            id,
+            label: format!("Command: {}", label),
+            kind: TerminalKind::Command,
+            exit_code: None,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -355,6 +469,14 @@ impl PtyTab {
         self.writer.write_all(data).context("Failed to write to PTY")?;
         self.writer.flush().context("Failed to flush PTY")?;
         Ok(())
+    }
+
+    /// Read the currently visible terminal screen as plain text.
+    pub fn screen_text(&self) -> String {
+        let Ok(parser) = self.parser.lock() else {
+            return String::new();
+        };
+        parser.screen().contents().trim().to_string()
     }
 
     /// Resize the PTY and vt100 parser
