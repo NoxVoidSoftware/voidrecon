@@ -125,7 +125,7 @@ impl App {
         let tx = self.event_tx.clone();
         let key = self.config.get_api_key(provider);
         let base_url = self.config.base_url.clone();
-        let p = crate::llm::provider::Provider::from_config(provider, key, base_url);
+        let p = crate::llm::providers::Provider::from_config(provider, key, base_url);
         let Ok(client) = crate::llm::LlmClient::new(p) else { return; };
         tokio::spawn(async move {
             if let Ok(models) = client.fetch_models().await {

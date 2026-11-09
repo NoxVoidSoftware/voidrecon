@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{Config, ModelInfo, ModelPricing, ProviderKind};
-use crate::llm::provider::{LlmProvider, Provider};
+use crate::llm::providers::{LlmProvider, Provider};
 use crate::llm::types::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, StreamChunk,
 };
