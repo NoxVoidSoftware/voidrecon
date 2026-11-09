@@ -129,7 +129,6 @@ impl LlmClient {
                         .get("context_length")
                         .or_else(|| item.get("context_window"))
                         .or_else(|| item.get("max_context_length"))
-                        .or_else(|| item.get("max_tokens"))
                         .and_then(|v| v.as_u64())
                         .map(|n| n as u32);
                     let prompt_price = item
