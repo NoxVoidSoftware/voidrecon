@@ -27,6 +27,7 @@ pub struct PtyTab {
     pub parser: Arc<Mutex<Parser>>,
     pub writer: Box<dyn Write + Send>,
     pub _reader_thread: Option<std::thread::JoinHandle<()>>,
+    pub _watcher_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PtyTab {
@@ -105,7 +106,7 @@ impl PtyTab {
         let tx_exit = tx.clone();
 
         // Watcher thread to promptly detect when process terminates (e.g. user typed 'exit')
-        std::thread::spawn(move || {
+        let watcher_thread = std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if let Ok(mut c) = child_clone.lock() {
@@ -136,6 +137,7 @@ impl PtyTab {
             parser,
             writer,
             _reader_thread: Some(reader_thread),
+            _watcher_thread: Some(watcher_thread),
         })
     }
 
@@ -306,7 +308,7 @@ impl PtyTab {
         let child_arc = Arc::new(Mutex::new(child));
         let child_clone = child_arc.clone();
         let tx_exit = tx.clone();
-        std::thread::spawn(move || {
+        let watcher_thread = std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if let Ok(mut c) = child_clone.lock() {
@@ -337,6 +339,7 @@ impl PtyTab {
             parser,
             writer,
             _reader_thread: Some(reader_thread),
+            _watcher_thread: Some(watcher_thread),
         })
     }
 
@@ -366,6 +369,12 @@ impl Drop for PtyTab {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
+        }
+        if let Some(handle) = self._watcher_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self._reader_thread.take() {
+            let _ = handle.join();
         }
     }
 }

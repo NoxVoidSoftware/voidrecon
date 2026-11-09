@@ -198,7 +198,7 @@ impl App {
         }
         self.command_run.raw.push_str(&chunk);
 
-        let sanitized = crate::ui::layout::sanitize_terminal_output(&self.command_run.raw);
+        let sanitized = crate::ui::text::sanitize_terminal_output(&self.command_run.raw);
         let mut lines = Vec::new();
         for line in sanitized.lines() {
             let trimmed = line.trim_end_matches('\r');
@@ -425,7 +425,7 @@ impl App {
             } else {
                 format!("{}\n{}", stdout_res, stderr_res)
             };
-            let cleaned = crate::ui::layout::sanitize_terminal_output(&combined);
+            let cleaned = crate::ui::text::sanitize_terminal_output(&combined);
 
             let _ = tx.send(AppEvent::CommandCompleted(
                 req_id,
@@ -475,7 +475,7 @@ impl App {
         format!("{}\n{}", stdout, stderr)
     };
 
-    let cleaned = crate::ui::layout::sanitize_terminal_output(&combined);
+    let cleaned = crate::ui::text::sanitize_terminal_output(&combined);
     let exit_code = output.status.code().unwrap_or(0);
     Ok((cleaned, exit_code))
 }
