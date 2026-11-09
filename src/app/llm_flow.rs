@@ -38,7 +38,7 @@ impl App {
                             let tail = lines[lines.len().saturating_sub(15)..].join("\n");
                             format!("{}\n... [truncated {} lines] ...\n{}", head, lines.len() - 45, tail)
                         } else {
-                            format!("{}... [truncated]", &msg.content[..3000])
+                            Self::truncate_bytes(&msg.content, 3000)
                         }
                     } else {
                         msg.content.clone()
@@ -53,7 +53,7 @@ impl App {
                 "assistant" => {
                     if !msg.content.is_empty() || msg.tool_calls.is_some() {
                         let content = if msg.content.len() > 1500 {
-                            format!("{}... [truncated]", &msg.content[..1500])
+                            Self::truncate_bytes(&msg.content, 1500)
                         } else {
                             msg.content.clone()
                         };
@@ -66,11 +66,7 @@ impl App {
                     }
                 }
                 "tool" => {
-                    let content = if msg.content.len() > 1500 {
-                        format!("{}... [truncated]", &msg.content[..1500])
-                    } else {
-                        msg.content.clone()
-                    };
+                    let content = Self::truncate_bytes(&msg.content, 8000);
                     messages.push(ChatMessage {
                         role: "tool".to_string(),
                         content,
@@ -128,6 +124,18 @@ impl App {
         text.chars().count() / 4 + 8
     }
 
+    /// Truncate `text` to at most `max_bytes` at a UTF-8 safe boundary, appending a truncation marker.
+    fn truncate_bytes(text: &str, max_bytes: usize) -> String {
+        if text.len() <= max_bytes {
+            return text.to_string();
+        }
+        let mut end = max_bytes;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}... [truncated]", &text[..end])
+    }
+
     fn estimate_chat_tokens(chat_log: &[ChatMessage]) -> usize {
         chat_log
             .iter()
@@ -156,7 +164,11 @@ impl App {
         if self.llm.chat_log.len() <= KEEP_RECENT + 2 {
             return Ok(());
         }
-        let split = self.llm.chat_log.len() - KEEP_RECENT;
+        let mut split = self.llm.chat_log.len() - KEEP_RECENT;
+        // Never start the kept slice on a "tool" message whose assistant call was compacted away.
+        while split > 0 && self.llm.chat_log[split].role == "tool" {
+            split -= 1;
+        }
 
         let transcript = {
             let mut t = String::new();
@@ -266,7 +278,6 @@ impl App {
             active_target.as_ref(),
             &all_findings,
             &all_facts,
-            &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
             false,
@@ -344,7 +355,6 @@ impl App {
             active_target.as_ref(),
             &all_findings,
             &all_facts,
-            &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
             true,
@@ -385,7 +395,7 @@ impl App {
                 let tail = lines[lines.len().saturating_sub(25)..].join("\n");
                 format!("{}\n... [truncated {} lines, full output archived to workspace] ...\n{}", head, lines.len() - 75, tail)
             } else {
-                format!("{}... [truncated]", &output[..16_000])
+                Self::truncate_bytes(output, 16_000)
             }
         } else {
             output.to_string()
@@ -736,7 +746,6 @@ impl App {
             active_target.as_ref(),
             &all_findings,
             &all_facts,
-            &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
             true,

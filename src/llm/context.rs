@@ -1,7 +1,7 @@
 //! Context building for LLM requests
 
 use anyhow::Result;
-use crate::db::models::{Target, Finding, Command, PortInfo, TargetMetadata, ImportantFact};
+use crate::db::models::{Target, Finding, PortInfo, TargetMetadata, ImportantFact};
 
 /// Build the system prompt with context from database.
 ///
@@ -14,7 +14,6 @@ pub fn build_system_prompt(
     active_target: Option<&Target>,
     all_findings: &[(i64, Vec<Finding>)],
     all_facts: &[(i64, Vec<ImportantFact>)],
-    _recent_commands: &[Command],
     command_count: i64,
     last_activity: Option<String>,
     suggest_next_step: bool,
