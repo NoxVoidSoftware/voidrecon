@@ -3,43 +3,69 @@ use crate::app::state::{App, InputMode, NotifLevel};
 use crate::llm::ChatMessage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use anyhow::Result;
+use unicode_width::UnicodeWidthChar;
+
+fn cursor_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    if cursor == text.len() {
+        return cursor;
+    }
+
+    text.char_indices()
+        .take_while(|(index, _)| *index <= cursor)
+        .last()
+        .map_or(0, |(index, _)| index)
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor_boundary(text, cursor);
+    text[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor_boundary(text, cursor);
+    cursor
+        + text[cursor..]
+            .chars()
+            .next()
+            .map_or(0, char::len_utf8)
+}
 
 impl App {
     pub fn insert_input_char(&mut self, c: char) {
-        if self.ui_state.input_cursor >= self.input_buffer.len() {
-            self.input_buffer.push(c);
-            self.ui_state.input_cursor = self.input_buffer.len();
-        } else {
-            self.input_buffer.insert(self.ui_state.input_cursor, c);
-            self.ui_state.input_cursor += 1;
-        }
+        let cursor = cursor_boundary(&self.input_buffer, self.ui_state.input_cursor);
+        self.input_buffer.insert(cursor, c);
+        self.ui_state.input_cursor = cursor + c.len_utf8();
     }
 
     pub fn delete_char_before_cursor(&mut self) {
-        if self.ui_state.input_cursor > 0 && !self.input_buffer.is_empty() {
-            self.ui_state.input_cursor -= 1;
-            if self.ui_state.input_cursor < self.input_buffer.len() {
-                self.input_buffer.remove(self.ui_state.input_cursor);
-            }
+        let cursor = cursor_boundary(&self.input_buffer, self.ui_state.input_cursor);
+        if cursor > 0 {
+            let previous = previous_char_boundary(&self.input_buffer, cursor);
+            self.input_buffer.remove(previous);
+            self.ui_state.input_cursor = previous;
         }
     }
 
     pub fn delete_char_at_cursor(&mut self) {
-        if self.ui_state.input_cursor < self.input_buffer.len() {
-            self.input_buffer.remove(self.ui_state.input_cursor);
+        let cursor = cursor_boundary(&self.input_buffer, self.ui_state.input_cursor);
+        if cursor < self.input_buffer.len() {
+            self.input_buffer.remove(cursor);
+            self.ui_state.input_cursor = cursor;
         }
     }
 
     pub fn cursor_left(&mut self) {
-        if self.ui_state.input_cursor > 0 {
-            self.ui_state.input_cursor -= 1;
-        }
+        self.ui_state.input_cursor =
+            previous_char_boundary(&self.input_buffer, self.ui_state.input_cursor);
     }
 
     pub fn cursor_right(&mut self) {
-        if self.ui_state.input_cursor < self.input_buffer.len() {
-            self.ui_state.input_cursor += 1;
-        }
+        self.ui_state.input_cursor =
+            next_char_boundary(&self.input_buffer, self.ui_state.input_cursor);
     }
 
     pub fn cursor_home(&mut self) {
@@ -47,6 +73,25 @@ impl App {
     }
 
     pub fn cursor_end(&mut self) {
+        self.ui_state.input_cursor = self.input_buffer.len();
+    }
+
+    pub fn set_input_cursor_from_column(&mut self, column: usize) {
+        let mut display_column = 0;
+        for (byte_index, character) in self.input_buffer.char_indices() {
+            let width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if column < display_column + width {
+                self.ui_state.input_cursor = byte_index;
+                return;
+            }
+
+            display_column += width;
+            if column == display_column {
+                self.ui_state.input_cursor = byte_index + character.len_utf8();
+                return;
+            }
+        }
+
         self.ui_state.input_cursor = self.input_buffer.len();
     }
 
@@ -345,4 +390,35 @@ impl App {
     }
     
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cursor_boundary, next_char_boundary, previous_char_boundary};
+
+    #[test]
+    fn cursor_movements_stay_on_utf8_boundaries() {
+        let text = "aЖ界";
+        assert_eq!(next_char_boundary(text, 1), 3);
+        assert_eq!(next_char_boundary(text, 3), 6);
+        assert_eq!(previous_char_boundary(text, 6), 3);
+        assert_eq!(previous_char_boundary(text, 3), 1);
+        assert_eq!(cursor_boundary(text, 2), 1);
+    }
+
+    #[test]
+    fn deleting_non_ascii_characters_uses_character_boundaries() {
+        let mut text = String::from("aЖ界");
+        let mut cursor = text.len();
+
+        let previous = previous_char_boundary(&text, cursor);
+        text.remove(previous);
+        cursor = previous;
+        assert_eq!(text, "aЖ");
+        assert_eq!(cursor, 3);
+
+        let previous = previous_char_boundary(&text, cursor);
+        text.remove(previous);
+        assert_eq!(text, "a");
+    }
 }

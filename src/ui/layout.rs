@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub fn render_ui(f: &mut Frame, app: &mut App) {
     let area = f.size();
@@ -632,8 +633,14 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
     
     // Set cursor position: accurately calculated and bounded when input is focused
     if app.ui_state.focus == crate::app::state::WindowFocus::Input {
-        let cursor_offset = app.ui_state.input_cursor.min(app.input_buffer.len());
-        let cursor_x = (area.x + mode_indicator.len() as u16 + cursor_offset as u16)
+        let cursor = app
+            .input_buffer
+            .get(..app.ui_state.input_cursor)
+            .unwrap_or(&app.input_buffer);
+        let cursor_offset = UnicodeWidthStr::width(cursor);
+        let cursor_x = (area.x
+            + mode_indicator.len() as u16
+            + cursor_offset.min(u16::MAX as usize) as u16)
             .min(area.x + area.width.saturating_sub(1));
         f.set_cursor(cursor_x, area.y);
     }

@@ -847,7 +847,7 @@ impl App {
                         self.ui_state.focus = WindowFocus::Input;
                         let prompt_len = 2; // "> " or "? "
                         let click_col = mouse.column.saturating_sub(sidebar_width + prompt_len);
-                        self.ui_state.input_cursor = (click_col as usize).min(self.input_buffer.len());
+                        self.set_input_cursor_from_column(click_col as usize);
                     } else if mouse.row >= 2 {
                         // Clicked inside the chat / log window -> focus chat window
                         self.ui_state.focus = WindowFocus::ChatLog;
