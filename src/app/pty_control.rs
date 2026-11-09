@@ -54,15 +54,21 @@ impl App {
     }
     
     pub async fn update_pty_dimensions(&mut self) -> Result<()> {
-        let (term_cols, term_rows) = self.terminal_size;
-        let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
-        let pty_cols = term_cols.saturating_sub(sidebar_width).max(20);
-        let pty_rows = term_rows.saturating_sub(3).max(5);
+        let (pty_cols, pty_rows) = self.pty_dimensions();
 
         for tab in &mut self.tabs {
             let _ = tab.resize(pty_cols, pty_rows);
         }
         Ok(())
+    }
+
+    pub fn pty_dimensions(&self) -> (u16, u16) {
+        let (term_cols, term_rows) = self.terminal_size;
+        let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
+        (
+            term_cols.saturating_sub(sidebar_width).max(20),
+            term_rows.saturating_sub(3).max(5),
+        )
     }
 
 

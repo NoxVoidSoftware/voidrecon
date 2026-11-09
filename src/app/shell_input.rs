@@ -3,7 +3,139 @@ use crate::app::state::{App, InputMode, NotifLevel};
 use crate::llm::ChatMessage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use anyhow::Result;
+use std::path::Path;
 use unicode_width::UnicodeWidthChar;
+
+fn input_token_bounds(input: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor_boundary(input, cursor);
+    let start = input[..cursor]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let end = input[cursor..]
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(input.len(), |(index, _)| cursor + index);
+    (start, end)
+}
+
+fn common_prefix(candidates: &[String]) -> &str {
+    let Some(first) = candidates.first() else {
+        return "";
+    };
+    let mut prefix_len = first.len();
+    for candidate in &candidates[1..] {
+        prefix_len = first
+            .char_indices()
+            .map(|(index, character)| (index, character.len_utf8()))
+            .take_while(|(index, length)| {
+                *index + *length <= prefix_len
+                    && candidate.get(*index..*index + *length)
+                        == first.get(*index..*index + *length)
+            })
+            .map(|(index, length)| index + length)
+            .last()
+            .unwrap_or(0);
+    }
+    &first[..prefix_len]
+}
+
+fn choose_completion(partial: &str, completions: &[String]) -> Option<String> {
+    let first = completions.first()?;
+    if completions.len() == 1 {
+        return Some(first.clone());
+    }
+
+    let prefix = common_prefix(completions);
+    if prefix.len() > partial.len() {
+        Some(prefix.to_string())
+    } else {
+        Some(first.clone())
+    }
+}
+
+fn is_executable(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
+}
+
+fn command_completions(prefix: &str) -> Result<Vec<String>> {
+    let mut completions = [
+        "cd", "echo", "exit", "export", "history", "jobs", "printf", "pwd", "read",
+        "source", "test", "type", "umask", "unalias", "unset",
+    ]
+    .into_iter()
+    .filter(|command| command.starts_with(prefix))
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(prefix) && is_executable(&entry.path())? {
+                    completions.push(name);
+                }
+            }
+        }
+    }
+
+    completions.sort();
+    completions.dedup();
+    Ok(completions)
+}
+
+fn path_completions(prefix: &str, workspace: &Path) -> Result<Vec<String>> {
+    let (directory_prefix, name_prefix) = prefix
+        .rsplit_once('/')
+        .map_or(("", prefix), |(directory, name)| {
+            (if directory.is_empty() { "/" } else { directory }, name)
+        });
+    let directory = if directory_prefix.is_empty() {
+        workspace.to_path_buf()
+    } else {
+        workspace.join(directory_prefix)
+    };
+
+    let mut completions = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(name_prefix) {
+            continue;
+        }
+
+        let mut completion = format!("{directory_prefix}{name}");
+        if entry.path().is_dir() {
+            completion.push('/');
+        }
+        completions.push(completion);
+    }
+
+    completions.sort();
+    Ok(completions)
+}
 
 fn cursor_boundary(text: &str, cursor: usize) -> usize {
     let cursor = cursor.min(text.len());
@@ -93,6 +225,78 @@ impl App {
         }
 
         self.ui_state.input_cursor = self.input_buffer.len();
+    }
+
+    pub fn complete_input(&mut self) -> Result<()> {
+        let cursor = cursor_boundary(&self.input_buffer, self.ui_state.input_cursor);
+        let (start, end) = input_token_bounds(&self.input_buffer, cursor);
+        let token = &self.input_buffer[start..cursor];
+        if token.is_empty() {
+            return Ok(());
+        }
+        let is_command = self.input_buffer[..start].trim().is_empty()
+            && !token.contains('/')
+            && !token.starts_with('.')
+            && !token.starts_with('~');
+        let completions = if is_command {
+            if token.starts_with(':') {
+                Ok([
+                    ":target",
+                    ":targets",
+                    ":findings",
+                    ":note",
+                    ":models",
+                    ":provider",
+                    ":sessions",
+                    ":mouse",
+                    ":newtab",
+                    ":closeshell",
+                    ":exploit",
+                    ":help",
+                    ":quit",
+                ]
+                .into_iter()
+                .filter(|command| command.starts_with(token))
+                .map(str::to_string)
+                .collect())
+            } else {
+                command_completions(token)
+            }
+        } else {
+            path_completions(token, &self.session_meta.workspace_path())
+        };
+
+        let completions = match completions {
+            Ok(completions) => completions,
+            Err(error) => {
+                self.add_notification(
+                    format!("Autocomplete failed: {error}"),
+                    NotifLevel::Warning,
+                );
+                return Ok(());
+            }
+        };
+        if completions.is_empty() {
+            return Ok(());
+        }
+
+        let partial = &self.input_buffer[start..cursor];
+        let Some(completion) = choose_completion(partial, &completions) else {
+            return Ok(());
+        };
+
+        let append_space = completions.len() == 1
+            && !completion.ends_with('/')
+            && end == self.input_buffer.len();
+        self.input_buffer.replace_range(start..end, &completion);
+        let mut cursor = start + completion.len();
+        if append_space {
+            self.input_buffer.insert(cursor, ' ');
+            cursor += 1;
+        }
+        self.ui_state.input_cursor = cursor;
+        self.ui_state.focus = crate::app::state::WindowFocus::Input;
+        Ok(())
     }
 
     pub async fn handle_shell_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -186,6 +390,9 @@ impl App {
                     return Ok(());
                 }
                 self.insert_input_char(c);
+            }
+            KeyCode::Tab => {
+                self.complete_input()?;
             }
             KeyCode::Backspace => {
                 self.ui_state.focus = crate::app::state::WindowFocus::Input;
@@ -287,6 +494,9 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.insert_input_char(c);
+            }
+            KeyCode::Tab => {
+                self.complete_input()?;
             }
             KeyCode::Backspace => {
                 self.ui_state.focus = crate::app::state::WindowFocus::Input;
@@ -394,7 +604,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{cursor_boundary, next_char_boundary, previous_char_boundary};
+    use super::{
+        choose_completion, common_prefix, cursor_boundary, input_token_bounds, next_char_boundary,
+        previous_char_boundary,
+    };
 
     #[test]
     fn cursor_movements_stay_on_utf8_boundaries() {
@@ -420,5 +633,24 @@ mod tests {
         let previous = previous_char_boundary(&text, cursor);
         text.remove(previous);
         assert_eq!(text, "a");
+    }
+
+    #[test]
+    fn completion_prefix_and_token_bounds_support_unicode() {
+        let candidates = vec!["café-au-lait".to_string(), "café-noir".to_string()];
+        assert_eq!(common_prefix(&candidates), "café-");
+
+        let input = "echo café au";
+        let cursor = "echo café".len();
+        assert_eq!(input_token_bounds(input, cursor), (5, 10));
+    }
+
+    #[test]
+    fn ambiguous_completion_is_inserted_instead_of_only_notified() {
+        let candidates = vec!["pwd".to_string(), "python".to_string()];
+        assert_eq!(choose_completion("p", &candidates).as_deref(), Some("pwd"));
+
+        let candidates = vec!["cargo".to_string(), "cat".to_string()];
+        assert_eq!(choose_completion("c", &candidates).as_deref(), Some("ca"));
     }
 }

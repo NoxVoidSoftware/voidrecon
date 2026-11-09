@@ -6,7 +6,7 @@ use ratatui::backend::Backend;
 use std::time::Instant;
 
 use crate::app::events::AppEvent;
-use crate::app::state::{App, InputMode, NotifLevel, SidebarNode};
+use crate::app::state::{App, InputMode, NotifLevel, SidebarNode, WindowFocus};
 use crate::db::DatabaseQueries;
 use crate::db::models::Finding;
 use crate::llm::{ChatMessage, LlmRequestState};
@@ -495,8 +495,8 @@ impl App {
                     self.toggle_mouse_capture()?;
                     return Ok(());
                 }
-                (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
-                    self.cycle_tab();
+                (KeyCode::BackTab, _) => {
+                    self.cycle_focus_backward();
                     return Ok(());
                 }
                 (KeyCode::Esc, _) => {
@@ -582,8 +582,8 @@ impl App {
                 self.toggle_mouse_capture()?;
                 return Ok(());
             }
-            (KeyCode::Tab, _) | (KeyCode::BackTab, _) => {
-                self.cycle_tab();
+            (KeyCode::BackTab, _) => {
+                self.cycle_focus_backward();
                 return Ok(());
             }
             (KeyCode::Esc, _) => {
@@ -697,7 +697,11 @@ impl App {
     }
     
     pub async fn new_shell_tab(&mut self) -> Result<()> {
-        let tab = PtyTab::new_shell(self.next_tab_id, self.event_tx.clone())?;
+        let tab = PtyTab::new_shell(
+            self.next_tab_id,
+            self.event_tx.clone(),
+            self.pty_dimensions(),
+        )?;
         self.next_tab_id += 1;
         self.tabs.push(tab);
         self.active_tab = self.tabs.len(); // switch focus to the new shell tab (Tab 1..N)
@@ -705,7 +709,12 @@ impl App {
     }
     
     pub async fn spawn_listener_tab(&mut self, lport: u16) -> Result<()> {
-        let tab = PtyTab::new_listener(self.next_tab_id, lport, self.event_tx.clone())?;
+        let tab = PtyTab::new_listener(
+            self.next_tab_id,
+            lport,
+            self.event_tx.clone(),
+            self.pty_dimensions(),
+        )?;
         self.next_tab_id += 1;
         self.tabs.push(tab);
         self.active_tab = self.tabs.len(); // switch focus to the listener tab
@@ -722,9 +731,28 @@ impl App {
         Ok(())
     }
     
-    pub fn cycle_tab(&mut self) {
-        let total = 1 + self.tabs.len();
-        self.active_tab = (self.active_tab + 1) % total;
+    pub fn cycle_focus_backward(&mut self) {
+        if self.active_tab > 0 {
+            if self.active_tab == 1 {
+                self.active_tab = 0;
+                self.ui_state.focus = WindowFocus::Input;
+            } else {
+                self.active_tab -= 1;
+            }
+            return;
+        }
+
+        match self.ui_state.focus {
+            WindowFocus::Input => self.ui_state.focus = WindowFocus::ChatLog,
+            WindowFocus::ChatLog if !self.ui_state.sidebar_collapsed => {
+                self.ui_state.focus = WindowFocus::Sidebar;
+            }
+            WindowFocus::ChatLog | WindowFocus::Sidebar if !self.tabs.is_empty() => {
+                self.active_tab = self.tabs.len();
+            }
+            WindowFocus::ChatLog => self.ui_state.focus = WindowFocus::Input,
+            WindowFocus::Sidebar => self.ui_state.focus = WindowFocus::Input,
+        }
     }
     
     pub async fn show_targets_table(&mut self) -> Result<()> {

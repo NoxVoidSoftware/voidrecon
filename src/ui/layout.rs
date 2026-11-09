@@ -745,8 +745,6 @@ fn render_notifications(f: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_sanitize_terminal_output_carriage_return() {
         let raw = " 0     0    0\r53 1.25M   53\r100 1.25M  100";

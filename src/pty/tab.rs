@@ -47,12 +47,17 @@ impl PtyTab {
     }
 
     /// Create a new local shell tab
-    pub fn new_shell(id: usize, tx: mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
+    pub fn new_shell(
+        id: usize,
+        tx: mpsc::UnboundedSender<AppEvent>,
+        size: (u16, u16),
+    ) -> Result<Self> {
+        let (cols, rows) = size;
         let pty_system = native_pty_system();
         let pty_pair = pty_system
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -68,7 +73,7 @@ impl PtyTab {
         let mut reader = pty_pair.master.try_clone_reader().context("Failed to clone reader")?;
         let writer = pty_pair.master.take_writer().context("Failed to take writer")?;
 
-        let parser = Arc::new(Mutex::new(Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
 
         let parser_clone = parser.clone();
         let tx_clone = tx.clone();
@@ -146,12 +151,14 @@ impl PtyTab {
         id: usize,
         lport: u16,
         tx: mpsc::UnboundedSender<AppEvent>,
+        size: (u16, u16),
     ) -> Result<Self> {
+        let (cols, rows) = size;
         let pty_system = native_pty_system();
         let pty_pair = pty_system
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -279,7 +286,7 @@ impl PtyTab {
         let mut reader = pty_pair.master.try_clone_reader().context("Failed to clone reader")?;
         let writer = pty_pair.master.take_writer().context("Failed to take writer")?;
 
-        let parser = Arc::new(Mutex::new(Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
 
         let parser_clone = parser.clone();
         let tx_clone = tx.clone();
