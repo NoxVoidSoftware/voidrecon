@@ -29,16 +29,16 @@ pub async fn execute_tool_call(
             let metadata_json = args.get("metadata_json").and_then(|v| v.as_str());
             let notes = args.get("notes").and_then(|v| v.as_str());
 
-            let target = DatabaseQueries::get_target_by_ip(conn, ip_host)?;
+            let target = DatabaseQueries::get_target_by_ip(&conn, ip_host)?;
             let (target_id, is_new) = if let Some(t) = target {
                 if ports_json.is_some() || metadata_json.is_some() {
-                    DatabaseQueries::update_target(conn, t.id, ports_json, metadata_json)?;
+                    DatabaseQueries::update_target(&conn, t.id, ports_json, metadata_json)?;
                 }
                 (t.id, false)
             } else {
-                let id = DatabaseQueries::add_target(conn, ip_host, ports_json, notes)?;
+                let id = DatabaseQueries::add_target(&conn, ip_host, ports_json, notes)?;
                 if metadata_json.is_some() {
-                    DatabaseQueries::update_target(conn, id, None, metadata_json)?;
+                    DatabaseQueries::update_target(&conn, id, None, metadata_json)?;
                 }
                 (id, true)
             };
@@ -54,10 +54,10 @@ pub async fn execute_tool_call(
             }))
         }
         "list_targets" => {
-            let targets = DatabaseQueries::get_all_targets(conn)?;
+            let targets = DatabaseQueries::get_all_targets(&conn)?;
             let mut list = Vec::new();
             for t in targets {
-                let findings_count = DatabaseQueries::get_findings_for_target(conn, t.id)
+                let findings_count = DatabaseQueries::get_findings_for_target(&conn, t.id)
                     .map(|f| f.len())
                     .unwrap_or(0);
                 let ports_count = t.ports_json.as_ref()
@@ -84,18 +84,18 @@ pub async fn execute_tool_call(
             let ip_host_arg = args.get("ip_host").and_then(|v| v.as_str());
 
             let target = if let Some(id) = target_id_arg {
-                DatabaseQueries::get_target(conn, id)?
+                DatabaseQueries::get_target(&conn, id)?
             } else if let Some(ip) = ip_host_arg {
-                DatabaseQueries::get_target_by_ip(conn, ip)?
+                DatabaseQueries::get_target_by_ip(&conn, ip)?
             } else if let Some(active_id) = active_target_id {
-                DatabaseQueries::get_target(conn, active_id)?
+                DatabaseQueries::get_target(&conn, active_id)?
             } else {
-                let all = DatabaseQueries::get_all_targets(conn)?;
+                let all = DatabaseQueries::get_all_targets(&conn)?;
                 all.into_iter().next()
             };
 
             if let Some(t) = target {
-                let (_, findings) = DatabaseQueries::get_target_with_findings(conn, t.id)?
+                let (_, findings) = DatabaseQueries::get_target_with_findings(&conn, t.id)?
                     .unwrap_or((t.clone(), Vec::new()));
                 Ok(serde_json::json!({
                     "id": t.id,
@@ -118,9 +118,9 @@ pub async fn execute_tool_call(
             let severity_filter = args.get("severity").and_then(|v| v.as_str());
 
             let findings = if let Some(tid) = target_id {
-                DatabaseQueries::get_findings_for_target(conn, tid)?
+                DatabaseQueries::get_findings_for_target(&conn, tid)?
             } else {
-                DatabaseQueries::get_all_findings(conn)?
+                DatabaseQueries::get_all_findings(&conn)?
             };
 
             let filtered: Vec<_> = findings.into_iter()
@@ -154,7 +154,7 @@ pub async fn execute_tool_call(
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
             if let Some(tid) = target_id {
-                let commands = DatabaseQueries::get_recent_commands(conn, tid, limit)?;
+                let commands = DatabaseQueries::get_recent_commands(&conn, tid, limit)?;
                 let cmd_json: Vec<_> = commands.into_iter().map(|c| serde_json::json!({
                     "raw_cmd": c.raw_cmd,
                     "output_preview": c.output,
@@ -175,7 +175,7 @@ pub async fn execute_tool_call(
                 .context("Missing target_id and no active target selected")?;
             let ports_json = args.get("ports_json").and_then(|v| v.as_str());
             let metadata_json = args.get("metadata_json").and_then(|v| v.as_str());
-            DatabaseQueries::update_target(conn, target_id, ports_json, metadata_json)?;
+            DatabaseQueries::update_target(&conn, target_id, ports_json, metadata_json)?;
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
             Ok(serde_json::json!({"success": true, "target_id": target_id}))
         }
@@ -188,7 +188,7 @@ pub async fn execute_tool_call(
             let source_cmd = args.get("source_cmd").and_then(|v| v.as_str());
             let confidence = args.get("confidence").and_then(|v| v.as_i64()).map(|c| c as i32);
             let evidence_path = args.get("evidence_path").and_then(|v| v.as_str());
-            let id = DatabaseQueries::add_finding(conn, target_id, title, description, severity, source_cmd, confidence, evidence_path)?;
+            let id = DatabaseQueries::add_finding(&conn, target_id, title, description, severity, source_cmd, confidence, evidence_path)?;
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
             Ok(serde_json::json!({"success": true, "finding_id": id, "target_id": target_id}))
         }
@@ -196,7 +196,7 @@ pub async fn execute_tool_call(
             let ip_host = args.get("ip_host").and_then(|v| v.as_str()).context("Missing ip_host")?;
             let ports_json = args.get("ports_json").and_then(|v| v.as_str());
             let notes = args.get("notes").and_then(|v| v.as_str());
-            let id = DatabaseQueries::add_target(conn, ip_host, ports_json, notes)?;
+            let id = DatabaseQueries::add_target(&conn, ip_host, ports_json, notes)?;
             let _ = app_tx.send(crate::app::AppEvent::SetActiveTarget(id));
             Ok(serde_json::json!({"id": id, "target_id": id, "ip_host": ip_host, "success": true}))
         }
@@ -219,8 +219,8 @@ pub async fn execute_tool_call(
         "get_shell_context" => {
             let target_id = args.get("target_id").and_then(|v| v.as_i64())
                 .context("Missing target_id")?;
-            let target = DatabaseQueries::get_target(conn, target_id)?.context("Target not found")?;
-            let commands = DatabaseQueries::get_recent_commands(conn, target_id, 50)?;
+            let target = DatabaseQueries::get_target(&conn, target_id)?.context("Target not found")?;
+            let commands = DatabaseQueries::get_recent_commands(&conn, target_id, 50)?;
             Ok(serde_json::json!({
                 "ip_host": target.ip_host,
                 "shell_type": "bash",
@@ -279,7 +279,7 @@ pub async fn execute_tool_call(
                 let source_cmd = format!("python workspace/exploits/{}", clean_name);
                 let rel_path = format!("workspace/exploits/{}", clean_name);
                 let _ = DatabaseQueries::add_finding(
-                    conn,
+                    &conn,
                     tid,
                     &finding_title,
                     &finding_desc,
@@ -625,7 +625,7 @@ pub async fn execute_tool_call(
                 let _ = std::fs::remove_file(&file_path);
             }
 
-            let removed_from_db = DatabaseQueries::delete_findings_by_evidence(conn, target_id, &clean_name)?;
+            let removed_from_db = DatabaseQueries::delete_findings_by_evidence(&conn, target_id, &clean_name)?;
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
 
             Ok(serde_json::json!({
@@ -665,7 +665,7 @@ pub async fn execute_tool_call(
             }
 
             let removed_from_db = if clean_folder == "evidence" {
-                DatabaseQueries::delete_findings_by_evidence(conn, active_target_id, &clean_name)?
+                DatabaseQueries::delete_findings_by_evidence(&conn, active_target_id, &clean_name)?
             } else {
                 0
             };

@@ -105,21 +105,21 @@ impl App {
         
         // Build context
         let active_target = if let Some(id) = self.active_target_id {
-            DatabaseQueries::get_target(self.db.conn(), id)?
+            DatabaseQueries::get_target(&self.db.conn(), id)?
         } else {
             None
         };
         
         let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
-            let f = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?;
-            let r = DatabaseQueries::get_recent_commands(self.db.conn(), target.id, 3)?;
-            let c = DatabaseQueries::get_command_count(self.db.conn(), target.id)?;
+            let f = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id)?;
+            let r = DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3)?;
+            let c = DatabaseQueries::get_command_count(&self.db.conn(), target.id)?;
             (f, r, c)
         } else {
             (Vec::new(), Vec::new(), 0)
         };
-        let targets_count = DatabaseQueries::get_targets_count(self.db.conn())?;
-        let all_targets = DatabaseQueries::get_all_targets(self.db.conn())?;
+        let targets_count = DatabaseQueries::get_targets_count(&self.db.conn())?;
+        let all_targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
         
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
@@ -186,20 +186,20 @@ impl App {
         }
 
         let active_target = if let Some(id) = self.active_target_id {
-            DatabaseQueries::get_target(self.db.conn(), id).unwrap_or(None)
+            DatabaseQueries::get_target(&self.db.conn(), id).unwrap_or(None)
         } else {
             None
         };
         let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
-            let f = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id).unwrap_or_default();
-            let r = DatabaseQueries::get_recent_commands(self.db.conn(), target.id, 3).unwrap_or_default();
-            let c = DatabaseQueries::get_command_count(self.db.conn(), target.id).unwrap_or(0);
+            let f = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id).unwrap_or_default();
+            let r = DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3).unwrap_or_default();
+            let c = DatabaseQueries::get_command_count(&self.db.conn(), target.id).unwrap_or(0);
             (f, r, c)
         } else {
             (Vec::new(), Vec::new(), 0)
         };
-        let targets_count = DatabaseQueries::get_targets_count(self.db.conn()).unwrap_or(0);
-        let all_targets = DatabaseQueries::get_all_targets(self.db.conn()).unwrap_or_default();
+        let targets_count = DatabaseQueries::get_targets_count(&self.db.conn()).unwrap_or(0);
+        let all_targets = DatabaseQueries::get_all_targets(&self.db.conn()).unwrap_or_default();
 
         let base_prompt = build_system_prompt(
             &self.session_meta.name,
@@ -382,7 +382,7 @@ impl App {
                 if tool_call.function.name == "save_workspace_file" {
                     let target_id = result.get("target_id").and_then(|v| v.as_i64()).or(self.active_target_id).unwrap_or(0);
                     let target_ip = if target_id > 0 {
-                        DatabaseQueries::get_target(self.db.conn(), target_id)
+                        DatabaseQueries::get_target(&self.db.conn(), target_id)
                             .ok()
                             .flatten()
                             .map(|t| t.ip_host)
@@ -425,7 +425,7 @@ impl App {
                 // Handle special tool results
                 if tool_call.function.name == "execute_exploit_script" {
                     let target_id = result.get("target_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let target = DatabaseQueries::get_target(self.db.conn(), target_id)?;
+                    let target = DatabaseQueries::get_target(&self.db.conn(), target_id)?;
                     if let Some(target) = target {
                         let script_name = result.get("script_name").and_then(|v| v.as_str()).unwrap_or("exploit.py").to_string();
                         let command_line = result.get("command_line").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -459,7 +459,7 @@ impl App {
 
                 if tool_call.function.name == "open_reverse_shell_tab" {
                     let target_id = result.get("target_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let target = DatabaseQueries::get_target(self.db.conn(), target_id)?;
+                    let target = DatabaseQueries::get_target(&self.db.conn(), target_id)?;
                     if let Some(target) = target {
                         let lhost = result.get("lhost").and_then(|v| v.as_str()).unwrap_or("0.0.0.0").to_string();
                         let lport = result.get("lport").and_then(|v| v.as_u64()).unwrap_or(4444) as u16;
@@ -562,20 +562,20 @@ impl App {
 
         // System prompt with full context
         let active_target = if let Some(id) = self.active_target_id {
-            DatabaseQueries::get_target(self.db.conn(), id).unwrap_or(None)
+            DatabaseQueries::get_target(&self.db.conn(), id).unwrap_or(None)
         } else {
             None
         };
         let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
-            let f = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id).unwrap_or_default();
-            let r = DatabaseQueries::get_recent_commands(self.db.conn(), target.id, 3).unwrap_or_default();
-            let c = DatabaseQueries::get_command_count(self.db.conn(), target.id).unwrap_or(0);
+            let f = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id).unwrap_or_default();
+            let r = DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3).unwrap_or_default();
+            let c = DatabaseQueries::get_command_count(&self.db.conn(), target.id).unwrap_or(0);
             (f, r, c)
         } else {
             (Vec::new(), Vec::new(), 0)
         };
-        let targets_count = DatabaseQueries::get_targets_count(self.db.conn()).unwrap_or(0);
-        let all_targets = DatabaseQueries::get_all_targets(self.db.conn()).unwrap_or_default();
+        let targets_count = DatabaseQueries::get_targets_count(&self.db.conn()).unwrap_or(0);
+        let all_targets = DatabaseQueries::get_all_targets(&self.db.conn()).unwrap_or_default();
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),

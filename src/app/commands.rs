@@ -14,22 +14,26 @@ impl App {
                 if parts.len() > 1 {
                     let input = parts[1].trim();
                     let target = if let Ok(id) = input.parse::<i64>() {
-                        DatabaseQueries::get_target(self.db.conn(), id)?
+                        DatabaseQueries::get_target(&self.db.conn(), id)?
                     } else {
-                        DatabaseQueries::get_target_by_ip(self.db.conn(), input)?
+                        DatabaseQueries::get_target_by_ip(&self.db.conn(), input)?
                     };
                     if let Some(target) = target {
                         self.active_target_id = Some(target.id);
                         self.reload_sidebar().await?;
                         self.add_notification(format!("Active target: {} (ID: {})", target.ip_host, target.id), NotifLevel::Info);
                     } else {
-                        let new_id = DatabaseQueries::add_target(self.db.conn(), input, None, None)?;
+                        let new_id = DatabaseQueries::add_target(&self.db.conn(), input, None, None)?;
                         self.active_target_id = Some(new_id);
                         self.reload_sidebar().await?;
                         self.add_notification(format!("Added & activated target: {} (ID: {})", input, new_id), NotifLevel::Info);
                     }
                 } else if let Some(target_id) = self.active_target_id {
-                    if let Some(target) = DatabaseQueries::get_target(self.db.conn(), target_id)? {
+                    let _target_res = {
+                        let conn = self.db.conn();
+                        DatabaseQueries::get_target(&conn, target_id)?
+                    };
+                    if let Some(target) = _target_res {
                         self.add_notification(format!("Active target: {} (ID: {})", target.ip_host, target.id), NotifLevel::Info);
                     }
                 } else {
@@ -49,7 +53,7 @@ impl App {
                 if parts.len() > 1 {
                     if let Some(target_id) = self.active_target_id {
                         DatabaseQueries::add_note(
-                            self.db.conn(),
+                            &self.db.conn(),
                             target_id,
                             parts[1],
                         )?;
@@ -236,10 +240,10 @@ impl App {
         let target_id = self.active_target_id;
 
         // Save to database with full output artifact
-        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "user", &result.cmd);
-        let _ = DatabaseQueries::add_chat_message(self.db.conn(), target_id, "assistant", &result.output);
+        let _ = DatabaseQueries::add_chat_message(&self.db.conn(), target_id, "user", &result.cmd);
+        let _ = DatabaseQueries::add_chat_message(&self.db.conn(), target_id, "assistant", &result.output);
         let _ = DatabaseQueries::add_command(
-            self.db.conn(),
+            &self.db.conn(),
             &self.session_meta.path(),
             target_id,
             &result.cmd,
@@ -258,12 +262,16 @@ impl App {
         self.ui_state.log_at_bottom = true;
 
         // Auto-parse scan outputs (e.g. nmap) to update target and open ports immediately
-        if let Ok(Some(discovered_target_id)) = DatabaseQueries::parse_nmap_and_update_target(
-            self.db.conn(),
-            &result.cmd,
-            &result.output,
-            self.active_target_id,
-        ) {
+        let parse_result = {
+            let conn = self.db.conn();
+            DatabaseQueries::parse_nmap_and_update_target(
+                &conn,
+                &result.cmd,
+                &result.output,
+                self.active_target_id,
+            )
+        };
+        if let Ok(Some(discovered_target_id)) = parse_result {
             self.active_target_id = Some(discovered_target_id);
             self.add_notification(
                 "Recon engine: Discovered target and updated open ports in DB".to_string(),

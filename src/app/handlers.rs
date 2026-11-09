@@ -293,7 +293,7 @@ impl App {
 
                                     // Record command and output artifact in database
                                     let _ = DatabaseQueries::add_command(
-                                        self.db.conn(),
+                                        &self.db.conn(),
                                         &self.session_meta.path(),
                                         Some(approval.target_id),
                                         command_line,
@@ -301,8 +301,8 @@ impl App {
                                         Some(0),
                                         Some(duration_ms),
                                     );
-                                    let _ = DatabaseQueries::add_chat_message(self.db.conn(), Some(approval.target_id), "user", &format!("$ {}", command_line));
-                                    let _ = DatabaseQueries::add_chat_message(self.db.conn(), Some(approval.target_id), "assistant", &out);
+                                    let _ = DatabaseQueries::add_chat_message(&self.db.conn(), Some(approval.target_id), "user", &format!("$ {}", command_line));
+                                    let _ = DatabaseQueries::add_chat_message(&self.db.conn(), Some(approval.target_id), "assistant", &out);
 
                                     let tool_out = if lines.len() > 30 {
                                         let top = lines[..25].join("\n");
@@ -355,7 +355,7 @@ impl App {
                                             format!("Evidence: {} ({})", filename, description)
                                         };
                                         let _ = DatabaseQueries::add_finding(
-                                            self.db.conn(),
+                                            &self.db.conn(),
                                             approval.target_id,
                                             &title,
                                             &description,
@@ -370,7 +370,7 @@ impl App {
                                         } else {
                                             format!("Saved artifact {}: {}", rel_path, description)
                                         };
-                                        let _ = DatabaseQueries::add_note(self.db.conn(), approval.target_id, &note_text);
+                                        let _ = DatabaseQueries::add_note(&self.db.conn(), approval.target_id, &note_text);
                                     }
 
                                     self.append_chat_message(ChatMessage {
@@ -631,8 +631,8 @@ impl App {
     }
     
     pub async fn reload_sidebar(&mut self) -> Result<()> {
-        let _ = DatabaseQueries::deduplicate_targets_and_findings(self.db.conn());
-        let targets = DatabaseQueries::get_all_targets(self.db.conn())?;
+        let _ = DatabaseQueries::deduplicate_targets_and_findings(&self.db.conn());
+        let targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
         self.sidebar_nodes.clear();
 
         if let Some(act_id) = self.active_target_id {
@@ -642,7 +642,7 @@ impl App {
         }
         
         for target in targets {
-            let findings = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?;
+            let findings = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id)?;
             let mut by_severity: std::collections::HashMap<String, Vec<Finding>> = std::collections::HashMap::new();
             for finding in findings {
                 // If finding references an evidence file in workspace/evidence, verify it still exists on disk.
@@ -654,7 +654,7 @@ impl App {
                         let full_p = self.session_meta.workspace_path().join("evidence").join(sub);
                         let direct_p = self.session_meta.path().join(ep);
                         if !full_p.exists() && !direct_p.exists() {
-                            let _ = DatabaseQueries::delete_finding(self.db.conn(), finding.id);
+                            let _ = DatabaseQueries::delete_finding(&self.db.conn(), finding.id);
                             continue;
                         }
                     }
@@ -728,7 +728,7 @@ impl App {
     }
     
     pub async fn show_targets_table(&mut self) -> Result<()> {
-        let targets = DatabaseQueries::get_all_targets(self.db.conn())?;
+        let targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
         let mut table = String::from("ID | IP/Host | Ports | Findings\n");
         table.push_str("---|---------|-------|---------\n");
         for target in targets {
@@ -736,7 +736,7 @@ impl App {
                 .and_then(|p| serde_json::from_str::<Vec<crate::db::models::PortInfo>>(p).ok())
                 .map(|v| v.len())
                 .unwrap_or(0);
-            let findings_count = DatabaseQueries::get_findings_for_target(self.db.conn(), target.id)?.len();
+            let findings_count = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id)?.len();
             table.push_str(&format!("{} | {} | {} | {}\n", target.id, target.ip_host, ports_count, findings_count));
         }
         self.append_chat_message(ChatMessage {
@@ -751,7 +751,7 @@ impl App {
     pub async fn show_findings(&mut self, target_id: Option<i64>) -> Result<()> {
         let target_id = target_id.or(self.active_target_id);
         if let Some(id) = target_id {
-            let findings = DatabaseQueries::get_findings_for_target(self.db.conn(), id)?;
+            let findings = DatabaseQueries::get_findings_for_target(&self.db.conn(), id)?;
             let mut output = String::from("Findings:\n");
             for f in findings {
                 output.push_str(&format!("[{}] {}: {} (from: {})\n", f.severity, f.title, f.description, f.source_cmd.unwrap_or_default()));
