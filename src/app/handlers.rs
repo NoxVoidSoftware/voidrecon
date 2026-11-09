@@ -465,7 +465,7 @@ impl App {
         }
 
         // If LLM is generating, Ctrl+C or Esc cancels the request
-        if matches!(self.llm_request_state, LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls) {
+        if matches!(self.llm.request_state, LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls) {
             if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
                 || key.code == KeyCode::Esc {
                 self.cancel_llm_request();
@@ -529,12 +529,12 @@ impl App {
         // Tab 0 (Workspace & LLM) shortcuts
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if let Some(handle) = self.command_abort_handle.take() {
+                if let Some(handle) = self.command_run.abort_handle.take() {
                     handle.abort();
-                    self.running_command = None;
-                    self.command_stdin_tx = None;
-                    self.running_command_output.clear();
-                    self.running_command_raw.clear();
+                    self.command_run.running = None;
+                    self.command_run.stdin_tx = None;
+                    self.command_run.output.clear();
+                    self.command_run.raw.clear();
                     self.append_chat_message(ChatMessage {
                         role: "system".to_string(),
                         content: "⚠️ Command cancelled by user (Ctrl+C)".to_string(),
@@ -544,9 +544,9 @@ impl App {
                     self.add_notification("Command cancelled".to_string(), NotifLevel::Warning);
                     return Ok(());
                 }
-                if let Some(handle) = self.llm_abort_handle.take() {
+                if let Some(handle) = self.llm.abort_handle.take() {
                     handle.abort();
-                    self.llm_request_state = LlmRequestState::Idle;
+                    self.llm.request_state = LlmRequestState::Idle;
                     self.append_chat_message(ChatMessage {
                         role: "system".to_string(),
                         content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
@@ -593,7 +593,7 @@ impl App {
                 self.input_mode = InputMode::Shell;
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
-                self.suggestion_visible = false;
+                self.llm.suggestion_visible = false;
                 self.history_index = None;
                 self.ui_state.show_help = false;
                 self.ui_state.show_model_picker = false;
@@ -943,8 +943,8 @@ impl App {
                 self.ui_state.input_cursor = 0;
 
                 // If a command is running in workspace tab, forward input to its stdin
-                if self.running_command.is_some() && self.active_tab == 0 {
-                    if let Some(tx) = &self.command_stdin_tx {
+                if self.command_run.running.is_some() && self.active_tab == 0 {
+                    if let Some(tx) = &self.command_run.stdin_tx {
                         let _ = tx.send(format!("{}\n", cmd));
                         self.append_chat_message(ChatMessage {
                             role: "user".to_string(),
@@ -987,11 +987,11 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.ui_state.focus = crate::app::state::WindowFocus::Input;
-                if self.suggestion_visible && self.input_buffer.is_empty() {
+                if self.llm.suggestion_visible && self.input_buffer.is_empty() {
                     match c {
                         'r' => {
-                            if let Some(sug) = self.suggestion.take() {
-                                self.suggestion_visible = false;
+                            if let Some(sug) = self.llm.suggestion.take() {
+                                self.llm.suggestion_visible = false;
                                 if let Some(cmd) = sug.command {
                                     if self.active_tab == 0 {
                                         self.execute_workspace_command(&cmd).await?;
@@ -1003,18 +1003,18 @@ impl App {
                             return Ok(());
                         }
                         'e' => {
-                            if let Some(sug) = &self.suggestion {
+                            if let Some(sug) = &self.llm.suggestion {
                                 if let Some(cmd) = &sug.command {
                                     self.input_buffer = cmd.clone();
                                     self.ui_state.input_cursor = self.input_buffer.len();
                                     self.input_mode = InputMode::EditCommand;
                                 }
                             }
-                            self.suggestion_visible = false;
+                            self.llm.suggestion_visible = false;
                             return Ok(());
                         }
                         's' => {
-                            self.suggestion_visible = false;
+                            self.llm.suggestion_visible = false;
                             return Ok(());
                         }
                         _ => {}
@@ -1183,7 +1183,7 @@ impl App {
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
                 self.input_mode = InputMode::Shell;
-                self.suggestion_visible = false;
+                self.llm.suggestion_visible = false;
                 if !cmd.is_empty() {
                     self.command_history.push_back(cmd.clone());
                     if self.active_tab == 0 {
@@ -1222,7 +1222,7 @@ impl App {
                 self.input_mode = InputMode::Shell;
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
-                self.suggestion_visible = false;
+                self.llm.suggestion_visible = false;
             }
             _ => {}
         }
@@ -1395,13 +1395,13 @@ impl App {
     }
     
     fn handle_command_started(&mut self, request_id: u64, cmd: String) {
-        self.running_command = Some((request_id, cmd, Instant::now()));
-        self.running_command_output.clear();
-        self.running_command_raw.clear();
+        self.command_run.running = Some((request_id, cmd, Instant::now()));
+        self.command_run.output.clear();
+        self.command_run.raw.clear();
     }
 
     fn handle_command_chunk(&mut self, request_id: u64, chunk: String) {
-        if let Some((cur_id, _, _)) = &self.running_command {
+        if let Some((cur_id, _, _)) = &self.command_run.running {
             if *cur_id != request_id {
                 return;
             }
@@ -1410,13 +1410,13 @@ impl App {
         }
 
         // Cap raw buffer to prevent unbounded memory growth during large scans
-        if self.running_command_raw.len() > 100_000 {
-            let keep_from = self.running_command_raw.len() - 80_000;
-            self.running_command_raw = self.running_command_raw[keep_from..].to_string();
+        if self.command_run.raw.len() > 100_000 {
+            let keep_from = self.command_run.raw.len() - 80_000;
+            self.command_run.raw = self.command_run.raw[keep_from..].to_string();
         }
-        self.running_command_raw.push_str(&chunk);
+        self.command_run.raw.push_str(&chunk);
 
-        let sanitized = crate::ui::layout::sanitize_terminal_output(&self.running_command_raw);
+        let sanitized = crate::ui::layout::sanitize_terminal_output(&self.command_run.raw);
         let mut lines = Vec::new();
         for line in sanitized.lines() {
             let trimmed = line.trim_end_matches('\r');
@@ -1436,7 +1436,7 @@ impl App {
             let start = lines.len() - 100;
             lines = lines[start..].to_vec();
         }
-        self.running_command_output = lines;
+        self.command_run.output = lines;
 
         if self.ui_state.log_at_bottom {
             self.ui_state.log_scroll = usize::MAX;
@@ -1444,16 +1444,16 @@ impl App {
     }
 
     async fn handle_command_completed(&mut self, request_id: u64, result: crate::app::events::CommandResult) -> Result<()> {
-        if let Some((cur_id, _, _)) = &self.running_command {
+        if let Some((cur_id, _, _)) = &self.command_run.running {
             if *cur_id != request_id {
                 return Ok(());
             }
         }
-        self.running_command = None;
-        self.command_abort_handle = None;
-        self.command_stdin_tx = None;
-        self.running_command_output.clear();
-        self.running_command_raw.clear();
+        self.command_run.running = None;
+        self.command_run.abort_handle = None;
+        self.command_run.stdin_tx = None;
+        self.command_run.output.clear();
+        self.command_run.raw.clear();
 
         let target_id = self.active_target_id;
 
@@ -1497,7 +1497,7 @@ impl App {
         self.reload_sidebar().await?;
 
         // Trigger post-execution analysis
-        self.post_exec_mode = true;
+        self.llm.post_exec_mode = true;
         self.send_post_exec_analysis(&result.cmd, &result.output).await?;
 
         Ok(())
@@ -1520,9 +1520,9 @@ impl App {
         });
         self.ui_state.log_at_bottom = true;
 
-        self.running_command = Some((req_id, cmd_str.clone(), Instant::now()));
-        self.running_command_output.clear();
-        self.running_command_raw.clear();
+        self.command_run.running = Some((req_id, cmd_str.clone(), Instant::now()));
+        self.command_run.output.clear();
+        self.command_run.raw.clear();
 
         let ws_path = self.session_meta.workspace_path();
         let _ = std::fs::create_dir_all(&ws_path);
@@ -1533,7 +1533,7 @@ impl App {
         let _ = tx.send(AppEvent::CommandStarted(req_id, cmd_str.clone()));
 
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        self.command_stdin_tx = Some(stdin_tx);
+        self.command_run.stdin_tx = Some(stdin_tx);
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -1652,7 +1652,7 @@ impl App {
             ));
         });
 
-        self.command_abort_handle = Some(handle.abort_handle());
+        self.command_run.abort_handle = Some(handle.abort_handle());
 
         Ok(())
     }
@@ -1705,9 +1705,9 @@ impl App {
     
     fn build_recent_chat_messages(&self, max_turns: usize) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
-        let history_start = self.chat_log.len().saturating_sub(max_turns);
+        let history_start = self.llm.chat_log.len().saturating_sub(max_turns);
 
-        for msg in &self.chat_log[history_start..] {
+        for msg in &self.llm.chat_log[history_start..] {
             match msg.role.as_str() {
                 "user" => {
                     let content = if msg.content.starts_with("? ") {
@@ -1861,9 +1861,9 @@ impl App {
             max_tokens: 2048,
         };
         
-        self.llm_request_state = LlmRequestState::Streaming;
-        self.llm_response_buffer.clear();
-        self.pending_llm_request = Some(query.to_string());
+        self.llm.request_state = LlmRequestState::Streaming;
+        self.llm.response_buffer.clear();
+        self.llm.pending_request = Some(query.to_string());
         
         let tx = self.event_tx.clone();
         let client = self.llm_client.clone();
@@ -1871,7 +1871,7 @@ impl App {
         let handle = tokio::spawn(async move {
             let _ = client.stream_chat(request, tx, request_id).await;
         });
-        self.llm_abort_handle = Some(handle.abort_handle());
+        self.llm.abort_handle = Some(handle.abort_handle());
         
         Ok(())
     }
@@ -1958,8 +1958,8 @@ impl App {
             max_tokens: 1024,
         };
         
-        self.llm_request_state = LlmRequestState::Streaming;
-        self.llm_response_buffer.clear();
+        self.llm.request_state = LlmRequestState::Streaming;
+        self.llm.response_buffer.clear();
         
         let tx = self.event_tx.clone();
         let client = self.llm_client.clone();
@@ -1967,39 +1967,39 @@ impl App {
         let handle = tokio::spawn(async move {
             let _ = client.stream_chat(request, tx, request_id).await;
         });
-        self.llm_abort_handle = Some(handle.abort_handle());
+        self.llm.abort_handle = Some(handle.abort_handle());
         
         Ok(())
     }
     
     fn handle_llm_chunk(&mut self, request_id: u64, chunk: String) {
         // Ignore stale requests
-        if request_id != self.llm_request_id {
+        if request_id != self.llm.request_id {
             return;
         }
-        self.llm_response_buffer.push_str(&chunk);
+        self.llm.response_buffer.push_str(&chunk);
     }
     
     async fn handle_llm_tool_call(&mut self, request_id: u64, tool_call: ToolCall) -> Result<()> {
         // Ignore stale requests
-        if request_id != self.llm_request_id {
+        if request_id != self.llm.request_id {
             return Ok(());
         }
-        self.pending_tool_calls.push(tool_call);
-        self.llm_request_state = LlmRequestState::ProcessingToolCalls;
+        self.llm.pending_tool_calls.push(tool_call);
+        self.llm.request_state = LlmRequestState::ProcessingToolCalls;
         Ok(())
     }
     
     fn handle_llm_request_started(&mut self, request_id: u64) {
-        if request_id == self.llm_request_id {
-            self.llm_request_state = LlmRequestState::Streaming;
+        if request_id == self.llm.request_id {
+            self.llm.request_state = LlmRequestState::Streaming;
         }
     }
     
     fn handle_llm_request_failed(&mut self, request_id: u64, error: String) {
-        if request_id == self.llm_request_id {
-            self.llm_abort_handle = None;
-            self.llm_request_state = LlmRequestState::Failed;
+        if request_id == self.llm.request_id {
+            self.llm.abort_handle = None;
+            self.llm.request_state = LlmRequestState::Failed;
             self.add_notification(format!("LLM request failed: {}", error), NotifLevel::Error);
             self.append_chat_message(ChatMessage {
                 role: "system".to_string(),
@@ -2013,19 +2013,19 @@ impl App {
     
     async fn handle_llm_done(&mut self, request_id: u64) -> Result<()> {
         // Ignore stale requests
-        if request_id != self.llm_request_id {
+        if request_id != self.llm.request_id {
             return Ok(());
         }
         
-        self.llm_abort_handle = None;
-        self.llm_request_state = LlmRequestState::Completed;
+        self.llm.abort_handle = None;
+        self.llm.request_state = LlmRequestState::Completed;
         
-        if !self.pending_tool_calls.is_empty() {
+        if !self.llm.pending_tool_calls.is_empty() {
             // Push assistant message with tool calls into chat log first (required by LLM APIs)
-            let tool_calls = std::mem::take(&mut self.pending_tool_calls);
+            let tool_calls = std::mem::take(&mut self.llm.pending_tool_calls);
             self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
-                content: self.llm_response_buffer.clone(),
+                content: self.llm.response_buffer.clone(),
                 tool_calls: Some(tool_calls.clone()),
                 tool_call_id: None,
             });
@@ -2066,11 +2066,11 @@ impl App {
                         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         let explanation = args.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
                         if !cmd.is_empty() {
-                            self.suggestion = Some(crate::llm::types::LlmSuggestion {
+                            self.llm.suggestion = Some(crate::llm::types::LlmSuggestion {
                                 command: Some(cmd.to_string()),
                                 explanation: explanation.to_string(),
                             });
-                            self.suggestion_visible = true;
+                            self.llm.suggestion_visible = true;
                         }
                     }
                 }
@@ -2203,36 +2203,36 @@ impl App {
 
             // If an action requires user approval or a command is suggested for user execution,
             // STOP querying the LLM and wait for user input!
-            if self.suggestion_visible || self.pending_exploit_approval.is_some() {
-                self.llm_request_state = LlmRequestState::Completed;
+            if self.llm.suggestion_visible || self.pending_exploit_approval.is_some() {
+                self.llm.request_state = LlmRequestState::Completed;
                 self.ui_state.log_at_bottom = true;
                 return Ok(());
             }
 
             // Continue conversation with tool results only when no pending user action
             self.continue_llm_conversation().await?;
-        } else if self.post_exec_mode {
+        } else if self.llm.post_exec_mode {
             // Post-execution analysis complete
-            self.post_exec_mode = false;
+            self.llm.post_exec_mode = false;
             // Add LLM comment to chat log
             self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
-                content: self.llm_response_buffer.clone(),
+                content: self.llm.response_buffer.clone(),
                 tool_calls: None,
                 tool_call_id: None,
             });
             
             // Check for new asset detection (simplified)
-            if self.llm_response_buffer.to_lowercase().contains("detected") {
+            if self.llm.response_buffer.to_lowercase().contains("detected") {
                 self.add_notification("New assets detected - check LLM output".to_string(), NotifLevel::Info);
             }
         } else {
             // Regular LLM query / suggestion
-            let suggestion = parse_llm_response(&self.llm_response_buffer)?;
+            let suggestion = parse_llm_response(&self.llm.response_buffer)?;
             let content_display = if !suggestion.explanation.is_empty() {
                 suggestion.explanation.clone()
             } else {
-                self.llm_response_buffer.clone()
+                self.llm.response_buffer.clone()
             };
             self.append_chat_message(ChatMessage {
                 role: "assistant".to_string(),
@@ -2241,14 +2241,14 @@ impl App {
                 tool_call_id: None,
             });
             if suggestion.command.is_some() {
-                self.suggestion = Some(suggestion);
-                self.suggestion_visible = true;
+                self.llm.suggestion = Some(suggestion);
+                self.llm.suggestion_visible = true;
             }
             self.ui_state.log_at_bottom = true;
         }
         
-        self.llm_response_buffer.clear();
-        self.pending_llm_request = None;
+        self.llm.response_buffer.clear();
+        self.llm.pending_request = None;
         
         Ok(())
     }
@@ -2292,13 +2292,13 @@ impl App {
         });
 
         // Filter valid OpenAI messages within a bounded window (last 12 messages) to protect LLM context limits
-        let window_start = self.chat_log.len().saturating_sub(12);
-        let mut slice = &self.chat_log[window_start..];
+        let window_start = self.llm.chat_log.len().saturating_sub(12);
+        let mut slice = &self.llm.chat_log[window_start..];
         
         // Ensure we don't start slice with an orphaned 'tool' message without its preceding 'assistant' message
         if let Some(first_tool_pos) = slice.iter().position(|m| m.role == "tool") {
             if first_tool_pos == 0 && window_start > 0 {
-                slice = &self.chat_log[window_start - 1..];
+                slice = &self.llm.chat_log[window_start - 1..];
             }
         }
 
@@ -2352,8 +2352,8 @@ impl App {
             max_tokens: 2048,
         };
         
-        self.llm_request_state = LlmRequestState::Streaming;
-        self.llm_response_buffer.clear();
+        self.llm.request_state = LlmRequestState::Streaming;
+        self.llm.response_buffer.clear();
         
         let tx = self.event_tx.clone();
         let client = self.llm_client.clone();
@@ -2361,7 +2361,7 @@ impl App {
         let handle = tokio::spawn(async move {
             let _ = client.stream_chat(request, tx, request_id).await;
         });
-        self.llm_abort_handle = Some(handle.abort_handle());
+        self.llm.abort_handle = Some(handle.abort_handle());
         
         Ok(())
     }
@@ -2402,7 +2402,7 @@ impl App {
         self.last_tick = now;
 
         let is_animating = matches!(
-            self.llm_request_state,
+            self.llm.request_state,
             LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
         );
 
@@ -2639,7 +2639,7 @@ impl App {
 
                     // Input line is at row term_rows - 2 (footer is term_rows - 1)
                     let input_row = term_rows.saturating_sub(2);
-                    let suggestion_height = if self.suggestion_visible { 5 } else { 0 };
+                    let suggestion_height = if self.llm.suggestion_visible { 5 } else { 0 };
                     let approval_height = if self.pending_exploit_approval.is_some() { 5 } else { 0 };
                     let panels_height = suggestion_height + approval_height;
                     let input_area_start = input_row.saturating_sub(panels_height as u16);

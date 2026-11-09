@@ -71,11 +71,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
 
-    let llm_indicator = if let Some((_, cmd, start)) = &app.running_command {
+    let llm_indicator = if let Some((_, cmd, start)) = &app.command_run.running {
         let elapsed = start.elapsed().as_secs();
         Span::styled(format!(" [RUNNING {} ({}s): {}] ", spinner, elapsed, cmd), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
     } else {
-        match app.llm_request_state {
+        match app.llm.request_state {
             crate::llm::types::LlmRequestState::Streaming => {
                 Span::styled(format!(" [LLM {}] ", spinner), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
             }
@@ -238,7 +238,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
     let approval_height = if app.pending_exploit_approval.is_some() { 5 } else { 0 };
-    let suggestion_height = if app.suggestion_visible { 5 } else { 0 };
+    let suggestion_height = if app.llm.suggestion_visible { 5 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -290,7 +290,7 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(content).block(block), chunks[1]);
     }
 
-    if app.suggestion_visible {
+    if app.llm.suggestion_visible {
         render_suggestion_panel(f, app, chunks[2]);
     }
     
@@ -597,14 +597,14 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
             .sum()
     };
 
-    let mut display_lines = app.cached_chat_lines.clone();
+    let mut display_lines = app.llm.cached_chat_lines.clone();
     
     // Add streaming LLM response
-    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+    if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
         let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
 
-        let title = if app.llm_request_state == crate::llm::types::LlmRequestState::ProcessingToolCalls {
+        let title = if app.llm.request_state == crate::llm::types::LlmRequestState::ProcessingToolCalls {
             format!("┌─ 🤖 AI / LLM [Executing Tools... {}] (Ctrl+C: Cancel) ────────", spinner)
         } else {
             format!("┌─ 🤖 AI / LLM [Thinking / Streaming... {}] (Ctrl+C: Cancel) ───", spinner)
@@ -612,13 +612,13 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         display_lines.push(Line::from(vec![
             Span::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]));
-        if app.llm_response_buffer.is_empty() {
+        if app.llm.response_buffer.is_empty() {
             display_lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(Color::Yellow)),
                 Span::styled(format!("Connecting to provider & generating response... {}", spinner), Style::default().fg(Color::Yellow)),
             ]));
         } else {
-            for line in app.llm_response_buffer.lines() {
+            for line in app.llm.response_buffer.lines() {
                 display_lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::Yellow)),
                     Span::styled(line.to_string(), Style::default().fg(Color::White)),
@@ -631,7 +631,7 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         display_lines.push(Line::from(""));
     }
 
-    if let Some((_, cmd, start)) = &app.running_command {
+    if let Some((_, cmd, start)) = &app.command_run.running {
         let elapsed = start.elapsed().as_secs();
         let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
@@ -640,11 +640,11 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(" [Ctrl+C: Cancel | Type below for stdin]", Style::default().fg(Color::DarkGray)),
         ]));
 
-        if !app.running_command_output.is_empty() {
+        if !app.command_run.output.is_empty() {
             let max_display = 25;
-            let count = app.running_command_output.len();
+            let count = app.command_run.output.len();
             let start = count.saturating_sub(max_display);
-            let slice = &app.running_command_output[start..];
+            let slice = &app.command_run.output[start..];
 
             display_lines.push(Line::from(vec![
                 Span::styled(format!("┌── Live Process Output (last {} lines) ──────────────────────────", slice.len()), Style::default().fg(Color::Cyan)),
@@ -710,7 +710,7 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_suggestion_panel(f: &mut Frame, app: &App, area: Rect) {
-    let suggestion = match &app.suggestion {
+    let suggestion = match &app.llm.suggestion {
         Some(s) => s,
         None => return,
     };
@@ -764,7 +764,7 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let is_running_cmd = app.running_command.is_some() && app.active_tab == 0;
+    let is_running_cmd = app.command_run.running.is_some() && app.active_tab == 0;
     let (mode_indicator, mode_style) = match app.input_mode {
         InputMode::Shell => {
             if is_running_cmd {
@@ -849,10 +849,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     if app.pending_exploit_approval.is_some() {
         footer_spans.push(Span::styled(" [Y: Approve | N: Reject] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
-    if app.running_command.is_some() {
+    if app.command_run.running.is_some() {
         footer_spans.push(Span::styled(" Ctrl+C: Cancel Process ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
-    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+    if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
         footer_spans.push(Span::styled(" Ctrl+C: Cancel LLM ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
     footer_spans.push(Span::styled(format!(" [{}] ", mode_text), Style::default().bg(Color::Blue).fg(Color::White)));

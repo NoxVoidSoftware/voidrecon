@@ -161,6 +161,30 @@ impl SessionMeta {
     }
 }
 
+#[derive(Default)]
+pub struct LlmState {
+    pub request_id: u64,
+    pub request_state: LlmRequestState,
+    pub response_buffer: String,
+    pub pending_request: Option<String>,
+    pub pending_tool_calls: Vec<crate::llm::types::ToolCall>,
+    pub post_exec_mode: bool,
+    pub abort_handle: Option<tokio::task::AbortHandle>,
+    pub suggestion: Option<LlmSuggestion>,
+    pub suggestion_visible: bool,
+    pub chat_log: Vec<ChatMessage>,
+    pub cached_chat_lines: Vec<Line<'static>>,
+}
+
+#[derive(Default)]
+pub struct CommandRunState {
+    pub running: Option<(u64, String, Instant)>,
+    pub output: Vec<String>,
+    pub raw: String,
+    pub stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub abort_handle: Option<tokio::task::AbortHandle>,
+}
+
 pub struct App {
     pub config: Config,
     pub db: Database,
@@ -186,22 +210,8 @@ pub struct App {
     pub next_tab_id: usize,
     
     // LLM state
-    pub llm_request_id: u64,
-    pub llm_request_state: LlmRequestState,
-    pub llm_response_buffer: String,
-    pub pending_llm_request: Option<String>,
-    pub pending_tool_calls: Vec<crate::llm::types::ToolCall>,
-    pub post_exec_mode: bool,
-    pub llm_abort_handle: Option<tokio::task::AbortHandle>,
-    
-    // Suggestion panel
-    pub suggestion: Option<LlmSuggestion>,
-    pub suggestion_visible: bool,
-    
-    // Chat history (for display only)
-    pub chat_log: Vec<ChatMessage>,
-    pub cached_chat_lines: Vec<Line<'static>>,
-    
+    pub llm: LlmState,
+
     // Notifications
     pub notifications: Vec<Notification>,
     
@@ -216,11 +226,7 @@ pub struct App {
     pub pending_exploit_approval: Option<ExploitApproval>,
 
     // Background workspace command execution (Tab 0)
-    pub running_command: Option<(u64, String, Instant)>,
-    pub running_command_output: Vec<String>,
-    pub running_command_raw: String,
-    pub command_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    pub command_abort_handle: Option<tokio::task::AbortHandle>,
+    pub command_run: CommandRunState,
 
     // Mouse mode
     pub mouse_capture_enabled: bool,
@@ -307,27 +313,13 @@ impl App {
             tabs: Vec::new(), // Tab 0 is always Workspace & LLM; tabs holds Tab 1..N (Shell tabs)
             active_tab: 0,
             next_tab_id: 1,
-            llm_request_id: 0,
-            llm_request_state: LlmRequestState::Idle,
-            llm_response_buffer: String::new(),
-            pending_llm_request: None,
-            pending_tool_calls: Vec::new(),
-            post_exec_mode: false,
-            llm_abort_handle: None,
-            suggestion: None,
-            suggestion_visible: false,
-            chat_log: Vec::new(),
-            cached_chat_lines: Vec::new(),
+            llm: LlmState::default(),
             notifications: Vec::new(),
             event_tx,
             event_rx,
             terminal_size: crossterm::terminal::size().unwrap_or((80, 24)),
             pending_exploit_approval: None,
-            running_command: None,
-            running_command_output: Vec::new(),
-            running_command_raw: String::new(),
-            command_stdin_tx: None,
-            command_abort_handle: None,
+            command_run: CommandRunState::default(),
             mouse_capture_enabled: false,
             last_tick: Instant::now(),
         };
@@ -344,18 +336,18 @@ impl App {
     }
     
     pub fn next_request_id(&mut self) -> u64 {
-        self.llm_request_id += 1;
-        self.llm_request_id
+        self.llm.request_id += 1;
+        self.llm.request_id
     }
 
     pub fn cancel_llm_request(&mut self) {
-        if let Some(abort) = self.llm_abort_handle.take() {
+        if let Some(abort) = self.llm.abort_handle.take() {
             abort.abort();
         }
         self.next_request_id();
-        self.llm_request_state = LlmRequestState::Idle;
-        self.pending_tool_calls.clear();
-        self.llm_response_buffer.clear();
+        self.llm.request_state = LlmRequestState::Idle;
+        self.llm.pending_tool_calls.clear();
+        self.llm.response_buffer.clear();
         self.append_chat_message(ChatMessage {
             role: "system".to_string(),
             content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
@@ -367,21 +359,21 @@ impl App {
     }
 
     pub fn save_chat_history(&self) {
-        let _ = self.session_meta.save_chat_history(&self.chat_log);
+        let _ = self.session_meta.save_chat_history(&self.llm.chat_log);
     }
 
     pub fn rebuild_cached_chat_lines(&mut self) {
-        self.cached_chat_lines.clear();
-        for msg in &self.chat_log {
+        self.llm.cached_chat_lines.clear();
+        for msg in &self.llm.chat_log {
             let lines = crate::ui::layout::format_chat_message(msg, &self.config.active_model);
-            self.cached_chat_lines.extend(lines);
+            self.llm.cached_chat_lines.extend(lines);
         }
     }
 
     pub fn append_chat_message(&mut self, msg: ChatMessage) {
         let lines = crate::ui::layout::format_chat_message(&msg, &self.config.active_model);
-        self.cached_chat_lines.extend(lines);
-        self.chat_log.push(msg);
+        self.llm.cached_chat_lines.extend(lines);
+        self.llm.chat_log.push(msg);
         self.ui_state.log_at_bottom = true;
         self.save_chat_history();
     }
@@ -392,8 +384,8 @@ impl App {
             // Drop connection to session.db before removing folder on Windows
             self.db = Database::in_memory()?;
             self.session_meta = SessionMeta::new("None".to_string());
-            self.chat_log.clear();
-            self.cached_chat_lines.clear();
+            self.llm.chat_log.clear();
+            self.llm.cached_chat_lines.clear();
             self.tabs.clear();
             self.sidebar_nodes.clear();
             self.active_target_id = None;
@@ -438,7 +430,7 @@ impl App {
         let _ = std::fs::create_dir_all(ws.join("exploits"));
 
         self.db = Database::new(&session_meta.db_path())?;
-        self.chat_log = session_meta.load_chat_history();
+        self.llm.chat_log = session_meta.load_chat_history();
         self.rebuild_cached_chat_lines();
         self.session_meta = session_meta;
         self.tabs.clear();
