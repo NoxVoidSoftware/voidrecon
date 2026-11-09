@@ -12,7 +12,6 @@ use ratatui::{
 
 pub fn render_ui(f: &mut Frame, app: &mut App) {
     let area = f.size();
-    app.terminal_size = (area.width, area.height);
     
     // Main layout
     let chunks = Layout::default()
@@ -46,8 +45,7 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let model_display = if app.config.models_cache.iter().any(|m| m.id == app.config.active_model) {
-        let model = app.config.models_cache.iter().find(|m| m.id == app.config.active_model).unwrap();
+    let model_display = if let Some(model) = app.config.models_cache.iter().find(|m| m.id == app.config.active_model) {
         let free_badge = if model.id.ends_with(":free") || (model.pricing.prompt == "0" && model.pricing.completion == "0") {
             " [FREE]".to_string()
         } else {

@@ -70,20 +70,16 @@ pub fn parse_retry_delay(headers: &reqwest::header::HeaderMap, response_body: &s
 }
 
 impl LlmClient {
-    pub fn new(provider: Provider) -> Self {
-        let inner = LlmClientInner {
-            client: Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to create HTTP client"),
-            provider,
-        };
-        Self {
-            inner: Arc::new(inner),
-        }
+    pub fn new(provider: Provider) -> Result<Self> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .context("Failed to create HTTP client")?;
+        let inner = LlmClientInner { client, provider };
+        Ok(Self { inner: Arc::new(inner) })
     }
 
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config) -> Result<Self> {
         let provider = Provider::from_config(
             config.provider,
             &config.api_key,

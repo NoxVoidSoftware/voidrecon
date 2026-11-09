@@ -391,7 +391,10 @@ impl DatabaseQueries {
         for (_key, group) in grouped {
             if group.len() > 1 {
                 // Canonical target is the one with the lowest ID
-                let canonical = group.iter().min_by_key(|t| t.id).unwrap();
+                let canonical = match group.iter().min_by_key(|t| t.id) {
+                    Some(c) => c,
+                    None => continue,
+                };
                 let canonical_id = canonical.id;
                 let duplicate_ids: Vec<i64> = group.iter()
                     .filter(|t| t.id != canonical_id)
@@ -578,7 +581,7 @@ impl DatabaseQueries {
         } else if let Some(ip) = &target_ip {
             Self::get_target_by_ip(conn, ip).ok().flatten()
         } else if let Some(fid) = fallback_target_id {
-            Self::get_target(conn, fid).unwrap_or(None)
+            Self::get_target(conn, fid).ok().flatten()
         } else {
             None
         };

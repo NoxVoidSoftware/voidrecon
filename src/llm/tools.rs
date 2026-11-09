@@ -588,10 +588,11 @@ pub async fn execute_tool_call(
             let bytes_written = script_code.len();
 
             // Run automated Python syntax validation via py_compile
-            let syntax_check = std::process::Command::new("python")
-                .args(["-m", "py_compile", file_path.to_str().unwrap()])
+            let syntax_check = tokio::process::Command::new("python")
+                .args(["-m", "py_compile", file_path.to_str().unwrap_or(raw_name)])
                 .current_dir(workspace_path)
-                .output();
+                .output()
+                .await;
 
             let (syntax_valid, syntax_error) = match syntax_check {
                 Ok(out) => {

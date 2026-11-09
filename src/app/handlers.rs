@@ -129,7 +129,7 @@ impl App {
         let key = self.config.get_api_key(provider);
         let base_url = self.config.base_url.clone();
         let p = crate::llm::provider::Provider::from_config(provider, key, base_url);
-        let client = crate::llm::LlmClient::new(p);
+        let Ok(client) = crate::llm::LlmClient::new(p) else { return; };
         tokio::spawn(async move {
             if let Ok(models) = client.fetch_models().await {
                 if !models.is_empty() {
@@ -206,7 +206,11 @@ impl App {
 
                     self.config.set_provider(selected_provider, None);
                     let _ = self.config.save();
-                    self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                    if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
+                        self.llm_client = client;
+                    } else {
+                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
+                    }
                     self.ui_state.show_api_key_prompt = false;
                     self.ui_state.api_key_input.clear();
                     if self.config.models_cache.is_empty() {
@@ -811,7 +815,11 @@ impl App {
                     if let Err(e) = self.config.save() {
                         self.add_notification(format!("Failed to save config: {}", e), NotifLevel::Error);
                     } else {
-                        self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                        if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
+                        self.llm_client = client;
+                    } else {
+                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
+                    }
                         self.add_notification(
                             format!("Active model: {} ({})", self.config.active_model, provider.as_str()),
                             NotifLevel::Info,
@@ -841,7 +849,11 @@ impl App {
         }
         self.config.set_provider(provider, None);
         let _ = self.config.save();
-        self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+        if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
+                        self.llm_client = client;
+                    } else {
+                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
+                    }
         self.ui_state.model_picker_selected = 0;
         self.ui_state.model_picker_search.clear();
 
@@ -1060,7 +1072,9 @@ impl App {
                     }
                 } else if !self.command_history.is_empty() {
                     self.history_index = Some(self.command_history.len() - 1);
-                    self.input_buffer = self.command_history.back().unwrap().clone();
+                    if let Some(last) = self.command_history.back() {
+                        self.input_buffer = last.clone();
+                    }
                     self.ui_state.input_cursor = self.input_buffer.len();
                 } else if self.input_buffer.is_empty() {
                     // When no command history and empty input, Up scrolls chat log up by 1 line
@@ -1292,7 +1306,11 @@ impl App {
                             let url = subparts.get(1).map(|u| u.to_string());
                             self.config.set_provider(crate::config::ProviderKind::Ollama, url);
                             let _ = self.config.save();
-                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
+                        self.llm_client = client;
+                    } else {
+                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
+                    }
                             self.add_notification("Switched provider to Ollama (Local)".to_string(), NotifLevel::Info);
                             self.trigger_fetch_models();
                         }
@@ -1300,7 +1318,11 @@ impl App {
                             let url = subparts.get(1).map(|u| u.to_string());
                             self.config.set_provider(crate::config::ProviderKind::Custom, url);
                             let _ = self.config.save();
-                            self.llm_client = crate::llm::LlmClient::from_config(&self.config);
+                            if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
+                        self.llm_client = client;
+                    } else {
+                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
+                    }
                             self.add_notification("Switched provider to Custom endpoint".to_string(), NotifLevel::Info);
                             self.trigger_fetch_models();
                         }

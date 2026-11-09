@@ -235,7 +235,7 @@ impl App {
         let config = Config::load().context("Failed to load config")?;
         
         // Initialize LLM client for configured provider (OpenRouter, OpenAI, Ollama, Custom)
-        let llm_client = LlmClient::from_config(&config);
+        let llm_client = LlmClient::from_config(&config).context("Failed to initialize LLM client")?;
         
         // Initialize with in-memory database and placeholder session until user selects or creates a session
         let db = Database::in_memory().context("Failed to initialize temporary database")?;
