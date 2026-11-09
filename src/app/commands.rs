@@ -167,6 +167,8 @@ impl App {
             ":exploit" => {
                 if self.active_target_id.is_some() {
                     self.send_llm_query("give me a shell on this target").await?;
+                } else {
+                    self.add_notification("No active target selected".to_string(), NotifLevel::Warning);
                 }
             }
             _ => {
