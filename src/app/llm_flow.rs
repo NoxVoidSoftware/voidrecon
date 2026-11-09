@@ -1,7 +1,8 @@
 //! LLM conversation flow
 use crate::app::state::{App, NotifLevel};
 use crate::db::DatabaseQueries;
-use crate::llm::{ChatMessage, LlmProvider, LlmRequestState, POST_EXEC_PROMPT, build_system_prompt, get_tool_definitions, parse_llm_response};
+use crate::llm::{ChatMessage, LlmProvider, LlmRequestState, POST_EXEC_PROMPT, build_system_prompt, parse_llm_response};
+use crate::tools::get_tool_definitions;
 use crate::llm::types::ToolCall;
 use anyhow::Result;
 
@@ -335,7 +336,7 @@ impl App {
 
             // Execute tool calls
             for tool_call in tool_calls {
-                let result = match crate::llm::tools::execute_tool_call(
+                let result = match crate::tools::execute_tool_call(
                     &tool_call,
                     &self.db,
                     self.active_target_id,

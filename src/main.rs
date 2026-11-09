@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod llm;
 mod pty;
+mod tools;
 mod ui;
 
 use anyhow::Result;
