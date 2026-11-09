@@ -428,6 +428,63 @@ impl LlmClient {
             usage: None,
         })
     }
+
+    /// Non-streaming completion used for internal tasks such as history compaction.
+    pub async fn complete_chat(&self, mut request: ChatCompletionRequest) -> Result<String> {
+        request.stream = false;
+
+        let mut req = self
+            .inner
+            .client
+            .post(self.inner.provider.chat_endpoint())
+            .header(CONTENT_TYPE, "application/json")
+            .timeout(Duration::from_secs(120));
+
+        if let Some(key) = self.inner.provider.api_key() {
+            if !key.trim().is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", key.trim()));
+            }
+        }
+
+        if self.inner.provider.kind() == ProviderKind::OpenRouter {
+            req = req
+                .header("HTTP-Referer", "https://github.com/NoxVoid/voidrecon")
+                .header("X-Title", "voidrecon");
+        }
+
+        let resp = req
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send completion request")?;
+
+        let status = resp.status();
+        let body = resp.text().await.context("Failed to read completion response")?;
+
+        if !status.is_success() {
+            let detail = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                json.get("detail")
+                    .or_else(|| json.get("message"))
+                    .or_else(|| json.get("error").and_then(|e| e.get("message")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&body)
+                    .to_string()
+            } else {
+                body
+            };
+            anyhow::bail!("HTTP {} from {}: {}", status, self.inner.provider.name(), detail);
+        }
+
+        let parsed: ChatCompletionResponse =
+            serde_json::from_str(&body).context("Failed to parse completion response")?;
+
+        Ok(parsed
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .unwrap_or_default())
+    }
 }
 
 #[cfg(test)]

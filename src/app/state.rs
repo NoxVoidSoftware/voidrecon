@@ -41,6 +41,7 @@ pub struct SidebarNode {
     pub ports: Vec<crate::db::models::PortInfo>,
     pub expanded: bool,
     pub findings_by_severity: Vec<(String, Vec<Finding>)>,
+    pub facts: Vec<crate::db::models::ImportantFact>,
 }
 
 #[derive(Debug, Clone)]

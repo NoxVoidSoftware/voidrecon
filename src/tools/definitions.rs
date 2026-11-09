@@ -108,6 +108,29 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new_function(
+            "save_important_fact",
+            "Record a concise, important fact about the target that must persist (e.g. credentials found, confirmed vulnerability, key service detail, discovered path). Use sparingly — only for facts worth remembering later. Facts are shown in the sidebar and included in the system context.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target_id": {"type": "integer", "description": "Target ID (defaults to active target if omitted)"},
+                    "fact": {"type": "string", "description": "Short, self-contained fact, e.g. 'SSH root login allowed with password hunter2'"}
+                },
+                "required": ["fact"]
+            }),
+        ),
+        ToolDefinition::new_function(
+            "delete_important_fact",
+            "Delete an important fact by its ID when it becomes obsolete or incorrect.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "fact_id": {"type": "integer", "description": "ID of the important fact to delete"}
+                },
+                "required": ["fact_id"]
+            }),
+        ),
+        ToolDefinition::new_function(
             "add_target",
             "Add a newly discovered host to the session targets in the database.",
             serde_json::json!({

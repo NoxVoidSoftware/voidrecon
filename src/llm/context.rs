@@ -1,38 +1,45 @@
 //! Context building for LLM requests
 
 use anyhow::Result;
-use crate::db::models::{Target, Finding, Command, PortInfo, TargetMetadata};
+use crate::db::models::{Target, Finding, Command, PortInfo, TargetMetadata, ImportantFact};
 
-/// Build the system prompt with context from database
+/// Build the system prompt with context from database.
+///
+/// `all_findings` and `all_facts` are keyed by target id and mirror the sidebar view.
 pub fn build_system_prompt(
     session_name: &str,
     session_created: &str,
     targets_count: i64,
     all_targets: &[Target],
     active_target: Option<&Target>,
-    findings: &[Finding],
+    all_findings: &[(i64, Vec<Finding>)],
+    all_facts: &[(i64, Vec<ImportantFact>)],
     _recent_commands: &[Command],
     command_count: i64,
     last_activity: Option<String>,
+    suggest_next_step: bool,
     workspace_path: Option<&std::path::Path>,
 ) -> String {
     let mut prompt = String::from(
         r#"You are an expert penetration tester working an active session in voidrecon.
 Be concise.
-- To execute or run any command or scan (nmap, gobuster, nikto, hydra, curl, whoami, etc.):
-  Call the `run_command` tool with the command and explanation.
-  The command will be presented to the user in the TUI Suggestion panel ([r]un / [e]dit / [s]kip) for interactive execution.
-  NEVER write commands to files to execute them.
-- When saving any files, artifacts, evidence, or exploits into the workspace:
-  Call `save_workspace_file` or `save_exploit_script`. NOTE: Saving requires interactive user Action Approval in the TUI before any file is written.
-- To read existing workspace files (command outputs, saved evidence, artifacts, or exploits):
-  Call `read_workspace_file`.
-- To delete evidence or clean up workspace files and their database entries:
-  Call `delete_evidence(filename="...")` or `delete_workspace_file(folder="...", filename="...")`. This deletes the file from disk and removes the corresponding finding from the database and targets list.
-- When answering informational questions (about targets, findings, open ports, status):
-  Use database read tools (`get_target_info`, `get_findings`, `list_targets`, `get_recent_commands`) and answer clearly.
+
+## Operating rules
+- Use the provided tools; their schemas are authoritative. Do not guess tool names or parameters.
+- Execute commands only via `run_command`; never write commands to files to execute them.
+- `nc`, `ncat` and `socat` listeners started via `run_command` are intercepted and open a dedicated listener tab after user approval.
+- The full sidebar (all targets with ports, OS, hostnames, findings, plus important facts) is already included below. Query the database only for details that are not shown here.
+- Use `update_target` for existing targets and `add_target` only for newly discovered hosts. Use `add_finding` only for genuine vulnerabilities.
+- Reference exploits by filename only, e.g. `python exploits/<name>.py`.
+- Act only on targets in scope. Do not scan or attack third-party hosts, and do not run destructive commands unless the user explicitly asks.
 - Voidrecon automatically archives all command outputs into `workspace/outputs/`.
-"#,
+
+## Memory & record-keeping
+- You see the full conversation history. When it grows too long, the oldest part is automatically replaced by a compacted summary; recent messages remain verbatim. Treat the summary as authoritative.
+- Findings, ports and target details are always reloaded from the database and are never lost to compaction. Use `save_important_fact` only for durable target knowledge that does not fit those tables: credentials, access state, key files/paths, and session constraints. Remove obsolete facts with `delete_important_fact`.
+- Keep facts short and self-contained, a few per target. Do not duplicate findings as facts, and do not record transient observations, raw output, or every command result.
+- Decide yourself what evidence is worth saving. Save only material that matters for the engagement: confirmed vulnerabilities, key scan results, credentials, exploit artifacts, and proof of access. Do not save intermediate or noisy output — it is already archived and can be read on demand.
+- Use `add_finding` for vulnerabilities that belong in the findings list; use `save_important_fact` only for durable facts not already covered by database records."#,
     );
     prompt.push_str("\n## Session progress\nSession: ");
     prompt.push_str(session_name);
@@ -41,12 +48,69 @@ Be concise.
     prompt.push_str("\nTargets in scope: ");
     prompt.push_str(&targets_count.to_string());
 
+    // Full sidebar view: every target with ports, findings and important facts.
     if !all_targets.is_empty() {
-        prompt.push_str("\nAll targets in scope:");
+        prompt.push_str("\n\n## Targets (full sidebar view)");
         for t in all_targets {
             let is_act = active_target.map(|a| a.id == t.id).unwrap_or(false);
             let marker = if is_act { " [ACTIVE]" } else { "" };
-            prompt.push_str(&format!("\n  - ID {}: {}{}", t.id, t.ip_host, marker));
+            prompt.push_str(&format!("\n### ID {}: {}{}", t.id, t.ip_host, marker));
+
+            let ports: Vec<PortInfo> = t
+                .ports_json
+                .as_ref()
+                .and_then(|p| serde_json::from_str(p).ok())
+                .unwrap_or_default();
+            if !ports.is_empty() {
+                prompt.push_str("\n  Ports:");
+                for p in &ports {
+                    prompt.push_str(&format!(
+                        "\n    {}/{}  {}  {}",
+                        p.port, p.proto, p.service, p.version
+                    ));
+                }
+            }
+
+            if let Some(md) = t
+                .metadata_json
+                .as_ref()
+                .and_then(|m| serde_json::from_str::<TargetMetadata>(m).ok())
+            {
+                if let Some(os) = md.os {
+                    prompt.push_str(&format!("\n  OS: {}", os));
+                }
+                if let Some(hostnames) = md.hostnames {
+                    if !hostnames.is_empty() {
+                        prompt.push_str(&format!("\n  Hostnames: {}", hostnames.join(", ")));
+                    }
+                }
+            }
+
+            if let Some((_, t_findings)) = all_findings.iter().find(|(id, _)| *id == t.id) {
+                if !t_findings.is_empty() {
+                    let mut by_sev: std::collections::BTreeMap<&str, Vec<&Finding>> =
+                        std::collections::BTreeMap::new();
+                    for f in t_findings {
+                        by_sev.entry(f.severity.as_str()).or_default().push(f);
+                    }
+                    prompt.push_str("\n  Findings:");
+                    for (sev, fs) in by_sev {
+                        prompt.push_str(&format!("\n    [{}] ({}):", sev.to_uppercase(), fs.len()));
+                        for f in fs {
+                            prompt.push_str(&format!("\n      - {} — {}", f.title, f.description));
+                        }
+                    }
+                }
+            }
+
+            if let Some((_, t_facts)) = all_facts.iter().find(|(id, _)| *id == t.id) {
+                if !t_facts.is_empty() {
+                    prompt.push_str("\n  Important facts:");
+                    for fact in t_facts {
+                        prompt.push_str(&format!("\n    - {}", fact.fact));
+                    }
+                }
+            }
         }
     }
 
@@ -117,57 +181,14 @@ Workspace structure:
             prompt.push_str("\n\n## Saved Artifacts in Workspace:\n");
             prompt.push_str(&artifacts_list.join("\n"));
         }
-
-        prompt.push_str(
-            r#"
-
-Tools & Workspace Workflow:
-1. `run_command`: Suggest or run a shell command/scan (nmap, gobuster, nikto, curl). The user is prompted in the TUI to approve and run it.
-2. `set_target`: Set or switch the active target in scope (e.g. `set_target(ip_host="192.168.1.1")`).
-3. `list_targets` / `get_target_info` / `get_findings`: Query targets, ports, and findings stored in the database.
-4. `update_target` / `add_finding`: Record discovered ports, OS details, and vulnerabilities into the database.
-5. `save_workspace_file`: Save evidence or artifacts into `workspace/evidence/` or `workspace/artifacts/` (requires user Action Approval).
-6. `read_workspace_file`: Read full raw command outputs (`workspace/outputs/<uuid>.txt`) or saved evidence/artifacts.
-7. `delete_evidence` / `delete_workspace_file`: Delete an evidence/workspace file and remove its finding from the database so it disappears from the targets list.
-8. `save_exploit_script` / `execute_exploit_script`: Save Python exploits into `workspace/exploits/` and execute with Action Approval."#,
-        );
     }
 
     if let Some(target) = active_target {
-        let ports_json: Vec<PortInfo> = target
-            .ports_json
-            .as_ref()
-            .and_then(|p| serde_json::from_str(p).ok())
-            .unwrap_or_default();
-
-        let metadata: TargetMetadata = target
-            .metadata_json
-            .as_ref()
-            .and_then(|m| serde_json::from_str(m).ok())
-            .unwrap_or_default();
-
-        prompt.push_str("\n\n## Active target: ");
-        prompt.push_str(&target.ip_host);
-
-        if let Some(os) = metadata.os {
-            prompt.push_str("\nOS: ");
-            prompt.push_str(&os);
-        }
-        if let Some(hostnames) = metadata.hostnames {
-            if !hostnames.is_empty() {
-                prompt.push_str("\nHostnames: ");
-                prompt.push_str(&hostnames.join(", "));
-            }
-        }
-        if !ports_json.is_empty() {
-            prompt.push_str("\nOpen ports:");
-            for port in ports_json {
-                prompt.push_str(&format!(
-                    "\n  {}/{}  {}  {}",
-                    port.port, port.proto, port.service, port.version
-                ));
-            }
-        }
+        // Ports, OS, hostnames and findings are already listed in the full sidebar view.
+        prompt.push_str(&format!(
+            "\n\n## Active target: {} (ID {})",
+            target.ip_host, target.id
+        ));
 
         prompt.push_str("\n\n## Activity on this target");
         prompt.push_str("\nCommands run: ");
@@ -177,24 +198,14 @@ Tools & Workspace Workflow:
             prompt.push_str(&activity);
         }
 
-        if !findings.is_empty() {
-            prompt.push_str("\n\nFindings so far (");
-            prompt.push_str(&findings.len().to_string());
-            prompt.push_str(" total):");
-            for finding in findings {
-                prompt.push_str(&format!(
-                    "\n  [{}] {} — {}",
-                    finding.severity, finding.title, finding.description
-                ));
-            }
-        }
-
-        prompt.push_str(
-            r#"
+        if suggest_next_step {
+            prompt.push_str(
+                r#"
 
 ## Next steps
 Suggest the next logical step based on findings and open ports. Do not repeat commands already run."#,
-        );
+            );
+        }
     } else {
         prompt.push_str("\n\nNote: No specific target is currently selected. Assist the user with discovery, tool guidance, or questions.");
     }
@@ -206,6 +217,8 @@ Suggest the next logical step based on findings and open ports. Do not repeat co
 pub const POST_EXEC_PROMPT: &str = r#"Analyze the command output in the context of our ongoing assessment.
 - If the output reveals new open ports, services, or OS details for the target, invoke `update_target`. Do NOT re-add existing targets with `add_target`.
 - If new vulnerabilities are found, invoke `add_finding`. Do NOT re-add findings already listed above.
+- If the output confirms durable knowledge worth remembering (credentials, confirmed access, a key service detail or path), invoke `save_important_fact`. Be selective and skip transient or noisy output.
+- Save evidence/artifacts only when the result is significant (confirmed vulnerability, key scan result, exploit artifact). Intermediate output is already archived and can be read on demand.
 - STRICTLY RESPECT USER INSTRUCTIONS: Review previous conversation messages. If the user asked not to use certain tools, flags, or techniques, do NOT suggest or invoke them.
 - Provide a concise 1-2 sentence summary, and if appropriate, suggest the next logical pentest step via `run_command`."#;
 

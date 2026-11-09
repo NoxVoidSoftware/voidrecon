@@ -192,6 +192,20 @@ pub async fn execute_tool_call(
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
             Ok(serde_json::json!({"success": true, "finding_id": id, "target_id": target_id}))
         }
+        "save_important_fact" => {
+            let target_id = args.get("target_id").and_then(|v| v.as_i64()).or(active_target_id)
+                .context("Missing target_id and no active target selected")?;
+            let fact = args.get("fact").and_then(|v| v.as_str()).context("Missing fact")?;
+            let id = DatabaseQueries::add_important_fact(&conn, target_id, fact)?;
+            let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
+            Ok(serde_json::json!({"success": true, "fact_id": id, "target_id": target_id, "fact": fact}))
+        }
+        "delete_important_fact" => {
+            let fact_id = args.get("fact_id").and_then(|v| v.as_i64()).context("Missing fact_id")?;
+            DatabaseQueries::delete_important_fact(&conn, fact_id)?;
+            let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
+            Ok(serde_json::json!({"success": true, "deleted_fact_id": fact_id}))
+        }
         "add_target" => {
             let ip_host = args.get("ip_host").and_then(|v| v.as_str()).context("Missing ip_host")?;
             let ports_json = args.get("ports_json").and_then(|v| v.as_str());

@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::db::models::{Command, Finding, Target};
+use crate::db::models::{Command, Finding, ImportantFact, Target};
 
 /// Parse datetime from SQLite TEXT
 fn parse_datetime(s: &str) -> DateTime<Utc> {
@@ -216,6 +216,63 @@ impl DatabaseQueries {
 
     pub fn add_note(conn: &Connection, target_id: i64, text: &str) -> Result<i64> {
         Self::add_finding(conn, target_id, "note", text, "info", None, Some(100), None)
+    }
+
+    // Important facts operations
+    pub fn add_important_fact(conn: &Connection, target_id: i64, fact: &str) -> Result<i64> {
+        let fact_clean = fact.trim();
+        if fact_clean.is_empty() {
+            anyhow::bail!("Fact cannot be empty");
+        }
+
+        // Deduplication: skip identical fact for the same target
+        let existing_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM important_facts WHERE target_id = ?1 AND LOWER(fact) = ?2 LIMIT 1",
+                params![target_id, fact_clean.to_lowercase()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        if let Some(id) = existing_id {
+            return Ok(id);
+        }
+
+        conn.execute(
+            "INSERT INTO important_facts (target_id, fact) VALUES (?1, ?2)",
+            params![target_id, fact_clean],
+        )
+        .context("Failed to insert important fact")?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn get_important_facts(conn: &Connection, target_id: i64) -> Result<Vec<ImportantFact>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, target_id, fact, created_at FROM important_facts WHERE target_id = ?1 ORDER BY created_at ASC",
+            )
+            .context("Failed to prepare query")?;
+        let facts = stmt
+            .query_map(params![target_id], |row| {
+                let created_at_str: String = row.get(3)?;
+                Ok(ImportantFact {
+                    id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    fact: row.get(2)?,
+                    created_at: parse_datetime(&created_at_str),
+                })
+            })
+            .context("Failed to query important facts")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to collect important facts")?;
+        Ok(facts)
+    }
+
+    pub fn delete_important_fact(conn: &Connection, fact_id: i64) -> Result<()> {
+        conn.execute("DELETE FROM important_facts WHERE id = ?1", params![fact_id])
+            .context("Failed to delete important fact")?;
+        Ok(())
     }
 
     pub fn delete_finding(conn: &Connection, finding_id: i64) -> Result<()> {

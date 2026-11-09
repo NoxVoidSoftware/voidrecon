@@ -174,6 +174,15 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
                     ])));
                 }
             }
+
+            // Important facts
+            for fact in &node.facts {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("FACT ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::styled(&fact.fact, Style::default().fg(Color::White)),
+                ])));
+            }
         }
     }
     

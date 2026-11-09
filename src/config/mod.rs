@@ -205,6 +205,14 @@ impl Config {
         }
     }
 
+    /// Context length (tokens) of the active model, if known.
+    pub fn active_model_context_length(&self) -> Option<u32> {
+        self.get_models_for_provider(self.provider)
+            .iter()
+            .find(|m| m.id == self.active_model)
+            .and_then(|m| m.context_length)
+    }
+
     pub fn get_free_models_for_provider(&self, provider: ProviderKind) -> Vec<&ModelInfo> {
         self.get_models_for_provider(provider)
             .iter()

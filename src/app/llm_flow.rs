@@ -7,11 +7,10 @@ use crate::llm::types::ToolCall;
 use anyhow::Result;
 
 impl App {
-    pub fn build_recent_chat_messages(&self, max_turns: usize) -> Vec<ChatMessage> {
+    pub fn build_chat_messages(&self) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
-        let history_start = self.llm.chat_log.len().saturating_sub(max_turns);
 
-        for msg in &self.llm.chat_log[history_start..] {
+        for msg in &self.llm.chat_log {
             match msg.role.as_str() {
                 "user" => {
                     let content = if msg.content.starts_with("? ") {
@@ -85,6 +84,121 @@ impl App {
         messages
     }
 
+    /// Build per-target findings and important facts mirroring the sidebar.
+    fn build_sidebar_context(
+        &self,
+        all_targets: &[crate::db::models::Target],
+    ) -> (
+        Vec<(i64, Vec<crate::db::models::Finding>)>,
+        Vec<(i64, Vec<crate::db::models::ImportantFact>)>,
+    ) {
+        let conn = self.db.conn();
+        let mut findings = Vec::with_capacity(all_targets.len());
+        let mut facts = Vec::with_capacity(all_targets.len());
+        for t in all_targets {
+            let f = DatabaseQueries::get_findings_for_target(&conn, t.id).unwrap_or_default();
+            let fa = DatabaseQueries::get_important_facts(&conn, t.id).unwrap_or_default();
+            findings.push((t.id, f));
+            facts.push((t.id, fa));
+        }
+        (findings, facts)
+    }
+
+    /// Token budget above which the conversation history is compacted.
+    /// 1/3 of the model context when known, otherwise 200k.
+    fn compaction_limit(&self) -> usize {
+        self.config
+            .active_model_context_length()
+            .map(|c| (c as usize) / 3)
+            .unwrap_or(200_000)
+    }
+
+    fn estimate_chat_tokens(chat_log: &[ChatMessage]) -> usize {
+        chat_log
+            .iter()
+            .map(|m| m.content.chars().count() / 4 + 8)
+            .sum()
+    }
+
+    /// When the history grows past the token budget, summarize the oldest part
+    /// with the LLM and replace it with a single summary message.
+    async fn maybe_compact_history(&mut self) -> Result<()> {
+        let limit = self.compaction_limit();
+        if Self::estimate_chat_tokens(&self.llm.chat_log) <= limit {
+            return Ok(());
+        }
+
+        // Keep the most recent messages verbatim; summarize everything older.
+        const KEEP_RECENT: usize = 10;
+        if self.llm.chat_log.len() <= KEEP_RECENT + 2 {
+            return Ok(());
+        }
+        let split = self.llm.chat_log.len() - KEEP_RECENT;
+
+        let transcript = {
+            let mut t = String::new();
+            for m in &self.llm.chat_log[..split] {
+                t.push_str(&format!("[{}]: {}\n", m.role, m.content));
+            }
+            t
+        };
+
+        let request = crate::llm::types::ChatCompletionRequest {
+            model: self.config.active_model.clone(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "You compact penetration-testing session conversations. Produce a dense factual summary preserving: targets and open ports, vulnerabilities/findings, saved evidence/artifacts/exploits, credentials, important facts, commands run and their key results, user instructions/preferences, and the current objective. Output only the summary.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: format!("Summarize this conversation:\n\n{}", transcript),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: 0.2,
+            max_tokens: 1500,
+        };
+
+        let client = self.llm_client.clone();
+        match client.complete_chat(request).await {
+            Ok(summary) if !summary.trim().is_empty() => {
+                let summary_msg = ChatMessage {
+                    role: "system".to_string(),
+                    content: format!(
+                        "[Compacted earlier conversation summary]\n{}",
+                        summary.trim()
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                let mut new_log = Vec::with_capacity(1 + self.llm.chat_log.len() - split);
+                new_log.push(summary_msg);
+                new_log.extend_from_slice(&self.llm.chat_log[split..]);
+                self.llm.chat_log = new_log;
+                self.save_chat_history();
+                self.add_notification(
+                    "Conversation history compacted".to_string(),
+                    NotifLevel::Info,
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.add_notification(
+                    format!("History compaction failed: {}", e),
+                    NotifLevel::Warning,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub async fn send_llm_query(&mut self, query: &str) -> Result<()> {
         if self.llm_client.provider().requires_api_key() && self.config.api_key.trim().is_empty() {
             self.add_notification(
@@ -93,6 +207,8 @@ impl App {
             );
             return Ok(());
         }
+
+        self.maybe_compact_history().await?;
 
         // Add user question to visible chat log
         self.append_chat_message(ChatMessage {
@@ -110,27 +226,29 @@ impl App {
             None
         };
         
-        let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
-            let f = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id)?;
+        let (recent_commands, command_count) = if let Some(target) = &active_target {
             let r = DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3)?;
             let c = DatabaseQueries::get_command_count(&self.db.conn(), target.id)?;
-            (f, r, c)
+            (r, c)
         } else {
-            (Vec::new(), Vec::new(), 0)
+            (Vec::new(), 0)
         };
         let targets_count = DatabaseQueries::get_targets_count(&self.db.conn())?;
         let all_targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
-        
+        let (all_findings, all_facts) = self.build_sidebar_context(&all_targets);
+
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),
             targets_count,
             &all_targets,
             active_target.as_ref(),
-            &findings,
+            &all_findings,
+            &all_facts,
             &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+            false,
             Some(&self.session_meta.workspace_path()),
         );
         
@@ -143,16 +261,9 @@ impl App {
             },
         ];
 
-        // Include recent conversational turns and command history for multi-turn coherence
-        let mut history = self.build_recent_chat_messages(16);
+        // Include the full conversation history (compacted periodically to stay within limits)
+        let mut history = self.build_chat_messages();
         messages.append(&mut history);
-
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: query.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-        });
         
         let request_id = self.next_request_id();
         let request = crate::llm::types::ChatCompletionRequest {
@@ -185,21 +296,23 @@ impl App {
             return Ok(());
         }
 
+        self.maybe_compact_history().await?;
+
         let active_target = if let Some(id) = self.active_target_id {
             DatabaseQueries::get_target(&self.db.conn(), id).unwrap_or(None)
         } else {
             None
         };
-        let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
-            let f = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id).unwrap_or_default();
+        let (recent_commands, command_count) = if let Some(target) = &active_target {
             let r = DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3).unwrap_or_default();
             let c = DatabaseQueries::get_command_count(&self.db.conn(), target.id).unwrap_or(0);
-            (f, r, c)
+            (r, c)
         } else {
-            (Vec::new(), Vec::new(), 0)
+            (Vec::new(), 0)
         };
         let targets_count = DatabaseQueries::get_targets_count(&self.db.conn()).unwrap_or(0);
         let all_targets = DatabaseQueries::get_all_targets(&self.db.conn()).unwrap_or_default();
+        let (all_findings, all_facts) = self.build_sidebar_context(&all_targets);
 
         let base_prompt = build_system_prompt(
             &self.session_meta.name,
@@ -207,15 +320,17 @@ impl App {
             targets_count,
             &all_targets,
             active_target.as_ref(),
-            &findings,
+            &all_findings,
+            &all_facts,
             &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+            true,
             Some(&self.session_meta.workspace_path()),
         );
 
         let system_prompt = format!(
-            "{}\n\n## Post-Execution Recon & Analysis Mode\nYou are analyzing the output of a command that just completed.\nCRITICAL RULES:\n1. STRICTLY RESPECT USER INSTRUCTIONS: Review previous messages. If the user previously instructed NOT to do something or to avoid certain tools, techniques, flags, or endpoints, DO NOT attempt or suggest them.\n2. DO NOT DUPLICATE TARGETS OR FINDINGS: Use `update_target` on the active target rather than `add_target`. Only invoke `add_finding` if the vulnerability is genuine, novel, and not already listed above.\n3. Suggest the next logical pentest step that strictly complies with the user's directions.",
+            "{}\n\n## Post-Execution Recon & Analysis Mode\nYou are analyzing the output of a command that just completed.\nCRITICAL RULES:\n1. STRICTLY RESPECT USER INSTRUCTIONS: Review previous messages. If the user previously instructed NOT to do something or to avoid certain tools, techniques, flags, or endpoints, DO NOT attempt or suggest them.\n2. DO NOT DUPLICATE TARGETS OR FINDINGS: Use `update_target` on the active target rather than `add_target`. Only invoke `add_finding` if the vulnerability is genuine, novel, and not already listed above.\n3. RECORD DURABLE KNOWLEDGE: If the output confirms something worth remembering later (credentials, confirmed access, a key service detail or path), invoke `save_important_fact`. Be selective and skip transient/noisy output.\n4. SAVE EVIDENCE SELECTIVELY: Only save evidence/artifacts when the result is significant (confirmed vulnerability, key scan result, exploit artifact). Intermediate output is already archived and can be read on demand.\n5. Suggest the next logical pentest step that strictly complies with the user's directions.",
             base_prompt
         );
 
@@ -228,7 +343,7 @@ impl App {
             },
         ];
 
-        let mut history = self.build_recent_chat_messages(10);
+        let mut history = self.build_chat_messages();
         messages.append(&mut history);
 
         let truncated_output = if output.len() > 16_000 {
@@ -563,6 +678,7 @@ impl App {
     }
     
     pub async fn continue_llm_conversation(&mut self) -> Result<()> {
+        self.maybe_compact_history().await?;
         let mut messages = Vec::new();
 
         // System prompt with full context
@@ -571,26 +687,28 @@ impl App {
         } else {
             None
         };
-        let (findings, recent_commands, command_count) = if let Some(target) = &active_target {
-            let f = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id).unwrap_or_default();
+        let (recent_commands, command_count) = if let Some(target) = &active_target {
             let r = DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3).unwrap_or_default();
             let c = DatabaseQueries::get_command_count(&self.db.conn(), target.id).unwrap_or(0);
-            (f, r, c)
+            (r, c)
         } else {
-            (Vec::new(), Vec::new(), 0)
+            (Vec::new(), 0)
         };
         let targets_count = DatabaseQueries::get_targets_count(&self.db.conn()).unwrap_or(0);
         let all_targets = DatabaseQueries::get_all_targets(&self.db.conn()).unwrap_or_default();
+        let (all_findings, all_facts) = self.build_sidebar_context(&all_targets);
         let system_prompt = build_system_prompt(
             &self.session_meta.name,
             &self.session_meta.created_at.to_rfc3339(),
             targets_count,
             &all_targets,
             active_target.as_ref(),
-            &findings,
+            &all_findings,
+            &all_facts,
             &recent_commands,
             command_count,
             recent_commands.first().map(|c| c.executed_at.to_rfc3339()),
+            true,
             Some(&self.session_meta.workspace_path()),
         );
         messages.push(ChatMessage {
@@ -600,55 +718,9 @@ impl App {
             tool_call_id: None,
         });
 
-        // Filter valid OpenAI messages within a bounded window (last 12 messages) to protect LLM context limits
-        let window_start = self.llm.chat_log.len().saturating_sub(12);
-        let mut slice = &self.llm.chat_log[window_start..];
-        
-        // Ensure we don't start slice with an orphaned 'tool' message without its preceding 'assistant' message
-        if let Some(first_tool_pos) = slice.iter().position(|m| m.role == "tool") {
-            if first_tool_pos == 0 && window_start > 0 {
-                slice = &self.llm.chat_log[window_start - 1..];
-            }
-        }
-
-        for msg in slice {
-            match msg.role.as_str() {
-                "user" | "assistant" | "system" | "tool" => {
-                    let max_bytes = 24_000;
-                    if msg.content.len() > max_bytes {
-                        let mut end = max_bytes;
-                        while !msg.content.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        let mut msg_copy = msg.clone();
-                        msg_copy.content = format!(
-                            "{}\n... [content truncated to protect context limits, total {} bytes] ...",
-                            &msg.content[..end],
-                            msg.content.len()
-                        );
-                        messages.push(msg_copy);
-                    } else {
-                        messages.push(msg.clone());
-                    }
-                }
-                "output" => {
-                    let lines: Vec<&str> = msg.content.lines().collect();
-                    let truncated_content = if lines.len() > 25 {
-                        let top = lines[..20].join("\n");
-                        format!("{}\n... [truncated {} lines; full output stored in workspace/outputs/] ...", top, lines.len() - 20)
-                    } else {
-                        msg.content.clone()
-                    };
-                    messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: format!("[Command Output]:\n{}", truncated_content),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-                _ => {}
-            }
-        }
+        // Full conversation history (already compacted to fit the token budget).
+        let mut history = self.build_chat_messages();
+        messages.append(&mut history);
         
         let request_id = self.next_request_id();
         let request = crate::llm::types::ChatCompletionRequest {

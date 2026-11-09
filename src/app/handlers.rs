@@ -680,11 +680,13 @@ impl App {
                 Vec::new()
             };
             
+            let facts = DatabaseQueries::get_important_facts(&self.db.conn(), target.id)?;
             self.sidebar_nodes.push(SidebarNode {
                 target,
                 ports,
                 expanded: true,
                 findings_by_severity,
+                facts,
             });
         }
         
