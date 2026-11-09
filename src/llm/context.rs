@@ -70,7 +70,7 @@ Workspace structure:
                     if meta.is_file() {
                         let fname = entry.file_name().to_string_lossy().to_string();
                         if fname.ends_with(".py") {
-                            exploits_list.push(format!("  - {} ({} bytes) -> `python workspace/exploits/{}`", fname, meta.len(), fname));
+                            exploits_list.push(format!("  - {} ({} bytes)", fname, meta.len()));
                         }
                     }
                 }

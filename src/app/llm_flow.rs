@@ -370,11 +370,51 @@ impl App {
                         let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         let explanation = args.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
                         if !cmd.is_empty() {
-                            self.llm.suggestion = Some(crate::llm::types::LlmSuggestion {
-                                command: Some(cmd.to_string()),
-                                explanation: explanation.to_string(),
-                            });
-                            self.llm.suggestion_visible = true;
+                            // Intercept reverse-shell listener commands (nc/ncat/socat) that would
+                            // block the terminal, and spawn a dedicated listener tab instead.
+                            let lower = cmd.to_lowercase();
+                            let is_listener = lower.contains("nc -lv") || lower.contains("nc -l ")
+                                || lower.contains("ncat -l") || lower.contains("socat tcp-listen")
+                                || lower.contains("nc -lvp") || lower.contains("nc -lvnp");
+                            if is_listener {
+                                // extract port
+                                let mut port: u16 = 4444;
+                                for tok in cmd.split_whitespace() {
+                                    if let Ok(p) = tok.parse::<u16>() {
+                                        if p > 1024 { port = p; break; }
+                                    }
+                                }
+                                let target_id = self.active_target_id.unwrap_or(0);
+                                let target_ip = if target_id > 0 {
+                                    DatabaseQueries::get_target(&self.db.conn(), target_id)
+                                        .ok()
+                                        .flatten()
+                                        .map(|t| t.ip_host)
+                                        .unwrap_or_else(|| "target".to_string())
+                                } else {
+                                    "active_target".to_string()
+                                };
+                                self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
+                                    target_id,
+                                    target_ip,
+                                    kind: crate::app::state::ApprovalKind::ReverseShellListener {
+                                        lhost: "0.0.0.0".to_string(),
+                                        lport: port,
+                                        shell_type: "bash".to_string(),
+                                    },
+                                    tool_call: tool_call.clone(),
+                                });
+                                self.add_notification(
+                                    format!("Approval required for reverse shell on port {}", port),
+                                    crate::app::state::NotifLevel::Warning,
+                                );
+                            } else {
+                                self.llm.suggestion = Some(crate::llm::types::LlmSuggestion {
+                                    command: Some(cmd.to_string()),
+                                    explanation: explanation.to_string(),
+                                });
+                                self.llm.suggestion_visible = true;
+                            }
                         }
                     }
                 }
@@ -457,41 +497,6 @@ impl App {
                     }
                 }
 
-                if tool_call.function.name == "open_reverse_shell_tab" {
-                    let target_id = result.get("target_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let target = DatabaseQueries::get_target(&self.db.conn(), target_id)?;
-                    if let Some(target) = target {
-                        let lhost = result.get("lhost").and_then(|v| v.as_str()).unwrap_or("0.0.0.0").to_string();
-                        let lport = result.get("lport").and_then(|v| v.as_u64()).unwrap_or(4444) as u16;
-                        let shell_type = result.get("shell_type").and_then(|v| v.as_str()).unwrap_or("bash").to_string();
-
-                        self.pending_exploit_approval = Some(crate::app::state::ExploitApproval {
-                            target_id,
-                            target_ip: target.ip_host,
-                            kind: crate::app::state::ApprovalKind::ReverseShellListener {
-                                lhost,
-                                lport,
-                                shell_type,
-                            },
-                            tool_call: tool_call.clone(),
-                        });
-                        self.add_notification(
-                            format!("Approval required for reverse shell on port {}", lport),
-                            NotifLevel::Warning,
-                        );
-                        return Ok(());
-                    } else {
-                        self.append_chat_message(ChatMessage {
-                            role: "tool".to_string(),
-                            content: serde_json::json!({
-                                "error": format!("Target ID {} is not within current assessment scope", target_id)
-                            }).to_string(),
-                            tool_calls: None,
-                            tool_call_id: Some(tool_call.id),
-                        });
-                        continue;
-                    }
-                }
                 
                 // Add tool result to conversation for next LLM call
                 self.append_chat_message(ChatMessage {

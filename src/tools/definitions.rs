@@ -184,20 +184,6 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::new_function(
-            "open_reverse_shell_tab",
-            "Set up a reverse shell listener tab. Call this ONLY when the user explicitly asks to exploit, gain shell access, or start a reverse shell listener.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "target_id": {"type": "integer"},
-                    "lhost": {"type": "string", "description": "Our listening IP (auto-detected from active interface if omitted)"},
-                    "lport": {"type": "integer", "default": 4444},
-                    "shell_type": {"type": "string", "enum": ["bash", "sh", "python", "powershell"], "default": "bash"}
-                },
-                "required": ["target_id"]
-            }),
-        ),
-        ToolDefinition::new_function(
             "get_shell_context",
             "Get current shell session state: target info, what has been run in this shell so far, current working directory if known.",
             serde_json::json!({

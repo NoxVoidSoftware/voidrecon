@@ -177,6 +177,34 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     
+    // Available exploits
+    let exploits_dir = app.session_meta.workspace_path().join("exploits");
+    let mut exploit_files: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&exploits_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".py") {
+                        exploit_files.push(name);
+                    }
+                }
+            }
+        }
+    }
+    exploit_files.sort();
+    if !exploit_files.is_empty() {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("── Exploits ──", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        ])));
+        for name in exploit_files {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(name, Style::default().fg(Color::Green)),
+            ])));
+        }
+    }
+    
     let items_len = items.len();
     let border_color = if app.ui_state.focus == crate::app::state::WindowFocus::Sidebar {
         Color::Cyan

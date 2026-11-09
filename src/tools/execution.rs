@@ -200,22 +200,6 @@ pub async fn execute_tool_call(
             let _ = app_tx.send(crate::app::AppEvent::SetActiveTarget(id));
             Ok(serde_json::json!({"id": id, "target_id": id, "ip_host": ip_host, "success": true}))
         }
-        "open_reverse_shell_tab" => {
-            let target_id = args.get("target_id").and_then(|v| v.as_i64())
-                .context("Missing target_id")?;
-            let lhost = args.get("lhost").and_then(|v| v.as_str());
-            let lport = args.get("lport").and_then(|v| v.as_u64()).unwrap_or(4444) as u16;
-            let shell_type = args.get("shell_type").and_then(|v| v.as_str()).unwrap_or("bash");
-            
-            // The actual PTY spawn is handled by the app, we just return the info
-            Ok(serde_json::json!({
-                "target_id": target_id,
-                "lhost": lhost,
-                "lport": lport,
-                "shell_type": shell_type,
-                "action": "spawn_listener_tab"
-            }))
-        }
         "get_shell_context" => {
             let target_id = args.get("target_id").and_then(|v| v.as_i64())
                 .context("Missing target_id")?;
@@ -276,7 +260,7 @@ pub async fn execute_tool_call(
             if let Some(tid) = target_id {
                 let finding_title = format!("Exploit Script: {}", clean_name);
                 let finding_desc = format!("{} (saved to workspace/exploits/{})", description, clean_name);
-                let source_cmd = format!("python workspace/exploits/{}", clean_name);
+                let source_cmd = format!("python exploits/{}", clean_name);
                 let rel_path = format!("workspace/exploits/{}", clean_name);
                 let _ = DatabaseQueries::add_finding(
                     &conn,
@@ -306,7 +290,7 @@ pub async fn execute_tool_call(
                     "file": clean_name,
                     "path": format!("workspace/exploits/{}", clean_name),
                     "bytes": bytes_written,
-                    "run_command": format!("python workspace/exploits/{}", clean_name),
+                    "run_command": format!("python exploits/{}", clean_name),
                     "message": format!("Exploit saved to workspace/exploits/{} with valid Python syntax. Call execute_exploit_script to execute it against the target.", clean_name)
                 }))
             }
@@ -372,7 +356,7 @@ pub async fn execute_tool_call(
                 "total_lines": total_lines,
                 "truncated": truncated || byte_truncated,
                 "code": code,
-                "run_command": format!("python workspace/exploits/{}", clean_name)
+                "run_command": format!("python exploits/{}", clean_name)
             }))
         }
         "list_workspace_exploits" => {
@@ -401,7 +385,7 @@ pub async fn execute_tool_call(
                                     "file": fname,
                                     "size_bytes": meta.len(),
                                     "summary": if summary.is_empty() { "Python exploit".to_string() } else { summary },
-                                    "run_command": format!("python workspace/exploits/{}", fname)
+                                    "run_command": format!("python exploits/{}", fname)
                                 }));
                             }
                         }
@@ -447,9 +431,9 @@ pub async fn execute_tool_call(
             }
 
             let command_line = if script_args.is_empty() {
-                format!("python workspace/exploits/{}", clean_name)
+                format!("python exploits/{}", clean_name)
             } else {
-                format!("python workspace/exploits/{} {}", clean_name, script_args)
+                format!("python exploits/{} {}", clean_name, script_args)
             };
 
             Ok(serde_json::json!({
