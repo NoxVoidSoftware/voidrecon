@@ -169,6 +169,8 @@ pub struct LlmState {
     pub response_buffer: String,
     pub pending_request: Option<String>,
     pub pending_tool_calls: Vec<crate::llm::types::ToolCall>,
+    pub pending_context_tokens: Option<usize>,
+    pub pending_context_limit_key: Option<String>,
     pub post_exec_mode: bool,
     pub abort_handle: Option<tokio::task::AbortHandle>,
     pub suggestion: Option<LlmSuggestion>,

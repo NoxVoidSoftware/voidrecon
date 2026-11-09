@@ -156,10 +156,7 @@ impl App {
 
     fn model_context_length(&self) -> usize {
         self.config
-            .active_model_context_length()
-            .filter(|length| *length > 0)
-            .map(|length| length as usize)
-            .unwrap_or(8_192)
+            .context_limit_for(self.config.provider, &self.config.active_model) as usize
     }
 
     fn output_token_budget(&self, preferred: u32) -> u32 {
@@ -349,7 +346,30 @@ impl App {
         output_tokens: u32,
     ) -> Option<Vec<ChatMessage>> {
         match self.fit_request_messages(system_prompt, history, trailing_messages, output_tokens) {
-            Ok(messages) => Some(messages),
+            Ok(messages) => {
+                let tool_tokens = match Self::tool_definitions_tokens() {
+                    Ok(tokens) => tokens,
+                    Err(error) => {
+                        self.llm.request_state = LlmRequestState::Failed;
+                        self.add_notification(
+                            format!("Failed to estimate LLM tool schema size: {}", error),
+                            NotifLevel::Error,
+                        );
+                        return None;
+                    }
+                };
+                self.llm.pending_context_tokens = Some(
+                    Self::estimate_chat_tokens(&messages)
+                        .saturating_add(tool_tokens)
+                        .saturating_add(output_tokens as usize),
+                );
+                self.llm.pending_context_limit_key =
+                    Some(crate::config::Config::context_limit_key(
+                        self.config.provider,
+                        &self.config.active_model,
+                    ));
+                Some(messages)
+            }
             Err(error) => {
                 self.llm.request_state = LlmRequestState::Failed;
                 self.add_notification(
@@ -433,20 +453,31 @@ impl App {
     /// with the LLM and replace it with a single summary message.
     /// `overhead_tokens` accounts for the system prompt and tool schemas.
     async fn maybe_compact_history(&mut self, overhead_tokens: usize) -> Result<()> {
-        let limit = self.input_token_budget(self.output_token_budget(2048));
-        if Self::estimate_chat_tokens(&self.llm.chat_log) + overhead_tokens <= limit {
+        let context_threshold = self
+            .config
+            .compaction_threshold_for(self.config.provider, &self.config.active_model)
+            as usize;
+        let input_limit = self.input_token_budget(self.output_token_budget(2048));
+        let limit = context_threshold.min(input_limit);
+        if Self::estimate_chat_tokens(&self.llm.chat_log) + overhead_tokens < limit {
             return Ok(());
         }
 
         // Keep the most recent messages verbatim; summarize everything older.
         const KEEP_RECENT: usize = 6;
-        if self.llm.chat_log.len() <= KEEP_RECENT {
+        if self.llm.chat_log.len() <= 1 {
             return Ok(());
         }
-        let mut split = self.llm.chat_log.len() - KEEP_RECENT;
+        let mut split = self.llm.chat_log.len().saturating_sub(KEEP_RECENT);
+        if split == 0 {
+            split = self.llm.chat_log.len() - 1;
+        }
         // Never start the kept slice on a "tool" message whose assistant call was compacted away.
         while split > 0 && self.llm.chat_log[split].role == "tool" {
             split -= 1;
+        }
+        if split == 0 {
+            return Ok(());
         }
 
         let transcript_budget = (self.model_context_length() / 4).max(64);
@@ -713,6 +744,33 @@ impl App {
         if request_id == self.llm.request_id {
             self.llm.abort_handle = None;
             self.llm.request_state = LlmRequestState::Failed;
+            if Self::is_context_length_error(&error) {
+                let key = self.llm.pending_context_limit_key.take();
+                let tokens = self.llm.pending_context_tokens.take();
+                if let (Some(key), Some(tokens)) = (key, tokens) {
+                    let observed_limit = Self::context_limit_from_error(&error)
+                        .unwrap_or(tokens)
+                        .min(u32::MAX as usize) as u32;
+                    if self.config.record_context_limit(key, observed_limit) {
+                        match self.config.save() {
+                            Ok(()) => self.add_notification(
+                                format!(
+                                    "Context limit learned as approximately {} tokens; conversation will compact at 80% of this limit",
+                                    observed_limit
+                                ),
+                                NotifLevel::Warning,
+                            ),
+                            Err(save_error) => self.add_notification(
+                                format!("Failed to save learned LLM context limit: {}", save_error),
+                                NotifLevel::Error,
+                            ),
+                        }
+                    }
+                }
+            } else {
+                self.llm.pending_context_limit_key = None;
+                self.llm.pending_context_tokens = None;
+            }
             self.add_notification(format!("LLM request failed: {}", error), NotifLevel::Error);
             self.append_chat_message(ChatMessage {
                 role: "system".to_string(),
@@ -724,6 +782,46 @@ impl App {
         }
     }
 
+    fn is_context_length_error(error: &str) -> bool {
+        let error = error.to_ascii_lowercase();
+        [
+            "maximum context length",
+            "max context length",
+            "context length",
+            "context_length_exceeded",
+            "context window",
+            "too many tokens",
+            "prompt is too long",
+            "input is too long",
+        ]
+        .iter()
+        .any(|phrase| error.contains(phrase))
+    }
+
+    fn context_limit_from_error(error: &str) -> Option<usize> {
+        let lower = error.to_ascii_lowercase();
+        for marker in [
+            "maximum context length is",
+            "max context length is",
+            "maximum context window of",
+            "context window of",
+        ] {
+            let Some(index) = lower.find(marker) else {
+                continue;
+            };
+            let number = error[index + marker.len()..]
+                .trim_start()
+                .chars()
+                .take_while(|character| character.is_ascii_digit() || *character == ',')
+                .filter(|character| *character != ',')
+                .collect::<String>();
+            if let Ok(limit) = number.parse() {
+                return Some(limit);
+            }
+        }
+        None
+    }
+
     pub async fn handle_llm_done(&mut self, request_id: u64) -> Result<()> {
         // Ignore stale requests
         if request_id != self.llm.request_id {
@@ -732,6 +830,8 @@ impl App {
 
         self.llm.abort_handle = None;
         self.llm.request_state = LlmRequestState::Completed;
+        self.llm.pending_context_limit_key = None;
+        self.llm.pending_context_tokens = None;
 
         if !self.llm.pending_tool_calls.is_empty() {
             // Push assistant message with tool calls into chat log first (required by LLM APIs)

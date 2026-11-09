@@ -1,5 +1,6 @@
 use chrono::Utc;
 use voidrecon::app::App;
+use voidrecon::config::{Config, ProviderKind};
 use voidrecon::db::models::{Command, Target};
 use voidrecon::llm::{
     build_system_prompt, parse_llm_response, ChatMessage, ToolCall, ToolFunction,
@@ -14,6 +15,39 @@ fn target(ports_json: Option<String>, notes: Option<String>) -> Target {
         notes,
         created_at: Utc::now(),
     }
+}
+
+#[test]
+fn context_limit_defaults_to_200k_and_compacts_at_80_percent_after_learning() {
+    let mut config = Config::default();
+    assert_eq!(
+        config.context_limit_for(ProviderKind::OpenAi, "model-a"),
+        200_000
+    );
+    assert_eq!(
+        config.compaction_threshold_for(ProviderKind::OpenAi, "model-a"),
+        200_000
+    );
+
+    let key = Config::context_limit_key(ProviderKind::OpenAi, "model-a");
+    assert!(config.record_context_limit(key.clone(), 100_000));
+    assert_eq!(
+        config.context_limit_for(ProviderKind::OpenAi, "model-a"),
+        100_000
+    );
+    assert_eq!(
+        config.compaction_threshold_for(ProviderKind::OpenAi, "model-a"),
+        80_000
+    );
+    assert!(!config.record_context_limit(key, 120_000));
+    assert_eq!(
+        config.context_limit_for(ProviderKind::OpenAi, "model-a"),
+        100_000
+    );
+    assert_eq!(
+        config.context_limit_for(ProviderKind::OpenAi, "model-b"),
+        200_000
+    );
 }
 
 #[test]
