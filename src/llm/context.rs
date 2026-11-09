@@ -41,16 +41,16 @@ Be concise.
 - Decide yourself what evidence is worth saving. Save only material that matters for the engagement: confirmed vulnerabilities, key scan results, credentials, exploit artifacts, and proof of access. Do not save intermediate or noisy output — it is already archived and can be read on demand.
 - Use `add_finding` for vulnerabilities that belong in the findings list; use `save_important_fact` only for durable facts not already covered by database records."#,
     );
-    prompt.push_str("\n## Session progress\nSession: ");
+    // Single session + targets block: session info, every target, and activity for the active one.
+    prompt.push_str("\n\n## Session & Targets");
+    prompt.push_str("\nSession: ");
     prompt.push_str(session_name);
     prompt.push_str("\nStarted: ");
     prompt.push_str(session_created);
     prompt.push_str("\nTargets in scope: ");
     prompt.push_str(&targets_count.to_string());
 
-    // Full sidebar view: every target with ports, findings and important facts.
     if !all_targets.is_empty() {
-        prompt.push_str("\n\n## Targets (full sidebar view)");
         for t in all_targets {
             let is_act = active_target.map(|a| a.id == t.id).unwrap_or(false);
             let marker = if is_act { " [ACTIVE]" } else { "" };
@@ -109,6 +109,15 @@ Be concise.
                     for fact in t_facts {
                         prompt.push_str(&format!("\n    - {}", fact.fact));
                     }
+                }
+            }
+
+            if is_act {
+                prompt.push_str("\n  Commands run: ");
+                prompt.push_str(&command_count.to_string());
+                if let Some(activity) = &last_activity {
+                    prompt.push_str("\n  Last activity: ");
+                    prompt.push_str(activity);
                 }
             }
         }
@@ -183,21 +192,7 @@ Workspace structure:
         }
     }
 
-    if let Some(target) = active_target {
-        // Ports, OS, hostnames and findings are already listed in the full sidebar view.
-        prompt.push_str(&format!(
-            "\n\n## Active target: {} (ID {})",
-            target.ip_host, target.id
-        ));
-
-        prompt.push_str("\n\n## Activity on this target");
-        prompt.push_str("\nCommands run: ");
-        prompt.push_str(&command_count.to_string());
-        if let Some(activity) = last_activity {
-            prompt.push_str("\nLast activity: ");
-            prompt.push_str(&activity);
-        }
-
+    if active_target.is_some() {
         if suggest_next_step {
             prompt.push_str(
                 r#"
