@@ -2,11 +2,12 @@
 
 use crate::db::models::{Command, Finding, ImportantFact, PortInfo, Target, TargetMetadata};
 use anyhow::{Context, Result};
+use tokio::fs;
 
 /// Build the system prompt with context from database.
 ///
 /// `all_findings` and `all_facts` are keyed by target id and mirror the sidebar view.
-pub fn build_system_prompt(
+pub async fn build_system_prompt(
     session_name: &str,
     session_created: &str,
     targets_count: i64,
@@ -217,7 +218,7 @@ Workspace structure:
   - exploits/  : Python exploit & PoC scripts"#,
         );
 
-        let exploits_list = list_workspace_files(&ws.join("exploits"), Some(".py"))?;
+        let exploits_list = list_workspace_files(&ws.join("exploits"), Some(".py")).await?;
 
         if !exploits_list.is_empty() {
             prompt.push_str("\n\n## Saved Exploits in Workspace:\n");
@@ -226,7 +227,7 @@ Workspace structure:
             prompt.push_str("\n\n## Saved Exploits:\n  (None saved yet. Use `save_exploit_script` when you identify or write an exploit).");
         }
 
-        let evidence_list = list_workspace_files(&ws.join("evidence"), None)?
+        let evidence_list = list_workspace_files(&ws.join("evidence"), None).await?
             .into_iter()
             .map(|entry| format!("  - evidence/{}", entry))
             .collect::<Vec<_>>();
@@ -235,7 +236,7 @@ Workspace structure:
             prompt.push_str(&evidence_list.join("\n"));
         }
 
-        let artifacts_list = list_workspace_files(&ws.join("artifacts"), None)?
+        let artifacts_list = list_workspace_files(&ws.join("artifacts"), None).await?
             .into_iter()
             .map(|entry| format!("  - artifacts/{}", entry))
             .collect::<Vec<_>>();
@@ -265,11 +266,11 @@ fn quoted(value: &str) -> String {
     format!("{value:?}")
 }
 
-fn list_workspace_files(
+pub async fn list_workspace_files(
     directory: &std::path::Path,
     extension: Option<&str>,
 ) -> Result<Vec<String>> {
-    let entries = match std::fs::read_dir(directory) {
+    let mut entries = match fs::read_dir(directory).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -278,11 +279,10 @@ fn list_workspace_files(
     };
 
     let mut files = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.with_context(|| format!("Failed to read entry in {}", directory.display()))?;
+    while let Some(entry) = entries.next_entry().await.with_context(|| format!("Failed to read entry in {}", directory.display()))? {
         let metadata = entry
             .metadata()
+            .await
             .with_context(|| format!("Failed to read metadata for {}", entry.path().display()))?;
         if !metadata.is_file() {
             continue;
@@ -315,9 +315,9 @@ pub const POST_EXEC_PROMPT: &str = r#"Analyze the command output in the context 
 pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSuggestion> {
     let mut text = response.trim();
 
-    // Strip <think>...</think> if present (reasoning models)
+    // Strip </think>... if present (reasoning models)
     let cleaned_text;
-    if let Some(think_start) = text.find("<think>") {
+    if let Some(think_start) = text.find("</think>") {
         if let Some(think_end) = text.find("</think>") {
             if think_end > think_start {
                 cleaned_text = format!("{}{}", &text[..think_start], &text[think_end + 8..]);
