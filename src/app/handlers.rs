@@ -108,7 +108,7 @@ impl App {
             AppEvent::ModelsLoadedForProvider(provider, models) => {
                 let count = models.len();
                 self.config.update_models_cache_for_provider(provider, models);
-                let _ = self.config.save();
+                let _ = self.config.save().await;
                 self.add_notification(
                     format!("Fetched {} models from {}", count, provider.as_str()),
                     NotifLevel::Info,
@@ -203,7 +203,7 @@ impl App {
                     }
 
                     self.config.set_provider(selected_provider, None);
-                    let _ = self.config.save();
+                    let _ = self.config.save().await;
                     if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
                         self.llm_client = client;
                     } else {
@@ -293,17 +293,35 @@ impl App {
                                     }).await;
 
                                     // Record command and output artifact in database
-                                    let _ = DatabaseQueries::add_command(
-                                        &self.db.conn(),
-                                        &self.session_meta.path(),
-                                        Some(approval.target_id),
-                                        command_line,
-                                        Some(&out),
-                                        Some(0),
-                                        Some(duration_ms),
-                                    );
-                                    let _ = DatabaseQueries::add_chat_message(&self.db.conn(), Some(approval.target_id), "user", &format!("$ {}", command_line));
-                                    let _ = DatabaseQueries::add_chat_message(&self.db.conn(), Some(approval.target_id), "assistant", &out);
+                                    // (blocking SQLite + artifact write runs off the event loop)
+                                    let db = self.db.clone();
+                                    let session_path = self.session_meta.path();
+                                    let command_line_for_db = command_line.to_string();
+                                    let out_for_db = out.clone();
+                                    let target_id_for_db = approval.target_id;
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = DatabaseQueries::add_command(
+                                            &db.conn(),
+                                            &session_path,
+                                            Some(target_id_for_db),
+                                            &command_line_for_db,
+                                            Some(&out_for_db),
+                                            Some(0),
+                                            Some(duration_ms),
+                                        );
+                                        let _ = DatabaseQueries::add_chat_message(
+                                            &db.conn(),
+                                            Some(target_id_for_db),
+                                            "user",
+                                            &format!("$ {}", command_line_for_db),
+                                        );
+                                        let _ = DatabaseQueries::add_chat_message(
+                                            &db.conn(),
+                                            Some(target_id_for_db),
+                                            "assistant",
+                                            &out_for_db,
+                                        );
+                                    }).await;
 
                                     let tool_out = if lines.len() > 30 {
                                         let top = lines[..25].join("\n");
@@ -876,16 +894,28 @@ impl App {
     }
     
     pub async fn show_targets_table(&mut self) -> Result<()> {
-        let targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
+        // Blocking SQLite queries run off the event loop.
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String, usize, usize)>> {
+            let targets = DatabaseQueries::get_all_targets(&db.conn())?;
+            let mut rows = Vec::with_capacity(targets.len());
+            for target in targets {
+                let ports_count = target.ports_json.as_ref()
+                    .and_then(|p| serde_json::from_str::<Vec<crate::db::models::PortInfo>>(p).ok())
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                let findings_count = DatabaseQueries::get_findings_for_target(&db.conn(), target.id)?.len();
+                rows.push((target.id, target.ip_host, ports_count, findings_count));
+            }
+            Ok(rows)
+        })
+        .await
+        .context("Targets table task panicked")??;
+
         let mut table = String::from("ID | IP/Host | Ports | Findings\n");
         table.push_str("---|---------|-------|---------\n");
-        for target in targets {
-            let ports_count = target.ports_json.as_ref()
-                .and_then(|p| serde_json::from_str::<Vec<crate::db::models::PortInfo>>(p).ok())
-                .map(|v| v.len())
-                .unwrap_or(0);
-            let findings_count = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id)?.len();
-            table.push_str(&format!("{} | {} | {} | {}\n", target.id, target.ip_host, ports_count, findings_count));
+        for (id, ip_host, ports_count, findings_count) in rows {
+            table.push_str(&format!("{} | {} | {} | {}\n", id, ip_host, ports_count, findings_count));
         }
         self.append_chat_message(ChatMessage {
             role: "assistant".to_string(),
@@ -899,7 +929,13 @@ impl App {
     pub async fn show_findings(&mut self, target_id: Option<i64>) -> Result<()> {
         let target_id = target_id.or(self.active_target_id);
         if let Some(id) = target_id {
-            let findings = DatabaseQueries::get_findings_for_target(&self.db.conn(), id)?;
+            // Blocking SQLite queries run off the event loop.
+            let db = self.db.clone();
+            let findings = tokio::task::spawn_blocking(move || -> Result<Vec<Finding>> {
+                DatabaseQueries::get_findings_for_target(&db.conn(), id)
+            })
+            .await
+            .context("Findings task panicked")??;
             let mut output = String::from("Findings:\n");
             for f in findings {
                 output.push_str(&format!("[{}] {}: {} (from: {})\n", f.severity, f.title, f.description, f.source_cmd.unwrap_or_default()));

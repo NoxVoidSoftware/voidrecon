@@ -819,7 +819,7 @@ impl App {
                         .unwrap_or(tokens)
                         .min(u32::MAX as usize) as u32;
                     if self.config.record_context_limit(key, observed_limit) {
-                        match self.config.save() {
+                        match self.config.save().await {
                             Ok(()) => self.add_notification(
                                 format!(
                                     "Context limit learned as approximately {} tokens; conversation will compact at 80% of this limit",

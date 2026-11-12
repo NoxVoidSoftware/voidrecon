@@ -6,7 +6,6 @@ use chrono::{DateTime, Utc};
 use dirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 
 const DEFAULT_CONTEXT_LENGTH: u32 = 200_000;
@@ -167,19 +166,23 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn config_path() -> Result<PathBuf> {
+    pub async fn config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Could not find user home directory")?;
         let config_dir = home.join(".config").join("voidrecon");
-        fs::create_dir_all(&config_dir).context("Failed to create config directory ~/.config/voidrecon")?;
+        tokio::fs::create_dir_all(&config_dir)
+            .await
+            .context("Failed to create config directory ~/.config/voidrecon")?;
         Ok(config_dir.join("config.json"))
     }
 
-    pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-        if !path.exists() {
+    pub async fn load() -> Result<Self> {
+        let path = Self::config_path().await?;
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(Self::default());
         }
-        let content = fs::read_to_string(&path).context("Failed to read config file")?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .context("Failed to read config file")?;
         let mut config: Config = serde_json::from_str(&content).context("Failed to parse config JSON")?;
         if !config.api_key.trim().is_empty() && !config.provider_keys.contains_key(&config.provider) {
             config.provider_keys.insert(config.provider, config.api_key.clone());
@@ -193,10 +196,12 @@ impl Config {
         Ok(config)
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
+    pub async fn save(&self) -> Result<()> {
+        let path = Self::config_path().await?;
         let content = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&path, content).context("Failed to write config file")?;
+        tokio::fs::write(&path, content)
+            .await
+            .context("Failed to write config file")?;
         Ok(())
     }
 

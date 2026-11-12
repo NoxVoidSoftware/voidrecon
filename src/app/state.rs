@@ -264,7 +264,7 @@ pub struct App {
 impl App {
     pub async fn new() -> Result<Self> {
         // Load or create config
-        let config = Config::load().context("Failed to load config")?;
+        let config = Config::load().await.context("Failed to load config")?;
         
         // Initialize LLM client for configured provider (OpenRouter, OpenAI, Ollama, Custom)
         let llm_client = LlmClient::from_config(&config).context("Failed to initialize LLM client")?;
@@ -421,7 +421,7 @@ impl App {
         }
 
         let dir = SessionMeta::sessions_dir().join(session_name);
-        if dir.exists() {
+        if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
             tokio::fs::remove_dir_all(&dir).await?;
         }
 
@@ -439,7 +439,7 @@ impl App {
         self.save_chat_history().await;
 
         let meta_path = SessionMeta::sessions_dir().join(&session_name).join("session.json");
-        let session_meta = if meta_path.exists() {
+        let session_meta = if tokio::fs::try_exists(&meta_path).await.unwrap_or(false) {
             let mut meta = SessionMeta::load(&meta_path).await?;
             meta.last_activity = Utc::now();
             let _ = meta.save().await;
@@ -458,7 +458,10 @@ impl App {
         let _ = tokio::fs::create_dir_all(ws.join("artifacts")).await;
         let _ = tokio::fs::create_dir_all(ws.join("exploits")).await;
 
-        self.db = Database::new(&session_meta.db_path())?;
+        let db_path = session_meta.db_path();
+        self.db = tokio::task::spawn_blocking(move || Database::new(&db_path))
+            .await
+            .context("Database open task panicked")??;
         self.llm.chat_log = session_meta.load_chat_history().await;
         self.rebuild_cached_chat_lines();
         self.session_meta = session_meta;

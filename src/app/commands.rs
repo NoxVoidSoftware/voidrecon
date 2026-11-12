@@ -12,28 +12,40 @@ impl App {
         match parts[0] {
             ":target" => {
                 if parts.len() > 1 {
-                    let input = parts[1].trim();
-                    let target = if let Ok(id) = input.parse::<i64>() {
-                        DatabaseQueries::get_target(&self.db.conn(), id)?
+                    let input = parts[1].trim().to_string();
+                    // Blocking SQLite lookup/insert runs off the event loop.
+                    let db = self.db.clone();
+                    let resolved = tokio::task::spawn_blocking(move || -> Result<(i64, String, bool)> {
+                        let target = if let Ok(id) = input.parse::<i64>() {
+                            DatabaseQueries::get_target(&db.conn(), id)?
+                        } else {
+                            DatabaseQueries::get_target_by_ip(&db.conn(), &input)?
+                        };
+                        if let Some(t) = target {
+                            Ok((t.id, t.ip_host, false))
+                        } else {
+                            let id = DatabaseQueries::add_target(&db.conn(), &input, None, None)?;
+                            Ok((id, input.clone(), true))
+                        }
+                    })
+                    .await
+                    .context("Target lookup task panicked")??;
+                    let (id, ip_host, is_new) = resolved;
+                    self.active_target_id = Some(id);
+                    self.reload_sidebar().await?;
+                    if is_new {
+                        self.add_notification(format!("Added & activated target: {} (ID: {})", ip_host, id), NotifLevel::Info);
                     } else {
-                        DatabaseQueries::get_target_by_ip(&self.db.conn(), input)?
-                    };
-                    if let Some(target) = target {
-                        self.active_target_id = Some(target.id);
-                        self.reload_sidebar().await?;
-                        self.add_notification(format!("Active target: {} (ID: {})", target.ip_host, target.id), NotifLevel::Info);
-                    } else {
-                        let new_id = DatabaseQueries::add_target(&self.db.conn(), input, None, None)?;
-                        self.active_target_id = Some(new_id);
-                        self.reload_sidebar().await?;
-                        self.add_notification(format!("Added & activated target: {} (ID: {})", input, new_id), NotifLevel::Info);
+                        self.add_notification(format!("Active target: {} (ID: {})", ip_host, id), NotifLevel::Info);
                     }
                 } else if let Some(target_id) = self.active_target_id {
-                    let _target_res = {
-                        let conn = self.db.conn();
-                        DatabaseQueries::get_target(&conn, target_id)?
-                    };
-                    if let Some(target) = _target_res {
+                    let db = self.db.clone();
+                    let target = tokio::task::spawn_blocking(move || -> Result<Option<crate::db::models::Target>> {
+                        DatabaseQueries::get_target(&db.conn(), target_id)
+                    })
+                    .await
+                    .context("Target lookup task panicked")??;
+                    if let Some(target) = target {
                         self.add_notification(format!("Active target: {} (ID: {})", target.ip_host, target.id), NotifLevel::Info);
                     }
                 } else {
@@ -52,11 +64,13 @@ impl App {
             ":note" => {
                 if parts.len() > 1 {
                     if let Some(target_id) = self.active_target_id {
-                        DatabaseQueries::add_note(
-                            &self.db.conn(),
-                            target_id,
-                            parts[1],
-                        )?;
+                        let note = parts[1].to_string();
+                        let db = self.db.clone();
+                        tokio::task::spawn_blocking(move || -> Result<i64> {
+                            DatabaseQueries::add_note(&db.conn(), target_id, &note)
+                        })
+                        .await
+                        .context("Add note task panicked")??;
                         self.add_notification("Note added".to_string(), NotifLevel::Info);
                         self.reload_sidebar().await?;
                     }
@@ -87,7 +101,7 @@ impl App {
                         "ollama" => {
                             let url = subparts.get(1).map(|u| u.to_string());
                             self.config.set_provider(crate::config::ProviderKind::Ollama, url);
-                            let _ = self.config.save();
+                            let _ = self.config.save().await;
                             if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
                         self.llm_client = client;
                     } else {
@@ -99,7 +113,7 @@ impl App {
                         "custom" => {
                             let url = subparts.get(1).map(|u| u.to_string());
                             self.config.set_provider(crate::config::ProviderKind::Custom, url);
-                            let _ = self.config.save();
+                            let _ = self.config.save().await;
                             if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
                         self.llm_client = client;
                     } else {

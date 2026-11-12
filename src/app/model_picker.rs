@@ -96,7 +96,7 @@ impl App {
                     self.config.set_provider(provider, None);
                     self.config.provider_active_models.insert(provider, model_id.clone());
                     self.config.active_model = model_id.clone();
-                    if let Err(e) = self.config.save() {
+                    if let Err(e) = self.config.save().await {
                         self.add_notification(format!("Failed to save config: {}", e), NotifLevel::Error);
                     } else {
                         if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
@@ -136,7 +136,7 @@ impl App {
             return Ok(());
         }
         self.config.set_provider(provider, None);
-        let _ = self.config.save();
+        let _ = self.config.save().await;
         if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
                         self.llm_client = client;
                     } else {
