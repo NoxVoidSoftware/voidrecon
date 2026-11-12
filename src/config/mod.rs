@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+const DEFAULT_CONTEXT_LENGTH: u32 = 200_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
@@ -131,6 +133,8 @@ pub struct Config {
     pub models_cache: Vec<ModelInfo>,
     #[serde(default)]
     pub models_cache_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub learned_context_lengths: HashMap<String, u32>,
 }
 
 impl ModelInfo {
@@ -157,6 +161,7 @@ impl Default for Config {
             active_model: String::new(),
             models_cache: Vec::new(),
             models_cache_updated_at: None,
+            learned_context_lengths: HashMap::new(),
         }
     }
 }
@@ -202,6 +207,41 @@ impl Config {
             self.models_cache.as_slice()
         } else {
             &[]
+        }
+    }
+
+    pub fn context_limit_key(provider: ProviderKind, model: &str) -> String {
+        format!("{}:{}", provider.as_str(), model)
+    }
+
+    pub fn context_limit_for(&self, provider: ProviderKind, model: &str) -> u32 {
+        self.learned_context_lengths
+            .get(&Self::context_limit_key(provider, model))
+            .copied()
+            .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+    }
+
+    pub fn compaction_threshold_for(&self, provider: ProviderKind, model: &str) -> u32 {
+        let key = Self::context_limit_key(provider, model);
+        self.learned_context_lengths
+            .get(&key)
+            .map(|limit| limit.saturating_mul(80) / 100)
+            .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+    }
+
+    pub fn record_context_limit(&mut self, key: String, observed_limit: u32) -> bool {
+        use std::collections::hash_map::Entry;
+
+        match self.learned_context_lengths.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(observed_limit);
+                true
+            }
+            Entry::Occupied(mut entry) if observed_limit < *entry.get() => {
+                entry.insert(observed_limit);
+                true
+            }
+            Entry::Occupied(_) => false,
         }
     }
 

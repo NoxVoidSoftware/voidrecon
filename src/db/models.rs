@@ -40,6 +40,14 @@ pub struct Command {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportantFact {
+    pub id: i64,
+    pub target_id: i64,
+    pub fact: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortInfo {
     pub port: u16,
     pub proto: String,

@@ -9,10 +9,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub fn render_ui(f: &mut Frame, app: &mut App) {
     let area = f.size();
-    app.terminal_size = (area.width, area.height);
     
     // Main layout
     let chunks = Layout::default()
@@ -46,8 +46,7 @@ pub fn render_ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
-    let model_display = if app.config.models_cache.iter().any(|m| m.id == app.config.active_model) {
-        let model = app.config.models_cache.iter().find(|m| m.id == app.config.active_model).unwrap();
+    let model_display = if let Some(model) = app.config.models_cache.iter().find(|m| m.id == app.config.active_model) {
         let free_badge = if model.id.ends_with(":free") || (model.pricing.prompt == "0" && model.pricing.completion == "0") {
             " [FREE]".to_string()
         } else {
@@ -73,11 +72,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
 
-    let llm_indicator = if let Some((_, cmd, start)) = &app.running_command {
+    let llm_indicator = if let Some((_, cmd, start)) = &app.command_run.running {
         let elapsed = start.elapsed().as_secs();
         Span::styled(format!(" [RUNNING {} ({}s): {}] ", spinner, elapsed, cmd), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
     } else {
-        match app.llm_request_state {
+        match app.llm.request_state {
             crate::llm::types::LlmRequestState::Streaming => {
                 Span::styled(format!(" [LLM {}] ", spinner), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
             }
@@ -175,6 +174,43 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
                     ])));
                 }
             }
+
+            // Important facts
+            for fact in &node.facts {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("FACT ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::styled(&fact.fact, Style::default().fg(Color::White)),
+                ])));
+            }
+        }
+    }
+    
+    // Available exploits
+    let exploits_dir = app.session_meta.workspace_path().join("exploits");
+    let mut exploit_files: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&exploits_dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".py") {
+                        exploit_files.push(name);
+                    }
+                }
+            }
+        }
+    }
+    exploit_files.sort();
+    if !exploit_files.is_empty() {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("── Exploits ──", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        ])));
+        for name in exploit_files {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(name, Style::default().fg(Color::Green)),
+            ])));
         }
     }
     
@@ -239,8 +275,12 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
-    let approval_height = if app.pending_exploit_approval.is_some() { 5 } else { 0 };
-    let suggestion_height = if app.suggestion_visible { 5 } else { 0 };
+    let approval_height = match app.pending_exploit_approval.as_ref().map(|approval| &approval.kind) {
+        Some(crate::app::state::ApprovalKind::TerminalInput { .. }) => 8,
+        Some(_) => 5,
+        None => 0,
+    };
+    let suggestion_height = if app.llm.suggestion_visible { 5 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -270,10 +310,20 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" Target: {} (ID {}) │ File: workspace/{}/{} │ Desc: {}", approval.target_ip, approval.target_id, folder, filename, description),
                 " [y / Enter] Approve & Save File ",
             ),
+            crate::app::state::ApprovalKind::TerminalInput { tab_id, input, press_enter } => (
+                " LLM requests terminal input:",
+                format!(" Tab ID {} │ Input: {:?} │ Press Enter: {}", tab_id, input, press_enter),
+                " [y / Enter] Approve & Send Input ",
+            ),
+            crate::app::state::ApprovalKind::CloseTerminalTab { tab_id, label } => (
+                " LLM requests closing a terminal tab:",
+                format!(" Tab ID {} │ {}", tab_id, label),
+                " [y / Enter] Approve & Close Tab ",
+            ),
         };
         let content = vec![
             Line::from(vec![
-                Span::styled(" [EXPLOIT APPROVAL REQUIRED] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(" [ACTION APPROVAL REQUIRED] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::raw(prompt_title),
             ]),
             Line::from(vec![
@@ -289,146 +339,32 @@ fn render_workspace_tab(f: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Red))
             .title(" Action Approval ");
-        f.render_widget(Paragraph::new(content).block(block), chunks[1]);
+        f.render_widget(
+            Paragraph::new(content)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            chunks[1],
+        );
     }
 
-    if app.suggestion_visible {
+    if app.llm.suggestion_visible {
         render_suggestion_panel(f, app, chunks[2]);
     }
     
     render_input_line(f, app, chunks[3]);
 }
 
-pub fn strip_ansi_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
 
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.next() {
-                Some('[') => {
-                    for next_c in chars.by_ref() {
-                        if (0x40..=0x7E).contains(&(next_c as u32)) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    while let Some(next_c) = chars.next() {
-                        if next_c == '\x07' {
-                            break;
-                        }
-                        if next_c == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some('(') | Some(')') => {
-                    chars.next();
-                }
-                Some(other) => {
-                    if !(0x40..=0x7E).contains(&(other as u32)) {
-                        // ignore
-                    }
-                }
-                None => {}
-            }
-        } else if c == '\t' {
-            out.push_str("    ");
-        } else if c == '\r' || c == '\n' || !c.is_control() {
-            out.push(c);
-        }
-    }
-    out
-}
 
-pub fn resolve_carriage_returns(text: &str) -> String {
-    let mut result = Vec::new();
-    for raw_line in text.split('\n') {
-        let line = raw_line.trim_end_matches('\r');
-        if !line.contains('\r') {
-            result.push(line.to_string());
-            continue;
-        }
 
-        let mut char_buf: Vec<char> = Vec::new();
-        let mut cursor = 0;
-        for c in line.chars() {
-            if c == '\r' {
-                cursor = 0;
-            } else {
-                if cursor < char_buf.len() {
-                    char_buf[cursor] = c;
-                } else {
-                    char_buf.push(c);
-                }
-                cursor += 1;
-            }
-        }
-        let resolved: String = char_buf.into_iter().collect();
-        result.push(resolved);
-    }
-    result.join("\n")
-}
 
-pub fn sanitize_terminal_output(raw: &str) -> String {
-    let stripped = strip_ansi_escapes(raw);
-    resolve_carriage_returns(&stripped)
-}
 
-fn push_chunked_line(
-    lines_out: &mut Vec<Line<'static>>,
-    prefix: &str,
-    prefix_style: Style,
-    line: &str,
-    text_style: Style,
-) {
-    if line.len() <= 200 {
-        lines_out.push(Line::from(vec![
-            Span::styled(prefix.to_string(), prefix_style),
-            Span::styled(line.to_string(), text_style),
-        ]));
-        return;
-    }
 
-    let mut chunk_start = 0;
-    let mut chunks_shown = 0;
-    while chunk_start < line.len() {
-        if chunks_shown >= 4 {
-            lines_out.push(Line::from(vec![
-                Span::styled(prefix.to_string(), prefix_style),
-                Span::styled(
-                    format!("... [long line truncated, total {} chars] ...", line.len()),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                ),
-            ]));
-            break;
-        }
 
-        let mut chunk_end = (chunk_start + 200).min(line.len());
-        while chunk_end > chunk_start && !line.is_char_boundary(chunk_end) {
-            chunk_end -= 1;
-        }
-        if chunk_end == chunk_start {
-            break;
-        }
-
-        let piece = &line[chunk_start..chunk_end];
-        let p = if chunks_shown == 0 { prefix } else { "  " };
-        lines_out.push(Line::from(vec![
-            Span::styled(p.to_string(), prefix_style),
-            Span::styled(piece.to_string(), text_style),
-        ]));
-
-        chunk_start = chunk_end;
-        chunks_shown += 1;
-    }
-}
 
 pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let sanitized_content = sanitize_terminal_output(&msg.content);
+    let sanitized_content = crate::ui::text::sanitize_terminal_output(&msg.content);
     match msg.role.as_str() {
         "user" => {
             let is_llm = sanitized_content.starts_with('?');
@@ -440,7 +376,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled("──────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
             ]));
             for line in sanitized_content.lines() {
-                push_chunked_line(&mut lines, "│ ", Style::default().fg(color), line, Style::default().fg(Color::White));
+                crate::ui::text::push_chunked_line(&mut lines, "│ ", Style::default().fg(color), line, Style::default().fg(Color::White));
             }
             lines.push(Line::from(""));
         }
@@ -450,7 +386,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
             let max_lines = 100;
             let show_count = total.min(max_lines);
             for &line in &all[..show_count] {
-                push_chunked_line(&mut lines, "  ", Style::default().fg(Color::DarkGray), line, Style::default().fg(Color::Gray));
+                crate::ui::text::push_chunked_line(&mut lines, "  ", Style::default().fg(Color::DarkGray), line, Style::default().fg(Color::Gray));
             }
             if total > max_lines {
                 lines.push(Line::from(vec![
@@ -471,7 +407,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled("──────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
             ]));
             for line in sanitized_content.lines() {
-                push_chunked_line(&mut lines, "│ ", Style::default().fg(Color::Cyan), line, Style::default().fg(Color::White));
+                crate::ui::text::push_chunked_line(&mut lines, "│ ", Style::default().fg(Color::Cyan), line, Style::default().fg(Color::White));
             }
             lines.push(Line::from(vec![
                 Span::styled("└────────────────────────────────────────────────────────────", Style::default().fg(Color::DarkGray)),
@@ -486,10 +422,10 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
             let mut first = true;
             for &line in &all[..show_count] {
                 if first {
-                    push_chunked_line(&mut lines, "# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC), line, Style::default().fg(Color::DarkGray));
+                    crate::ui::text::push_chunked_line(&mut lines, "# Tool Result: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC), line, Style::default().fg(Color::DarkGray));
                     first = false;
                 } else {
-                    push_chunked_line(&mut lines, "  ", Style::default().fg(Color::DarkGray), line, Style::default().fg(Color::DarkGray));
+                    crate::ui::text::push_chunked_line(&mut lines, "  ", Style::default().fg(Color::DarkGray), line, Style::default().fg(Color::DarkGray));
                 }
             }
             if first {
@@ -514,7 +450,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
                 Span::styled("┌─ ⚠️ Notice / System ──────────────────────────────────────────", Style::default().fg(Color::Red)),
             ]));
             for line in sanitized_content.lines() {
-                push_chunked_line(&mut lines, "│ ", Style::default().fg(Color::Red), line, Style::default().fg(Color::White));
+                crate::ui::text::push_chunked_line(&mut lines, "│ ", Style::default().fg(Color::Red), line, Style::default().fg(Color::White));
             }
             lines.push(Line::from(""));
         }
@@ -522,65 +458,7 @@ pub fn format_chat_message(msg: &crate::llm::ChatMessage, active_model: &str) ->
     lines
 }
 
-fn calculate_line_wrapped_rows(line_text: &str, max_width: usize) -> usize {
-    if max_width == 0 {
-        return 1;
-    }
-    use unicode_width::UnicodeWidthStr;
-    let total_width = line_text.width();
-    if total_width == 0 {
-        return 1;
-    }
-    if total_width <= max_width {
-        return 1;
-    }
 
-    let mut rows = 1;
-    let mut current_row_width = 0;
-
-    for word in line_text.split(' ') {
-        let word_width = word.width();
-        if word_width == 0 {
-            // space
-            if current_row_width + 1 <= max_width {
-                current_row_width += 1;
-            } else {
-                rows += 1;
-                current_row_width = 1;
-            }
-            continue;
-        }
-
-        if current_row_width == 0 {
-            if word_width <= max_width {
-                current_row_width = word_width;
-            } else {
-                let extra_rows = (word_width.saturating_sub(1)) / max_width;
-                rows += extra_rows;
-                current_row_width = word_width % max_width;
-                if current_row_width == 0 {
-                    current_row_width = max_width;
-                }
-            }
-        } else if current_row_width + 1 + word_width <= max_width {
-            current_row_width += 1 + word_width;
-        } else {
-            rows += 1;
-            if word_width <= max_width {
-                current_row_width = word_width;
-            } else {
-                let extra_rows = (word_width.saturating_sub(1)) / max_width;
-                rows += extra_rows;
-                current_row_width = word_width % max_width;
-                if current_row_width == 0 {
-                    current_row_width = max_width;
-                }
-            }
-        }
-    }
-
-    rows
-}
 
 fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
@@ -594,19 +472,19 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
             .iter()
             .map(|l| {
                 let line_text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-                calculate_line_wrapped_rows(&line_text, inner_width)
+                crate::ui::text::calculate_line_wrapped_rows(&line_text, inner_width)
             })
             .sum()
     };
 
-    let mut display_lines = app.cached_chat_lines.clone();
+    let mut display_lines = app.llm.cached_chat_lines.clone();
     
     // Add streaming LLM response
-    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+    if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
         let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
 
-        let title = if app.llm_request_state == crate::llm::types::LlmRequestState::ProcessingToolCalls {
+        let title = if app.llm.request_state == crate::llm::types::LlmRequestState::ProcessingToolCalls {
             format!("┌─ 🤖 AI / LLM [Executing Tools... {}] (Ctrl+C: Cancel) ────────", spinner)
         } else {
             format!("┌─ 🤖 AI / LLM [Thinking / Streaming... {}] (Ctrl+C: Cancel) ───", spinner)
@@ -614,13 +492,13 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         display_lines.push(Line::from(vec![
             Span::styled(title, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ]));
-        if app.llm_response_buffer.is_empty() {
+        if app.llm.response_buffer.is_empty() {
             display_lines.push(Line::from(vec![
                 Span::styled("│ ", Style::default().fg(Color::Yellow)),
                 Span::styled(format!("Connecting to provider & generating response... {}", spinner), Style::default().fg(Color::Yellow)),
             ]));
         } else {
-            for line in app.llm_response_buffer.lines() {
+            for line in app.llm.response_buffer.lines() {
                 display_lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::Yellow)),
                     Span::styled(line.to_string(), Style::default().fg(Color::White)),
@@ -633,7 +511,7 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         display_lines.push(Line::from(""));
     }
 
-    if let Some((_, cmd, start)) = &app.running_command {
+    if let Some((_, cmd, start)) = &app.command_run.running {
         let elapsed = start.elapsed().as_secs();
         let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let spinner = spinner_frames[(app.ui_state.tick_count / 2) % spinner_frames.len()];
@@ -642,17 +520,17 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(" [Ctrl+C: Cancel | Type below for stdin]", Style::default().fg(Color::DarkGray)),
         ]));
 
-        if !app.running_command_output.is_empty() {
+        if !app.command_run.output.is_empty() {
             let max_display = 25;
-            let count = app.running_command_output.len();
+            let count = app.command_run.output.len();
             let start = count.saturating_sub(max_display);
-            let slice = &app.running_command_output[start..];
+            let slice = &app.command_run.output[start..];
 
             display_lines.push(Line::from(vec![
                 Span::styled(format!("┌── Live Process Output (last {} lines) ──────────────────────────", slice.len()), Style::default().fg(Color::Cyan)),
             ]));
             for line in slice {
-                push_chunked_line(
+                crate::ui::text::push_chunked_line(
                     &mut display_lines,
                     "│ ",
                     Style::default().fg(Color::Cyan),
@@ -712,7 +590,7 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_suggestion_panel(f: &mut Frame, app: &App, area: Rect) {
-    let suggestion = match &app.suggestion {
+    let suggestion = match &app.llm.suggestion {
         Some(s) => s,
         None => return,
     };
@@ -766,7 +644,7 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let is_running_cmd = app.running_command.is_some() && app.active_tab == 0;
+    let is_running_cmd = app.command_run.running.is_some() && app.active_tab == 0;
     let (mode_indicator, mode_style) = match app.input_mode {
         InputMode::Shell => {
             if is_running_cmd {
@@ -811,8 +689,14 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
     
     // Set cursor position: accurately calculated and bounded when input is focused
     if app.ui_state.focus == crate::app::state::WindowFocus::Input {
-        let cursor_offset = app.ui_state.input_cursor.min(app.input_buffer.len());
-        let cursor_x = (area.x + mode_indicator.len() as u16 + cursor_offset as u16)
+        let cursor = app
+            .input_buffer
+            .get(..app.ui_state.input_cursor)
+            .unwrap_or(&app.input_buffer);
+        let cursor_offset = UnicodeWidthStr::width(cursor);
+        let cursor_x = (area.x
+            + mode_indicator.len() as u16
+            + cursor_offset.min(u16::MAX as usize) as u16)
             .min(area.x + area.width.saturating_sub(1));
         f.set_cursor(cursor_x, area.y);
     }
@@ -851,10 +735,10 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     if app.pending_exploit_approval.is_some() {
         footer_spans.push(Span::styled(" [Y: Approve | N: Reject] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
-    if app.running_command.is_some() {
+    if app.command_run.running.is_some() {
         footer_spans.push(Span::styled(" Ctrl+C: Cancel Process ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
-    if matches!(app.llm_request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+    if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
         footer_spans.push(Span::styled(" Ctrl+C: Cancel LLM ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
     }
     footer_spans.push(Span::styled(format!(" [{}] ", mode_text), Style::default().bg(Color::Blue).fg(Color::White)));
@@ -917,19 +801,17 @@ fn render_notifications(f: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_sanitize_terminal_output_carriage_return() {
         let raw = " 0     0    0\r53 1.25M   53\r100 1.25M  100";
-        let cleaned = sanitize_terminal_output(raw);
+        let cleaned = crate::ui::text::sanitize_terminal_output(raw);
         assert_eq!(cleaned, "100 1.25M  100");
     }
 
     #[test]
     fn test_sanitize_terminal_output_ansi_and_tabs() {
         let raw = "\x1b[31mError:\x1b[0m\tCheck failed\r\nDone";
-        let cleaned = sanitize_terminal_output(raw);
+        let cleaned = crate::ui::text::sanitize_terminal_output(raw);
         assert_eq!(cleaned, "Error:    Check failed\nDone");
     }
 }

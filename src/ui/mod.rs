@@ -2,6 +2,7 @@
 //! Handles ratatui layout, widgets, and rendering.
 
 pub mod layout;
+pub mod text;
 pub mod widgets;
 pub mod modals;
 
