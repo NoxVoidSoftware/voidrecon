@@ -107,7 +107,7 @@ impl App {
         Ok((findings, facts))
     }
 
-    fn build_session_context_prompt(&self, suggest_next_step: bool) -> Result<String> {
+    async fn build_session_context_prompt(&self, suggest_next_step: bool) -> Result<String> {
         let active_target = if let Some(id) = self.active_target_id {
             DatabaseQueries::get_target(&self.db.conn(), id)?
         } else {
@@ -137,7 +137,8 @@ impl App {
             command_count,
             suggest_next_step,
             Some(&self.session_meta.workspace_path()),
-        )?;
+        )
+        .await?;
         prompt.push_str(&format!(
             "\n\n## Open Terminal Tabs\nTab 0: Workspace & LLM [{}].",
             if self.active_tab == 0 { "active" } else { "inactive" }
@@ -176,8 +177,8 @@ impl App {
         Ok(prompt)
     }
 
-    fn context_prompt_or_notify(&mut self, suggest_next_step: bool) -> Option<String> {
-        match self.build_session_context_prompt(suggest_next_step) {
+    async fn context_prompt_or_notify(&mut self, suggest_next_step: bool) -> Option<String> {
+        match self.build_session_context_prompt(suggest_next_step).await {
             Ok(prompt) => Some(prompt),
             Err(error) => {
                 self.llm.request_state = LlmRequestState::Failed;
@@ -614,7 +615,7 @@ impl App {
         });
         self.ui_state.log_at_bottom = true;
 
-        let Some(system_prompt) = self.context_prompt_or_notify(false) else {
+        let Some(system_prompt) = self.context_prompt_or_notify(false).await else {
             return Ok(());
         };
 
@@ -670,7 +671,7 @@ impl App {
             return Ok(());
         }
 
-        let Some(base_prompt) = self.context_prompt_or_notify(true) else {
+        let Some(base_prompt) = self.context_prompt_or_notify(true).await else {
             return Ok(());
         };
 
@@ -1356,7 +1357,7 @@ impl App {
     }
 
     pub async fn continue_llm_conversation(&mut self) -> Result<()> {
-        let Some(system_prompt) = self.context_prompt_or_notify(true) else {
+        let Some(system_prompt) = self.context_prompt_or_notify(true).await else {
             return Ok(());
         };
 

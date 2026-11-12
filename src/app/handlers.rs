@@ -1,6 +1,6 @@
 //! Event handlers for voidrecon
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::Backend;
 use std::time::Instant;
@@ -343,35 +343,43 @@ impl App {
                         }
                         crate::app::state::ApprovalKind::SaveWorkspaceFile { folder, filename, description, content } => {
                             let target_dir = self.session_meta.workspace_path().join(&folder);
-                            let _ = std::fs::create_dir_all(&target_dir);
+                            let _ = tokio::fs::create_dir_all(&target_dir).await;
                             let file_path = target_dir.join(&filename);
-                            match std::fs::write(&file_path, &content) {
+                            match tokio::fs::write(&file_path, &content).await {
                                 Ok(_) => {
                                     let rel_path = format!("workspace/{}/{}", folder, filename);
-                                    if folder == "evidence" {
-                                        let title = if description.is_empty() {
-                                            format!("Evidence: {}", filename)
-                                        } else {
-                                            format!("Evidence: {} ({})", filename, description)
-                                        };
-                                        let _ = DatabaseQueries::add_finding(
-                                            &self.db.conn(),
-                                            approval.target_id,
-                                            &title,
-                                            &description,
-                                            "info",
-                                            None,
-                                            Some(100),
-                                            Some(&rel_path),
-                                        );
-                                    } else if folder == "artifacts" {
-                                        let note_text = if description.is_empty() {
-                                            format!("Saved artifact: {}", rel_path)
-                                        } else {
-                                            format!("Saved artifact {}: {}", rel_path, description)
-                                        };
-                                        let _ = DatabaseQueries::add_note(&self.db.conn(), approval.target_id, &note_text);
-                                    }
+                                    let db = self.db.clone();
+                                    let description = description.clone();
+                                    let folder_for_db = folder.clone();
+                                    let filename_for_db = filename.clone();
+                                    let rel_path_for_db = rel_path.clone();
+                                    let content_len = content.len();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if folder_for_db == "evidence" {
+                                            let title = if description.is_empty() {
+                                                format!("Evidence: {}", filename_for_db)
+                                            } else {
+                                                format!("Evidence: {} ({})", filename_for_db, description)
+                                            };
+                                            let _ = DatabaseQueries::add_finding(
+                                                &db.conn(),
+                                                approval.target_id,
+                                                &title,
+                                                &description,
+                                                "info",
+                                                None,
+                                                Some(100),
+                                                Some(&rel_path_for_db),
+                                            );
+                                        } else if folder_for_db == "artifacts" {
+                                            let note_text = if description.is_empty() {
+                                                format!("Saved artifact: {}", rel_path_for_db)
+                                            } else {
+                                                format!("Saved artifact {}: {}", rel_path_for_db, description)
+                                            };
+                                            let _ = DatabaseQueries::add_note(&db.conn(), approval.target_id, &note_text);
+                                        }
+                                    }).await;
 
                                     self.append_chat_message(ChatMessage {
                                         role: "tool".to_string(),
@@ -380,7 +388,7 @@ impl App {
                                             "folder": folder,
                                             "file": filename,
                                             "path": rel_path,
-                                            "bytes": content.len()
+                                            "bytes": content_len
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
@@ -727,70 +735,82 @@ impl App {
     }
     
     pub async fn reload_sidebar(&mut self) -> Result<()> {
-        let _ = DatabaseQueries::deduplicate_targets_and_findings(&self.db.conn());
-        let targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
-        self.sidebar_nodes.clear();
+        let db = self.db.clone();
+        let workspace_path = self.session_meta.workspace_path();
+        let session_path = self.session_meta.path();
+        let active_target_id = self.active_target_id;
 
-        if let Some(act_id) = self.active_target_id {
-            if !targets.iter().any(|t| t.id == act_id) {
-                self.active_target_id = targets.first().map(|t| t.id);
-            }
-        }
-        
-        for target in targets {
-            let findings = DatabaseQueries::get_findings_for_target(&self.db.conn(), target.id)?;
-            let mut by_severity: std::collections::HashMap<String, Vec<Finding>> = std::collections::HashMap::new();
-            for finding in findings {
-                // If finding references an evidence file in workspace/evidence, verify it still exists on disk.
-                // If user deleted the file manually, automatically prune the orphaned finding from the DB.
-                if let Some(ref ep) = finding.evidence_path {
-                    if ep.starts_with("workspace/evidence") || ep.starts_with("evidence") {
-                        let rel = ep.trim_start_matches("workspace/").trim_start_matches("workspace\\");
-                        let sub = rel.trim_start_matches("evidence/").trim_start_matches("evidence\\");
-                        let full_p = self.session_meta.workspace_path().join("evidence").join(sub);
-                        let direct_p = self.session_meta.path().join(ep);
-                        if !full_p.exists() && !direct_p.exists() {
-                            let _ = DatabaseQueries::delete_finding(&self.db.conn(), finding.id);
-                            continue;
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<SidebarNode>> {
+            let _ = DatabaseQueries::deduplicate_targets_and_findings(&db.conn());
+            let targets = DatabaseQueries::get_all_targets(&db.conn())?;
+            let mut nodes = Vec::new();
+
+            for target in targets {
+                let findings = DatabaseQueries::get_findings_for_target(&db.conn(), target.id)?;
+                let mut by_severity: std::collections::HashMap<String, Vec<Finding>> = std::collections::HashMap::new();
+                for finding in findings {
+                    // If finding references an evidence file in workspace/evidence, verify it still exists on disk.
+                    // If user deleted the file manually, automatically prune the orphaned finding from the DB.
+                    if let Some(ref ep) = finding.evidence_path {
+                        if ep.starts_with("workspace/evidence") || ep.starts_with("evidence") {
+                            let rel = ep.trim_start_matches("workspace/").trim_start_matches("workspace\\");
+                            let sub = rel.trim_start_matches("evidence/").trim_start_matches("evidence\\");
+                            let full_p = workspace_path.join("evidence").join(sub);
+                            let direct_p = session_path.join(ep);
+                            if !full_p.exists() && !direct_p.exists() {
+                                let _ = DatabaseQueries::delete_finding(&db.conn(), finding.id);
+                                continue;
+                            }
                         }
                     }
+                    by_severity.entry(finding.severity.clone()).or_default().push(finding);
                 }
-                by_severity.entry(finding.severity.clone()).or_default().push(finding);
-            }
-            let mut findings_by_severity: Vec<_> = by_severity.into_iter().collect();
-            findings_by_severity.sort_by(|a, b| {
-                let severity_order = |s: &str| match s {
-                    "critical" => 0,
-                    "high" => 1,
-                    "medium" => 2,
-                    "low" => 3,
-                    "info" => 4,
-                    _ => 5,
+                let mut findings_by_severity: Vec<_> = by_severity.into_iter().collect();
+                findings_by_severity.sort_by(|a, b| {
+                    let severity_order = |s: &str| match s {
+                        "critical" => 0,
+                        "high" => 1,
+                        "medium" => 2,
+                        "low" => 3,
+                        "info" => 4,
+                        _ => 5,
+                    };
+                    severity_order(&a.0).cmp(&severity_order(&b.0))
+                });
+
+                let ports = if let Some(ports_json) = &target.ports_json {
+                    serde_json::from_str::<Vec<crate::db::models::PortInfo>>(ports_json).unwrap_or_default()
+                } else {
+                    Vec::new()
                 };
-                severity_order(&a.0).cmp(&severity_order(&b.0))
-            });
-            
-            let ports = if let Some(ports_json) = &target.ports_json {
-                serde_json::from_str::<Vec<crate::db::models::PortInfo>>(ports_json).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            
-            let facts = DatabaseQueries::get_important_facts(&self.db.conn(), target.id)?;
-            self.sidebar_nodes.push(SidebarNode {
-                target,
-                ports,
-                expanded: true,
-                findings_by_severity,
-                facts,
-            });
+
+                let facts = DatabaseQueries::get_important_facts(&db.conn(), target.id)?;
+                nodes.push(SidebarNode {
+                    target,
+                    ports,
+                    expanded: true,
+                    findings_by_severity,
+                    facts,
+                });
+            }
+            Ok(nodes)
+        })
+        .await
+        .context("Sidebar reload task panicked")??;
+
+        // Determine active target validity from the reloaded data
+        if let Some(act_id) = active_target_id {
+            if !result.iter().any(|n| n.target.id == act_id) {
+                self.active_target_id = result.first().map(|n| n.target.id);
+            }
         }
-        
+        self.sidebar_nodes = result;
+
         // If no active target, select first
         if self.active_target_id.is_none() && !self.sidebar_nodes.is_empty() {
             self.active_target_id = Some(self.sidebar_nodes[0].target.id);
         }
-        
+
         Ok(())
     }
     

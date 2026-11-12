@@ -405,7 +405,7 @@ impl App {
 
         let dir = SessionMeta::sessions_dir().join(session_name);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
+            tokio::fs::remove_dir_all(&dir).await?;
         }
 
         self.ui_state.session_list = SessionMeta::list_sessions();
@@ -429,17 +429,17 @@ impl App {
             meta
         } else {
             let meta = SessionMeta::new(session_name);
-            std::fs::create_dir_all(&meta.path())?;
+            tokio::fs::create_dir_all(&meta.path()).await?;
             meta.save()?;
             meta
         };
 
         // Ensure session workspace subdirectories always exist
         let ws = session_meta.workspace_path();
-        let _ = std::fs::create_dir_all(ws.join("outputs"));
-        let _ = std::fs::create_dir_all(ws.join("evidence"));
-        let _ = std::fs::create_dir_all(ws.join("artifacts"));
-        let _ = std::fs::create_dir_all(ws.join("exploits"));
+        let _ = tokio::fs::create_dir_all(ws.join("outputs")).await;
+        let _ = tokio::fs::create_dir_all(ws.join("evidence")).await;
+        let _ = tokio::fs::create_dir_all(ws.join("artifacts")).await;
+        let _ = tokio::fs::create_dir_all(ws.join("exploits")).await;
 
         self.db = Database::new(&session_meta.db_path())?;
         self.llm.chat_log = session_meta.load_chat_history();

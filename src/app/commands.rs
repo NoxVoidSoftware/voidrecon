@@ -240,19 +240,38 @@ impl App {
         self.command_run.raw.clear();
 
         let target_id = self.active_target_id;
+        let active_target_id = self.active_target_id;
+        let db = self.db.clone();
+        let session_path = self.session_meta.path();
+        let cmd = result.cmd.clone();
+        let output = result.output.clone();
+        let exit_code = result.exit_code;
+        let duration_ms = result.duration_ms;
 
-        // Save to database with full output artifact
-        let _ = DatabaseQueries::add_chat_message(&self.db.conn(), target_id, "user", &result.cmd);
-        let _ = DatabaseQueries::add_chat_message(&self.db.conn(), target_id, "assistant", &result.output);
-        let _ = DatabaseQueries::add_command(
-            &self.db.conn(),
-            &self.session_meta.path(),
-            target_id,
-            &result.cmd,
-            Some(&result.output),
-            Some(result.exit_code),
-            Some(result.duration_ms),
-        );
+        // Save to database with full output artifact (blocking SQLite I/O off the event loop)
+        let parse_result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+            let _ = DatabaseQueries::add_chat_message(&db.conn(), target_id, "user", &cmd);
+            let _ = DatabaseQueries::add_chat_message(&db.conn(), target_id, "assistant", &output);
+            let _ = DatabaseQueries::add_command(
+                &db.conn(),
+                &session_path,
+                target_id,
+                &cmd,
+                Some(&output),
+                Some(exit_code),
+                Some(duration_ms),
+            );
+
+            // Auto-parse scan outputs (e.g. nmap) to update target and open ports immediately
+            DatabaseQueries::parse_nmap_and_update_target(
+                &db.conn(),
+                &cmd,
+                &output,
+                active_target_id,
+            )
+        })
+        .await
+        .context("Command completion DB task panicked")??;
 
         // Add output to chat log
         self.append_chat_message(ChatMessage {
@@ -263,17 +282,7 @@ impl App {
         });
         self.ui_state.log_at_bottom = true;
 
-        // Auto-parse scan outputs (e.g. nmap) to update target and open ports immediately
-        let parse_result = {
-            let conn = self.db.conn();
-            DatabaseQueries::parse_nmap_and_update_target(
-                &conn,
-                &result.cmd,
-                &result.output,
-                self.active_target_id,
-            )
-        };
-        if let Ok(Some(discovered_target_id)) = parse_result {
+        if let Some(discovered_target_id) = parse_result {
             self.active_target_id = Some(discovered_target_id);
             self.add_notification(
                 "Recon engine: Discovered target and updated open ports in DB".to_string(),
@@ -316,7 +325,7 @@ impl App {
         self.command_run.raw.clear();
 
         let ws_path = self.session_meta.workspace_path();
-        let _ = std::fs::create_dir_all(&ws_path);
+        let _ = tokio::fs::create_dir_all(&ws_path).await;
 
         let tx = self.event_tx.clone();
         let cmd_for_task = cmd_str.clone();
@@ -450,7 +459,7 @@ impl App {
 
     pub async fn run_command_capture(&self, cmd: &str) -> Result<String> {
         let ws_path = self.session_meta.workspace_path();
-        let _ = std::fs::create_dir_all(&ws_path);
+        let _ = tokio::fs::create_dir_all(&ws_path).await;
         let (output, _) = Self::run_process_in_dir(cmd, &ws_path).await?;
         Ok(output)
     }
@@ -496,7 +505,8 @@ impl App {
 
     pub async fn spawn_command_tab(&mut self, command: &str) -> Result<()> {
         let workspace = self.session_meta.workspace_path();
-        std::fs::create_dir_all(&workspace)
+        tokio::fs::create_dir_all(&workspace)
+            .await
             .with_context(|| format!("Failed to create workspace {}", workspace.display()))?;
         let tab = crate::pty::tab::PtyTab::new_command(
             self.next_tab_id,
