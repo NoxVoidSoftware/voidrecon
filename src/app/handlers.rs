@@ -90,13 +90,14 @@ impl App {
                 self.handle_command_completed(request_id, result).await?;
                 Ok(true)
             }
-            AppEvent::Tick => Ok(self.handle_tick()),
+            AppEvent::Tick => Ok(self.handle_tick().await),
             AppEvent::Resize(cols, rows) => {
                 self.handle_resize(cols, rows).await?;
                 Ok(true)
             }
             AppEvent::SidebarReload => {
                 self.reload_sidebar().await?;
+                self.refresh_exploit_cache().await;
                 Ok(true)
             }
             AppEvent::SetActiveTarget(target_id) => {
@@ -395,6 +396,7 @@ impl App {
                                     }).await;
                                     self.add_notification(format!("Approved & saved: {}", rel_path), NotifLevel::Info);
                                     let _ = self.reload_sidebar().await;
+                                    self.refresh_exploit_cache().await;
                                 }
                                 Err(e) => {
                                     self.append_chat_message(ChatMessage {

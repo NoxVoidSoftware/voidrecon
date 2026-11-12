@@ -54,7 +54,7 @@ impl App {
         Ok(label)
     }
     
-    pub fn handle_tick(&mut self) -> bool {
+    pub async fn handle_tick(&mut self) -> bool {
         let now = Instant::now();
         let had_notifications = !self.notifications.is_empty();
         self.notifications.retain(|n| now.duration_since(n.created_at).as_secs() < 5);
@@ -63,6 +63,13 @@ impl App {
         }
         let has_notifications = !self.notifications.is_empty();
         self.last_tick = now;
+
+        // Periodically refresh the exploit file cache so newly saved exploits
+        // appear in the sidebar without blocking the render path.
+        if now.duration_since(self.exploit_cache_time).as_secs() >= 30 {
+            self.exploit_cache_time = now;
+            self.refresh_exploit_cache().await;
+        }
 
         let is_animating = matches!(
             self.llm.request_state,

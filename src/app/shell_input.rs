@@ -55,8 +55,8 @@ fn choose_completion(partial: &str, completions: &[String]) -> Option<String> {
     }
 }
 
-fn is_executable(path: &Path) -> Result<bool> {
-    let metadata = match std::fs::metadata(path) {
+async fn is_executable(path: &Path) -> Result<bool> {
+    let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
@@ -75,7 +75,7 @@ fn is_executable(path: &Path) -> Result<bool> {
     }
 }
 
-fn command_completions(prefix: &str) -> Result<Vec<String>> {
+async fn command_completions(prefix: &str) -> Result<Vec<String>> {
     let mut completions = [
         "cd", "echo", "exit", "export", "history", "jobs", "printf", "pwd", "read",
         "source", "test", "type", "umask", "unalias", "unset",
@@ -86,15 +86,14 @@ fn command_completions(prefix: &str) -> Result<Vec<String>> {
     .collect::<Vec<_>>();
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {
-            let entries = match std::fs::read_dir(directory) {
+            let mut entries = match tokio::fs::read_dir(directory).await {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            for entry in entries {
-                let entry = entry?;
+            while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(prefix) && is_executable(&entry.path())? {
+                if name.starts_with(prefix) && is_executable(&entry.path()).await? {
                     completions.push(name);
                 }
             }
@@ -106,7 +105,7 @@ fn command_completions(prefix: &str) -> Result<Vec<String>> {
     Ok(completions)
 }
 
-fn path_completions(prefix: &str, workspace: &Path) -> Result<Vec<String>> {
+async fn path_completions(prefix: &str, workspace: &Path) -> Result<Vec<String>> {
     let (directory_prefix, name_prefix) = prefix
         .rsplit_once('/')
         .map_or(("", prefix), |(directory, name)| {
@@ -119,15 +118,20 @@ fn path_completions(prefix: &str, workspace: &Path) -> Result<Vec<String>> {
     };
 
     let mut completions = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.starts_with(name_prefix) {
             continue;
         }
 
         let mut completion = format!("{directory_prefix}{name}");
-        if entry.path().is_dir() {
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false);
+        if is_dir {
             completion.push('/');
         }
         completions.push(completion);
@@ -227,7 +231,7 @@ impl App {
         self.ui_state.input_cursor = self.input_buffer.len();
     }
 
-    pub fn complete_input(&mut self) -> Result<()> {
+    pub async fn complete_input(&mut self) -> Result<()> {
         let cursor = cursor_boundary(&self.input_buffer, self.ui_state.input_cursor);
         let (start, end) = input_token_bounds(&self.input_buffer, cursor);
         let token = &self.input_buffer[start..cursor];
@@ -260,10 +264,10 @@ impl App {
                 .map(str::to_string)
                 .collect())
             } else {
-                command_completions(token)
+                command_completions(token).await
             }
         } else {
-            path_completions(token, &self.session_meta.workspace_path())
+            path_completions(token, &self.session_meta.workspace_path()).await
         };
 
         let completions = match completions {
@@ -395,7 +399,7 @@ impl App {
                 self.insert_input_char(c);
             }
             KeyCode::Tab => {
-                self.complete_input()?;
+                self.complete_input().await?;
             }
             KeyCode::Backspace => {
                 self.ui_state.focus = crate::app::state::WindowFocus::Input;
@@ -499,7 +503,7 @@ impl App {
                 self.insert_input_char(c);
             }
             KeyCode::Tab => {
-                self.complete_input()?;
+                self.complete_input().await?;
             }
             KeyCode::Backspace => {
                 self.ui_state.focus = crate::app::state::WindowFocus::Input;
