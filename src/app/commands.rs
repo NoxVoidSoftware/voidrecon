@@ -292,6 +292,7 @@ impl App {
 
         // Reload sidebar
         self.reload_sidebar().await?;
+        self.refresh_exploit_cache().await;
 
         // Trigger post-execution analysis
         self.llm.post_exec_mode = true;

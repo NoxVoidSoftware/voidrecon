@@ -255,6 +255,10 @@ pub struct App {
 
     // Timing
     pub last_tick: Instant,
+
+    // Exploit files cache (avoid sync read_dir on every render frame)
+    pub exploit_files_cache: Vec<String>,
+    pub exploit_cache_time: Instant,
 }
 
 impl App {
@@ -344,6 +348,8 @@ impl App {
             command_run: CommandRunState::default(),
             mouse_capture_enabled: false,
             last_tick: Instant::now(),
+            exploit_files_cache: Vec::new(),
+            exploit_cache_time: Instant::now(),
         };
 
         // Dynamic model discovery on startup (fetch live models from provider if cache is empty or stale)
@@ -353,6 +359,7 @@ impl App {
         
         // Load sidebar
         app.reload_sidebar().await?;
+        app.refresh_exploit_cache().await;
         
         Ok(app)
     }
@@ -462,7 +469,44 @@ impl App {
         self.reload_sidebar().await?;
         self.ui_state.session_list = SessionMeta::list_sessions().await;
         self.add_notification(format!("Active session: {}", self.session_meta.name), NotifLevel::Info);
+        self.refresh_exploit_cache().await;
         Ok(())
+    }
+
+    /// Refresh the cached list of exploit scripts in the workspace.
+    ///
+    /// This performs the directory scan off the render path (async, spawned on
+    /// the tokio runtime) and stores the result in `exploit_files_cache` so the
+    /// sidebar renderer never touches the filesystem synchronously.
+    pub async fn refresh_exploit_cache(&mut self) {
+        let exploits_dir = self.session_meta.workspace_path().join("exploits");
+        let mut files = match tokio::fs::read_dir(&exploits_dir).await {
+            Ok(entries) => entries,
+            Err(_) => {
+                self.exploit_files_cache.clear();
+                self.exploit_cache_time = Instant::now();
+                return;
+            }
+        };
+
+        let mut exploit_files: Vec<String> = Vec::new();
+        while let Ok(Some(entry)) = files.next_entry().await {
+            let is_file = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_file())
+                .unwrap_or(false);
+            if !is_file {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".py") {
+                exploit_files.push(name);
+            }
+        }
+        exploit_files.sort();
+        self.exploit_files_cache = exploit_files;
+        self.exploit_cache_time = Instant::now();
     }
 }
 
