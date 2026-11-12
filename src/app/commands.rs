@@ -199,6 +199,7 @@ impl App {
     }
 
     pub fn handle_command_chunk(&mut self, request_id: u64, chunk: String) {
+        let _t = crate::app::perf::Timer::new("handle_command_chunk");
         if let Some((cur_id, _, _)) = &self.command_run.running {
             if *cur_id != request_id {
                 return;
@@ -319,6 +320,7 @@ impl App {
     }
 
     pub async fn execute_workspace_command(&mut self, cmd: &str) -> Result<()> {
+        let _t = crate::app::perf::Timer::new("execute_workspace_command_total");
         let cmd_str = cmd.trim().to_string();
         if cmd_str.is_empty() {
             return Ok(());

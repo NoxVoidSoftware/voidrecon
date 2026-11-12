@@ -631,6 +631,7 @@ impl App {
     }
 
     pub async fn send_llm_query(&mut self, query: &str) -> Result<()> {
+        let _t = crate::app::perf::Timer::new("send_llm_query_total");
         if self.llm_client.provider().requires_api_key() && self.config.api_key.trim().is_empty() {
             self.add_notification(
                 format!(
