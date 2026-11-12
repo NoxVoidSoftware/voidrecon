@@ -7,8 +7,31 @@ use crate::db::{Database, DatabaseQueries};
 use crate::tools::definitions::get_tool_definitions;
 use crate::llm::types::ToolCall;
 
-/// Execute a tool call and return the result
+/// Execute a tool call and return the result.
+///
+/// Tool execution performs blocking SQLite and filesystem I/O, so it runs on a
+/// blocking thread: the async event loop is never stalled and the database
+/// `MutexGuard` is never held across an `.await`.
 pub async fn execute_tool_call(
+    tool_call: &ToolCall,
+    db: &Database,
+    active_target_id: Option<i64>,
+    workspace_path: &std::path::Path,
+    app_tx: &tokio::sync::mpsc::UnboundedSender<crate::app::AppEvent>,
+) -> Result<Value> {
+    let tool_call = tool_call.clone();
+    let db = db.clone();
+    let workspace_path = workspace_path.to_path_buf();
+    let app_tx = app_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        execute_tool_call_blocking(&tool_call, &db, active_target_id, &workspace_path, &app_tx)
+    })
+    .await
+    .context("Tool execution task panicked")?
+}
+
+/// Synchronous tool execution body. Must only be called from a blocking context.
+fn execute_tool_call_blocking(
     tool_call: &ToolCall,
     db: &Database,
     active_target_id: Option<i64>,
@@ -252,11 +275,10 @@ pub async fn execute_tool_call(
             let bytes_written = script_code.len();
 
             // Run automated Python syntax validation via py_compile
-            let syntax_check = tokio::process::Command::new("python")
+            let syntax_check = std::process::Command::new("python")
                 .args(["-m", "py_compile", file_path.to_str().unwrap_or(raw_name)])
                 .current_dir(workspace_path)
-                .output()
-                .await;
+                .output();
 
             let (syntax_valid, syntax_error) = match syntax_check {
                 Ok(out) => {

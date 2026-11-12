@@ -499,6 +499,10 @@ impl Drop for PtyTab {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
+        // Close this handle to the slave side before joining the reader thread.
+        // Otherwise the parent keeps the PTY open and the master read never
+        // returns EOF/EIO, so `join()` below would block forever.
+        self._slave.take();
         if let Some(handle) = self._watcher_thread.take() {
             let _ = handle.join();
         }

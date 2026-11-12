@@ -1,6 +1,6 @@
 //! LLM conversation flow
 use crate::app::state::{App, NotifLevel};
-use crate::db::DatabaseQueries;
+use crate::db::{Database, DatabaseQueries};
 use crate::llm::types::ToolCall;
 use crate::llm::{
     build_system_prompt, parse_llm_response, ChatMessage, LlmProvider, LlmRequestState,
@@ -86,14 +86,17 @@ impl App {
     }
 
     /// Build per-target findings and important facts mirroring the sidebar.
+    ///
+    /// This performs blocking SQLite queries and must be called from a
+    /// `spawn_blocking` context, never directly on the async event loop.
     fn build_sidebar_context(
-        &self,
+        db: &Database,
         all_targets: &[crate::db::models::Target],
     ) -> Result<(
         Vec<(i64, Vec<crate::db::models::Finding>)>,
         Vec<(i64, Vec<crate::db::models::ImportantFact>)>,
     )> {
-        let conn = self.db.conn();
+        let conn = db.conn();
         let mut findings = Vec::with_capacity(all_targets.len());
         let mut facts = Vec::with_capacity(all_targets.len());
         for t in all_targets {
@@ -108,22 +111,49 @@ impl App {
     }
 
     async fn build_session_context_prompt(&self, suggest_next_step: bool) -> Result<String> {
-        let active_target = if let Some(id) = self.active_target_id {
-            DatabaseQueries::get_target(&self.db.conn(), id)?
-        } else {
-            None
-        };
-        let (recent_commands, command_count) = if let Some(target) = &active_target {
-            (
-                DatabaseQueries::get_recent_commands(&self.db.conn(), target.id, 3)?,
-                DatabaseQueries::get_command_count(&self.db.conn(), target.id)?,
-            )
-        } else {
-            (Vec::new(), 0)
-        };
-        let targets_count = DatabaseQueries::get_targets_count(&self.db.conn())?;
-        let all_targets = DatabaseQueries::get_all_targets(&self.db.conn())?;
-        let (all_findings, all_facts) = self.build_sidebar_context(&all_targets)?;
+        // All SQLite access for the prompt runs off the event loop. The prompt
+        // must not stall `?query` streaming on database I/O.
+        let db = self.db.clone();
+        let active_target_id = self.active_target_id;
+
+        let (
+            active_target,
+            recent_commands,
+            command_count,
+            targets_count,
+            all_targets,
+            all_findings,
+            all_facts,
+        ) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let conn = db.conn();
+            let active_target = if let Some(id) = active_target_id {
+                DatabaseQueries::get_target(&conn, id)?
+            } else {
+                None
+            };
+            let (recent_commands, command_count) = if let Some(target) = &active_target {
+                (
+                    DatabaseQueries::get_recent_commands(&conn, target.id, 3)?,
+                    DatabaseQueries::get_command_count(&conn, target.id)?,
+                )
+            } else {
+                (Vec::new(), 0)
+            };
+            let targets_count = DatabaseQueries::get_targets_count(&conn)?;
+            let all_targets = DatabaseQueries::get_all_targets(&conn)?;
+            let (all_findings, all_facts) = Self::build_sidebar_context(&db, &all_targets)?;
+            Ok((
+                active_target,
+                recent_commands,
+                command_count,
+                targets_count,
+                all_targets,
+                all_findings,
+                all_facts,
+            ))
+        })
+        .await
+        .context("Session context build task panicked")??;
 
         let mut prompt = build_system_prompt(
             &self.session_meta.name,
@@ -577,7 +607,7 @@ impl App {
                 new_log.push(summary_msg);
                 new_log.extend_from_slice(&self.llm.chat_log[split..]);
                 self.llm.chat_log = new_log;
-                self.save_chat_history();
+                self.save_chat_history().await;
                 self.add_notification(
                     "Conversation history compacted".to_string(),
                     NotifLevel::Info,
@@ -612,7 +642,7 @@ impl App {
             content: format!("? {}", query),
             tool_calls: None,
             tool_call_id: None,
-        });
+        }).await;
         self.ui_state.log_at_bottom = true;
 
         let Some(system_prompt) = self.context_prompt_or_notify(false).await else {
@@ -777,7 +807,7 @@ impl App {
         }
     }
 
-    pub fn handle_llm_request_failed(&mut self, request_id: u64, error: String) {
+    pub async fn handle_llm_request_failed(&mut self, request_id: u64, error: String) {
         if request_id == self.llm.request_id {
             self.llm.abort_handle = None;
             self.llm.request_state = LlmRequestState::Failed;
@@ -814,7 +844,7 @@ impl App {
                 content: format!("⚠️ LLM Request Failed: {}", error),
                 tool_calls: None,
                 tool_call_id: None,
-            });
+            }).await;
             self.ui_state.log_at_bottom = true;
         }
     }
@@ -1030,7 +1060,7 @@ impl App {
                 content: self.llm.response_buffer.clone(),
                 tool_calls: Some(tool_calls.clone()),
                 tool_call_id: None,
-            });
+            }).await;
 
             // Execute tool calls
             for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -1057,7 +1087,7 @@ impl App {
                             }).to_string(),
                             tool_calls: None,
                             tool_call_id: Some(deferred.id.clone()),
-                        });
+                        }).await;
                     }
                     return Ok(());
                 }
@@ -1127,12 +1157,18 @@ impl App {
                                     }
                                 }
                                 let target_id = self.active_target_id.unwrap_or(0);
+                                let db = self.db.clone();
                                 let target_ip = if target_id > 0 {
-                                    DatabaseQueries::get_target(&self.db.conn(), target_id)
-                                        .ok()
-                                        .flatten()
-                                        .map(|t| t.ip_host)
-                                        .unwrap_or_else(|| "target".to_string())
+                                    tokio::task::spawn_blocking(move || {
+                                        DatabaseQueries::get_target(&db.conn(), target_id)
+                                            .ok()
+                                            .flatten()
+                                            .map(|t| t.ip_host)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "target".to_string())
                                 } else {
                                     "active_target".to_string()
                                 };
@@ -1175,11 +1211,17 @@ impl App {
                         .or(self.active_target_id)
                         .unwrap_or(0);
                     let target_ip = if target_id > 0 {
-                        DatabaseQueries::get_target(&self.db.conn(), target_id)
-                            .ok()
-                            .flatten()
-                            .map(|t| t.ip_host)
-                            .unwrap_or_else(|| "target".to_string())
+                        let db = self.db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            DatabaseQueries::get_target(&db.conn(), target_id)
+                                .ok()
+                                .flatten()
+                                .map(|t| t.ip_host)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "target".to_string())
                     } else {
                         "active_target".to_string()
                     };
@@ -1249,7 +1291,12 @@ impl App {
                         .get("target_id")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
-                    let target = DatabaseQueries::get_target(&self.db.conn(), target_id)?;
+                    let db = self.db.clone();
+                    let target = tokio::task::spawn_blocking(move || {
+                        DatabaseQueries::get_target(&db.conn(), target_id)
+                    })
+                    .await
+                    .context("Target lookup task panicked")??;
                     if let Some(target) = target {
                         let script_name = result
                             .get("script_name")
@@ -1284,7 +1331,7 @@ impl App {
                             }).to_string(),
                             tool_calls: None,
                             tool_call_id: Some(tool_call.id.clone()),
-                        });
+                        }).await;
                         continue;
                     }
                 }
@@ -1295,7 +1342,7 @@ impl App {
                     content: result.to_string(),
                     tool_calls: None,
                     tool_call_id: Some(tool_call.id.clone()),
-                });
+                }).await;
             }
 
             // Reload sidebar to reflect any target/findings DB changes
@@ -1320,7 +1367,7 @@ impl App {
                 content: self.llm.response_buffer.clone(),
                 tool_calls: None,
                 tool_call_id: None,
-            });
+            }).await;
 
             // Check for new asset detection (simplified)
             if self.llm.response_buffer.to_lowercase().contains("detected") {
@@ -1342,7 +1389,7 @@ impl App {
                 content: content_display,
                 tool_calls: None,
                 tool_call_id: None,
-            });
+            }).await;
             if suggestion.command.is_some() {
                 self.llm.suggestion = Some(suggestion);
                 self.llm.suggestion_visible = true;

@@ -123,7 +123,7 @@ impl App {
                 }
             }
             ":sessions" => {
-                self.ui_state.session_list = crate::app::state::SessionMeta::list_sessions();
+                self.ui_state.session_list = crate::app::state::SessionMeta::list_sessions().await;
                 self.ui_state.session_picker_selected = 0;
                 self.ui_state.session_naming_mode = false;
                 self.ui_state.session_name_input.clear();
@@ -279,7 +279,7 @@ impl App {
             content: result.output.clone(),
             tool_calls: None,
             tool_call_id: None,
-        });
+        }).await;
         self.ui_state.log_at_bottom = true;
 
         if let Some(discovered_target_id) = parse_result {
@@ -317,7 +317,7 @@ impl App {
             content: format!("$ {}", cmd_str),
             tool_calls: None,
             tool_call_id: None,
-        });
+        }).await;
         self.ui_state.log_at_bottom = true;
 
         self.command_run.running = Some((req_id, cmd_str.clone(), Instant::now()));
@@ -520,7 +520,7 @@ impl App {
             content: format!("Started interactive command in tab {}: {}", tab.id, command),
             tool_calls: None,
             tool_call_id: None,
-        });
+        }).await;
         self.next_tab_id += 1;
         let label = tab.label.clone();
         self.tabs.push(tab);

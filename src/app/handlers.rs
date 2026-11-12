@@ -71,7 +71,7 @@ impl App {
                 Ok(true)
             }
             AppEvent::LlmRequestFailed(request_id, error) => {
-                self.handle_llm_request_failed(request_id, error);
+                self.handle_llm_request_failed(request_id, error).await;
                 Ok(true)
             }
             AppEvent::LlmDone(request_id) => {
@@ -246,7 +246,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(
                                         format!("Spawned listener on port {}", lport),
                                         NotifLevel::Info,
@@ -261,7 +261,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(
                                         format!("Failed to spawn listener: {}", e),
                                         NotifLevel::Error,
@@ -276,7 +276,7 @@ impl App {
                                 content: format!("$ {}", command_line),
                                 tool_calls: None,
                                 tool_call_id: None,
-                            });
+                            }).await;
 
                             let output_result = self.run_command_capture(command_line).await;
                             let duration_ms = start.elapsed().as_millis() as i64;
@@ -289,7 +289,7 @@ impl App {
                                         content: out.clone(),
                                         tool_calls: None,
                                         tool_call_id: None,
-                                    });
+                                    }).await;
 
                                     // Record command and output artifact in database
                                     let _ = DatabaseQueries::add_command(
@@ -322,7 +322,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(format!("Exploit executed ({})", script_name), NotifLevel::Info);
                                 }
                                 Err(e) => {
@@ -335,7 +335,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(format!("Exploit failed: {}", e), NotifLevel::Error);
                                 }
                             }
@@ -392,7 +392,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(format!("Approved & saved: {}", rel_path), NotifLevel::Info);
                                     let _ = self.reload_sidebar().await;
                                 }
@@ -405,7 +405,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(format!("Failed to save file: {}", e), NotifLevel::Error);
                                 }
                             }
@@ -446,7 +446,7 @@ impl App {
                                         content: result.to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(
                                         format!("Sent approved input to terminal tab {}", tab_id),
                                         NotifLevel::Info,
@@ -461,7 +461,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(
                                         format!("Failed to send terminal input: {}", error),
                                         NotifLevel::Error,
@@ -481,7 +481,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(
                                         format!("Closed terminal tab {}", tab_id),
                                         NotifLevel::Info,
@@ -496,7 +496,7 @@ impl App {
                                         }).to_string(),
                                         tool_calls: None,
                                         tool_call_id: Some(approval.tool_call.id),
-                                    });
+                                    }).await;
                                     self.add_notification(
                                         format!("Failed to close terminal tab: {}", error),
                                         NotifLevel::Error,
@@ -525,7 +525,7 @@ impl App {
                         }).to_string(),
                         tool_calls: None,
                         tool_call_id: Some(approval.tool_call.id),
-                    });
+                    }).await;
                     self.add_notification("Action rejected".to_string(), NotifLevel::Info);
                     self.continue_llm_conversation().await?;
                     return Ok(());
@@ -569,7 +569,7 @@ impl App {
         if matches!(self.llm.request_state, LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls) {
             if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
                 || key.code == KeyCode::Esc {
-                self.cancel_llm_request();
+                self.cancel_llm_request().await;
                 return Ok(());
             }
         }
@@ -641,7 +641,7 @@ impl App {
                         content: "⚠️ Command cancelled by user (Ctrl+C)".to_string(),
                         tool_calls: None,
                         tool_call_id: None,
-                    });
+                    }).await;
                     self.add_notification("Command cancelled".to_string(), NotifLevel::Warning);
                     return Ok(());
                 }
@@ -653,7 +653,7 @@ impl App {
                         content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
                         tool_calls: None,
                         tool_call_id: None,
-                    });
+                    }).await;
                     self.add_notification("LLM cancelled".to_string(), NotifLevel::Warning);
                     return Ok(());
                 }
@@ -890,7 +890,7 @@ impl App {
             content: table,
             tool_calls: None,
             tool_call_id: None,
-        });
+        }).await;
         Ok(())
     }
     
@@ -907,7 +907,7 @@ impl App {
                 content: output,
                 tool_calls: None,
                 tool_call_id: None,
-            });
+            }).await;
         }
         Ok(())
     }

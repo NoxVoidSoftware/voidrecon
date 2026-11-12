@@ -319,7 +319,7 @@ impl App {
                             },
                             tool_calls: None,
                             tool_call_id: None,
-                        });
+                        }).await;
                         self.add_notification("Sent input to running process".to_string(), NotifLevel::Info);
                     } else {
                         self.add_notification("Command is running (stdin closed). Press Ctrl+C to cancel.".to_string(), NotifLevel::Warning);

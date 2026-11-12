@@ -128,19 +128,28 @@ impl SessionMeta {
         self.path().join("chat_history.json")
     }
 
-    pub fn load_chat_history(&self) -> Vec<ChatMessage> {
+    pub async fn load_chat_history(&self) -> Vec<ChatMessage> {
         let p = self.chat_history_path();
-        if p.exists() {
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                if let Ok(msgs) = serde_json::from_str::<Vec<ChatMessage>>(&content) {
-                    return msgs;
-                }
-            }
+        match tokio::fs::read_to_string(&p).await {
+            Ok(content) => serde_json::from_str::<Vec<ChatMessage>>(&content).unwrap_or_default(),
+            Err(_) => Vec::new(),
         }
-        Vec::new()
     }
 
-    pub fn save_chat_history(&self, messages: &[ChatMessage]) -> Result<()> {
+    pub async fn save_chat_history(&self, messages: &[ChatMessage]) -> Result<()> {
+        if self.name.is_empty() || self.name == "None" {
+            return Ok(());
+        }
+        let p = self.chat_history_path();
+        let content = serde_json::to_string_pretty(messages)?;
+        tokio::fs::write(p, content).await?;
+        Ok(())
+    }
+
+    /// Synchronous fallback for shutdown (`Drop`), where the async runtime may
+    /// already be tearing down. Chat history is persisted asynchronously on every
+    /// append, so this is only a final safety net.
+    fn save_chat_history_blocking(&self, messages: &[ChatMessage]) -> Result<()> {
         if self.name.is_empty() || self.name == "None" {
             return Ok(());
         }
@@ -150,20 +159,21 @@ impl SessionMeta {
         Ok(())
     }
 
-    pub fn list_sessions() -> Vec<SessionMeta> {
+    pub async fn list_sessions() -> Vec<SessionMeta> {
         let dir = Self::sessions_dir();
-        if !dir.exists() {
-            return Vec::new();
-        }
         let mut list = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let meta_path = entry.path().join("session.json");
-                if meta_path.exists() {
-                    if let Ok(meta) = Self::load(&meta_path) {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            return list;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let meta_path = entry.path().join("session.json");
+            match tokio::fs::metadata(&meta_path).await {
+                Ok(metadata) if metadata.is_file() => {
+                    if let Ok(meta) = Self::load(&meta_path).await {
                         list.push(meta);
                     }
                 }
+                _ => {}
             }
         }
         list.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
@@ -258,7 +268,7 @@ impl App {
         // Initialize with in-memory database and placeholder session until user selects or creates a session
         let db = Database::in_memory().context("Failed to initialize temporary database")?;
         let session_meta = SessionMeta::new("None".to_string());
-        let session_list = SessionMeta::list_sessions();
+        let session_list = SessionMeta::list_sessions().await;
         
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         
@@ -352,7 +362,7 @@ impl App {
         self.llm.request_id
     }
 
-    pub fn cancel_llm_request(&mut self) {
+    pub async fn cancel_llm_request(&mut self) {
         if let Some(abort) = self.llm.abort_handle.take() {
             abort.abort();
         }
@@ -365,13 +375,13 @@ impl App {
             content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
             tool_calls: None,
             tool_call_id: None,
-        });
+        }).await;
         self.ui_state.log_at_bottom = true;
         self.add_notification("LLM generation cancelled".to_string(), NotifLevel::Info);
     }
 
-    pub fn save_chat_history(&self) {
-        let _ = self.session_meta.save_chat_history(&self.llm.chat_log);
+    pub async fn save_chat_history(&self) {
+        let _ = self.session_meta.save_chat_history(&self.llm.chat_log).await;
     }
 
     pub fn rebuild_cached_chat_lines(&mut self) {
@@ -382,12 +392,12 @@ impl App {
         }
     }
 
-    pub fn append_chat_message(&mut self, msg: ChatMessage) {
+    pub async fn append_chat_message(&mut self, msg: ChatMessage) {
         let lines = crate::ui::layout::format_chat_message(&msg, &self.config.active_model);
         self.llm.cached_chat_lines.extend(lines);
         self.llm.chat_log.push(msg);
         self.ui_state.log_at_bottom = true;
-        self.save_chat_history();
+        self.save_chat_history().await;
     }
 
     pub async fn delete_session(&mut self, session_name: &str) -> Result<()> {
@@ -408,7 +418,7 @@ impl App {
             tokio::fs::remove_dir_all(&dir).await?;
         }
 
-        self.ui_state.session_list = SessionMeta::list_sessions();
+        self.ui_state.session_list = SessionMeta::list_sessions().await;
         let total_rows = 1 + self.ui_state.session_list.len();
         if self.ui_state.session_picker_selected >= total_rows {
             self.ui_state.session_picker_selected = total_rows.saturating_sub(1);
@@ -419,18 +429,18 @@ impl App {
 
     pub async fn switch_session(&mut self, session_name: String) -> Result<()> {
         // Save current session chat history before switching
-        self.save_chat_history();
+        self.save_chat_history().await;
 
         let meta_path = SessionMeta::sessions_dir().join(&session_name).join("session.json");
         let session_meta = if meta_path.exists() {
-            let mut meta = SessionMeta::load(&meta_path)?;
+            let mut meta = SessionMeta::load(&meta_path).await?;
             meta.last_activity = Utc::now();
-            let _ = meta.save();
+            let _ = meta.save().await;
             meta
         } else {
             let meta = SessionMeta::new(session_name);
             tokio::fs::create_dir_all(&meta.path()).await?;
-            meta.save()?;
+            meta.save().await?;
             meta
         };
 
@@ -442,7 +452,7 @@ impl App {
         let _ = tokio::fs::create_dir_all(ws.join("exploits")).await;
 
         self.db = Database::new(&session_meta.db_path())?;
-        self.llm.chat_log = session_meta.load_chat_history();
+        self.llm.chat_log = session_meta.load_chat_history().await;
         self.rebuild_cached_chat_lines();
         self.session_meta = session_meta;
         self.tabs.clear();
@@ -450,7 +460,7 @@ impl App {
         self.active_target_id = None;
         self.ui_state.log_at_bottom = true;
         self.reload_sidebar().await?;
-        self.ui_state.session_list = SessionMeta::list_sessions();
+        self.ui_state.session_list = SessionMeta::list_sessions().await;
         self.add_notification(format!("Active session: {}", self.session_meta.name), NotifLevel::Info);
         Ok(())
     }
@@ -458,19 +468,20 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.save_chat_history();
+        // Shutdown-only safety net; the event loop is already gone at this point.
+        let _ = self.session_meta.save_chat_history_blocking(&self.llm.chat_log);
     }
 }
 
 impl SessionMeta {
-    pub fn save(&self) -> Result<()> {
+    pub async fn save(&self) -> Result<()> {
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(self.meta_path(), content)?;
+        tokio::fs::write(self.meta_path(), content).await?;
         Ok(())
     }
-    
-    pub fn load(path: &PathBuf) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+
+    pub async fn load(path: &PathBuf) -> Result<Self> {
+        let content = tokio::fs::read_to_string(path).await?;
         let meta: SessionMeta = serde_json::from_str(&content)?;
         Ok(meta)
     }
