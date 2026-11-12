@@ -17,23 +17,31 @@ use crate::ui::render_ui;
 impl App {
     pub async fn run<B: Backend>(&mut self, terminal: &mut ratatui::Terminal<B>) -> Result<()> {
         // Initial render
-        terminal.draw(|f| render_ui(f, self))?;
+        {
+            let _t = crate::app::perf::Timer::forced("render_initial");
+            terminal.draw(|f| render_ui(f, self))?;
+        }
         
         while !self.ui_state.should_quit {
             let Some(first_event) = self.event_rx.recv().await else {
                 break;
             };
             
-            let mut needs_render = self.handle_event(first_event).await?;
+            let mut needs_render = {
+                let _t = crate::app::perf::Timer::new("handle_event_first");
+                self.handle_event(first_event).await?
+            };
             
             // Drain and batch any already-queued events before drawing
             while let Ok(event) = self.event_rx.try_recv() {
+                let _t = crate::app::perf::Timer::new("handle_event_batched");
                 if self.handle_event(event).await? {
                     needs_render = true;
                 }
             }
             
             if needs_render && !self.ui_state.should_quit {
+                let _t = crate::app::perf::Timer::new("render_frame");
                 terminal.draw(|f| render_ui(f, self))?;
             }
         }
@@ -41,6 +49,7 @@ impl App {
     }
     
     async fn handle_event(&mut self, event: AppEvent) -> Result<bool> {
+        crate::app::perf::mark("event_received");
         match event {
             AppEvent::Key(key) => {
                 self.handle_key(key).await?;
@@ -760,7 +769,9 @@ impl App {
         let session_path = self.session_meta.path();
         let active_target_id = self.active_target_id;
 
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<SidebarNode>> {
+        let result = {
+            let _t = crate::app::perf::Timer::new("spawn_blocking_reload_sidebar");
+            tokio::task::spawn_blocking(move || -> Result<Vec<SidebarNode>> {
             let _ = DatabaseQueries::deduplicate_targets_and_findings(&db.conn());
             let targets = DatabaseQueries::get_all_targets(&db.conn())?;
             let mut nodes = Vec::new();
@@ -816,7 +827,8 @@ impl App {
             Ok(nodes)
         })
         .await
-        .context("Sidebar reload task panicked")??;
+        .context("Sidebar reload task panicked")??
+        };
 
         // Determine active target validity from the reloaded data
         if let Some(act_id) = active_target_id {

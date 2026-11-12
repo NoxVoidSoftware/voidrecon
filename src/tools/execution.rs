@@ -23,6 +23,7 @@ pub async fn execute_tool_call(
     let db = db.clone();
     let workspace_path = workspace_path.to_path_buf();
     let app_tx = app_tx.clone();
+    let _t = crate::app::perf::Timer::new("spawn_blocking_execute_tool_call");
     tokio::task::spawn_blocking(move || {
         execute_tool_call_blocking(&tool_call, &db, active_target_id, &workspace_path, &app_tx)
     })

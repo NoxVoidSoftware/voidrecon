@@ -55,6 +55,7 @@ impl App {
     }
     
     pub async fn handle_tick(&mut self) -> bool {
+        let _t = crate::app::perf::Timer::new("handle_tick");
         let now = Instant::now();
         let had_notifications = !self.notifications.is_empty();
         self.notifications.retain(|n| now.duration_since(n.created_at).as_secs() < 5);

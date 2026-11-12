@@ -263,7 +263,9 @@ impl App {
         let duration_ms = result.duration_ms;
 
         // Save to database with full output artifact (blocking SQLite I/O off the event loop)
-        let parse_result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+        let parse_result = {
+            let _t = crate::app::perf::Timer::new("spawn_blocking_command_completed_db");
+            tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
             let _ = DatabaseQueries::add_chat_message(&db.conn(), target_id, "user", &cmd);
             let _ = DatabaseQueries::add_chat_message(&db.conn(), target_id, "assistant", &output);
             let _ = DatabaseQueries::add_command(
@@ -285,7 +287,8 @@ impl App {
             )
         })
         .await
-        .context("Command completion DB task panicked")??;
+        .context("Command completion DB task panicked")??
+        };
 
         // Add output to chat log
         self.append_chat_message(ChatMessage {

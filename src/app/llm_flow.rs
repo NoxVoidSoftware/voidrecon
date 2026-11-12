@@ -124,7 +124,9 @@ impl App {
             all_targets,
             all_findings,
             all_facts,
-        ) = tokio::task::spawn_blocking(move || -> Result<_> {
+        ) = {
+            let _t = crate::app::perf::Timer::new("spawn_blocking_session_context_db");
+            tokio::task::spawn_blocking(move || -> Result<_> {
             let conn = db.conn();
             let active_target = if let Some(id) = active_target_id {
                 DatabaseQueries::get_target(&conn, id)?
@@ -153,22 +155,26 @@ impl App {
             ))
         })
         .await
-        .context("Session context build task panicked")??;
+        .context("Session context build task panicked")??
+        };
 
-        let mut prompt = build_system_prompt(
-            &self.session_meta.name,
-            &self.session_meta.created_at.to_rfc3339(),
-            targets_count,
-            &all_targets,
-            active_target.as_ref(),
-            &all_findings,
-            &all_facts,
-            &recent_commands,
-            command_count,
-            suggest_next_step,
-            Some(&self.session_meta.workspace_path()),
-        )
-        .await?;
+        let mut prompt = {
+            let _t = crate::app::perf::Timer::new("build_system_prompt_async");
+            build_system_prompt(
+                &self.session_meta.name,
+                &self.session_meta.created_at.to_rfc3339(),
+                targets_count,
+                &all_targets,
+                active_target.as_ref(),
+                &all_findings,
+                &all_facts,
+                &recent_commands,
+                command_count,
+                suggest_next_step,
+                Some(&self.session_meta.workspace_path()),
+            )
+            .await?
+        };
         prompt.push_str(&format!(
             "\n\n## Open Terminal Tabs\nTab 0: Workspace & LLM [{}].",
             if self.active_tab == 0 { "active" } else { "inactive" }

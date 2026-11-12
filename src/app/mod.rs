@@ -9,6 +9,7 @@ pub mod shell_input;
 pub mod commands;
 pub mod llm_flow;
 pub mod pty_control;
+pub mod perf;
 
 pub use state::*;
 pub use events::*;
