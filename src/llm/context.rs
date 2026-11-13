@@ -315,14 +315,17 @@ pub const POST_EXEC_PROMPT: &str = r#"Analyze the command output in the context 
 pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSuggestion> {
     let mut text = response.trim();
 
-    // Strip </think>... if present (reasoning models)
+    // Strip <think>...</think> if present (reasoning models)
     let cleaned_text;
-    if let Some(think_start) = text.find("</think>") {
-        if let Some(think_end) = text.find("</think>") {
+    if let Some(think_end) = text.find("</think>") {
+        if let Some(think_start) = text.find("<think>") {
             if think_end > think_start {
                 cleaned_text = format!("{}{}", &text[..think_start], &text[think_end + 8..]);
                 text = cleaned_text.trim();
             }
+        } else {
+            cleaned_text = text[think_end + 8..].to_string();
+            text = cleaned_text.trim();
         }
     }
 
