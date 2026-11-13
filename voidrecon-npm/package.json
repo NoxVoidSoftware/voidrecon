@@ -1,0 +1,53 @@
+{
+  "name": "voidrecon",
+  "type": "module",
+  "version": "0.1.1",
+  "description": "Production-grade interactive TUI terminal for security auditing, CLI workflows, and LLM-assisted terminal operations. Wrapper for native Rust binary.",
+  "main": "index.js",
+  "bin": {
+    "voidrecon": "index.js"
+  },
+  "files": [
+    "index.js",
+    "bin/voidrecon",
+    "scripts/postinstall.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "prepare": "node scripts/postinstall.js"
+  },
+  "dependencies": {
+    "tar": "^7.4.0",
+    "unzipper": "^0.12.0"
+  },
+  "keywords": [
+    "tui",
+    "terminal",
+    "security",
+    "pentesting",
+    "llm",
+    "rust"
+  ],
+  "author": "NoxVoid Software",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NoxVoidSoftware/voidrecon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NoxVoidSoftware/voidrecon/issues"
+  },
+  "homepage": "https://github.com/NoxVoidSoftware/voidrecon#readme"
+}
