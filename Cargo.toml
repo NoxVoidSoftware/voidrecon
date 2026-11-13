@@ -1,6 +1,6 @@
 [package]
 name = "voidrecon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Production-grade interactive TUI terminal application for security auditing, CLI workflows, and LLM-assisted terminal operations. Developed under NoxVoid Software."
 authors = ["NoxVoid Software"]
