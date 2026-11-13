@@ -292,6 +292,11 @@ fn llm_response_parsing_still_handles_json_and_mixed_output() {
         parse_llm_response(r#"{"command": null, "explanation": "No command is needed"}"#).unwrap();
     assert!(null_command.command.is_none());
     assert_eq!(null_command.explanation, "No command is needed");
+
+    let with_think =
+        parse_llm_response("<think>Internal reasoning steps</think>Here is the analysis.").unwrap();
+    assert!(with_think.command.is_none());
+    assert_eq!(with_think.explanation, "Here is the analysis.");
 }
 
 #[tokio::test]
@@ -311,4 +316,20 @@ async fn chat_history_handles_large_non_ascii_output() {
         .is_char_boundary(messages[0].content.len()));
     assert!(messages[0].content.ends_with("END\""));
     assert!(messages[0].content.contains("[truncated]"));
+}
+
+#[tokio::test]
+async fn build_session_context_prompt_does_not_deadlock() {
+    let app = App::new().await.expect("App::new failed");
+    let prompt = app
+        .build_session_context_prompt(false)
+        .await
+        .expect("build_session_context_prompt failed");
+    assert!(prompt.contains("Session:"));
+
+    let prompt_next = app
+        .build_session_context_prompt(true)
+        .await
+        .expect("build_session_context_prompt with next step failed");
+    assert!(prompt_next.contains("Session:"));
 }

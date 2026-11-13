@@ -1,6 +1,6 @@
 //! LLM conversation flow
 use crate::app::state::{App, NotifLevel};
-use crate::db::{Database, DatabaseQueries};
+use crate::db::DatabaseQueries;
 use crate::llm::types::ToolCall;
 use crate::llm::{
     build_system_prompt, parse_llm_response, ChatMessage, LlmProvider, LlmRequestState,
@@ -90,19 +90,18 @@ impl App {
     /// This performs blocking SQLite queries and must be called from a
     /// `spawn_blocking` context, never directly on the async event loop.
     fn build_sidebar_context(
-        db: &Database,
+        conn: &rusqlite::Connection,
         all_targets: &[crate::db::models::Target],
     ) -> Result<(
         Vec<(i64, Vec<crate::db::models::Finding>)>,
         Vec<(i64, Vec<crate::db::models::ImportantFact>)>,
     )> {
-        let conn = db.conn();
         let mut findings = Vec::with_capacity(all_targets.len());
         let mut facts = Vec::with_capacity(all_targets.len());
         for t in all_targets {
-            let f = DatabaseQueries::get_findings_for_target(&conn, t.id)
+            let f = DatabaseQueries::get_findings_for_target(conn, t.id)
                 .with_context(|| format!("Failed to load findings for target {}", t.id))?;
-            let fa = DatabaseQueries::get_important_facts(&conn, t.id)
+            let fa = DatabaseQueries::get_important_facts(conn, t.id)
                 .with_context(|| format!("Failed to load important facts for target {}", t.id))?;
             findings.push((t.id, f));
             facts.push((t.id, fa));
@@ -110,7 +109,7 @@ impl App {
         Ok((findings, facts))
     }
 
-    async fn build_session_context_prompt(&self, suggest_next_step: bool) -> Result<String> {
+    pub async fn build_session_context_prompt(&self, suggest_next_step: bool) -> Result<String> {
         // All SQLite access for the prompt runs off the event loop. The prompt
         // must not stall `?query` streaming on database I/O.
         let db = self.db.clone();
@@ -141,7 +140,7 @@ impl App {
             };
             let targets_count = DatabaseQueries::get_targets_count(&conn)?;
             let all_targets = DatabaseQueries::get_all_targets(&conn)?;
-            let (all_findings, all_facts) = Self::build_sidebar_context(&db, &all_targets)?;
+            let (all_findings, all_facts) = Self::build_sidebar_context(&conn, &all_targets)?;
             Ok((
                 active_target,
                 recent_commands,

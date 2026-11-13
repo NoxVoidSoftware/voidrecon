@@ -307,12 +307,12 @@ impl LlmClient {
         let mut line_buffer = String::new();
 
         use futures_util::StreamExt;
-        while let Some(chunk_result) = stream.next().await {
+        'stream_loop: while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(crate::app::AppEvent::LlmRequestFailed(request_id, format!("Stream chunk error: {}", e)));
-                    break;
+                    break 'stream_loop;
                 }
             };
             line_buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -323,7 +323,7 @@ impl LlmClient {
                 if let Some(data) = trimmed.strip_prefix("data:") {
                     let data = data.trim();
                     if data == "[DONE]" {
-                        break;
+                        break 'stream_loop;
                     }
                     if let Ok(stream_chunk) = serde_json::from_str::<StreamChunk>(data) {
                         for choice in stream_chunk.choices {
@@ -372,6 +372,9 @@ impl LlmClient {
                                         }
                                     }
                                 }
+                            }
+                            if choice.finish_reason.is_some() {
+                                break 'stream_loop;
                             }
                         }
                     } else if let Ok(err_val) = serde_json::from_str::<serde_json::Value>(data) {
