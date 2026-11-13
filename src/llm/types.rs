@@ -152,8 +152,9 @@ pub struct StreamToolFunction {
 
 
 /// LLM request state tracking
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LlmRequestState {
+    #[default]
     Idle,
     Streaming,
     ProcessingToolCalls,
@@ -166,6 +167,8 @@ pub enum LlmRequestState {
 pub struct LlmSuggestion {
     pub command: Option<String>,
     pub explanation: String,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl LlmSuggestion {

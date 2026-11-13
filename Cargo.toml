@@ -33,10 +33,6 @@ anyhow = "1.0"
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.7", features = ["v4", "serde", "fast-rng"] }
-lazy_static = "1.4"
-parking_lot = "0.12"
-notify = "6.1"
-tempfile = "3.8"
 futures-util = "0.3"
 sha2 = "0.10"
 which = "6.0"

@@ -61,7 +61,8 @@ Press `F1`, `Alt+H`, or `Ctrl+H` to open the in-app help.
 | `F2` | Open model picker |
 | `F3` | Open a new shell tab |
 | `F4` / `Alt+M` | Toggle mouse mode |
-| `Tab` / `Shift+Tab` | Cycle tabs |
+| `Tab` | Complete commands and paths in the workspace prompt; shell tabs use native shell completion |
+| `Shift+Tab` | Cycle backward through workspace panes and shell tabs |
 | `Esc` | Return to the workspace or dismiss the active view |
 | `Ctrl+L` | Enter LLM query mode |
 | `Ctrl+C` | Abort a running command or LLM request |

@@ -46,15 +46,32 @@ CREATE TABLE IF NOT EXISTS chat_history (
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS important_facts (
+    id INTEGER PRIMARY KEY,
+    target_id INTEGER NOT NULL REFERENCES targets(id),
+    fact TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_findings_target ON findings(target_id);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_commands_target ON commands(target_id);
 CREATE INDEX IF NOT EXISTS idx_commands_executed ON commands(executed_at);
 CREATE INDEX IF NOT EXISTS idx_chat_target ON chat_history(target_id);
+CREATE INDEX IF NOT EXISTS idx_facts_target ON important_facts(target_id);
 ";
 
 /// Migration SQL for future schema versions
-pub const MIGRATIONS: &[&str] = &[];
+pub const MIGRATIONS: &[&str] = &[
+    // v2: important facts
+    "CREATE TABLE IF NOT EXISTS important_facts (
+        id INTEGER PRIMARY KEY,
+        target_id INTEGER NOT NULL REFERENCES targets(id),
+        fact TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_facts_target ON important_facts(target_id);",
+];
 
 /// Initialize database with schema and run migrations
 pub fn init_database(conn: &rusqlite::Connection) -> anyhow::Result<()> {

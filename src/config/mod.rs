@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use dirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
+
+const DEFAULT_CONTEXT_LENGTH: u32 = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -131,6 +132,8 @@ pub struct Config {
     pub models_cache: Vec<ModelInfo>,
     #[serde(default)]
     pub models_cache_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub learned_context_lengths: HashMap<String, u32>,
 }
 
 impl ModelInfo {
@@ -157,24 +160,29 @@ impl Default for Config {
             active_model: String::new(),
             models_cache: Vec::new(),
             models_cache_updated_at: None,
+            learned_context_lengths: HashMap::new(),
         }
     }
 }
 
 impl Config {
-    pub fn config_path() -> Result<PathBuf> {
+    pub async fn config_path() -> Result<PathBuf> {
         let home = dirs::home_dir().context("Could not find user home directory")?;
         let config_dir = home.join(".config").join("voidrecon");
-        fs::create_dir_all(&config_dir).context("Failed to create config directory ~/.config/voidrecon")?;
+        tokio::fs::create_dir_all(&config_dir)
+            .await
+            .context("Failed to create config directory ~/.config/voidrecon")?;
         Ok(config_dir.join("config.json"))
     }
 
-    pub fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-        if !path.exists() {
+    pub async fn load() -> Result<Self> {
+        let path = Self::config_path().await?;
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(Self::default());
         }
-        let content = fs::read_to_string(&path).context("Failed to read config file")?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .context("Failed to read config file")?;
         let mut config: Config = serde_json::from_str(&content).context("Failed to parse config JSON")?;
         if !config.api_key.trim().is_empty() && !config.provider_keys.contains_key(&config.provider) {
             config.provider_keys.insert(config.provider, config.api_key.clone());
@@ -188,10 +196,12 @@ impl Config {
         Ok(config)
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
+    pub async fn save(&self) -> Result<()> {
+        let path = Self::config_path().await?;
         let content = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(&path, content).context("Failed to write config file")?;
+        tokio::fs::write(&path, content)
+            .await
+            .context("Failed to write config file")?;
         Ok(())
     }
 
@@ -202,6 +212,41 @@ impl Config {
             self.models_cache.as_slice()
         } else {
             &[]
+        }
+    }
+
+    pub fn context_limit_key(provider: ProviderKind, model: &str) -> String {
+        format!("{}:{}", provider.as_str(), model)
+    }
+
+    pub fn context_limit_for(&self, provider: ProviderKind, model: &str) -> u32 {
+        self.learned_context_lengths
+            .get(&Self::context_limit_key(provider, model))
+            .copied()
+            .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+    }
+
+    pub fn compaction_threshold_for(&self, provider: ProviderKind, model: &str) -> u32 {
+        let key = Self::context_limit_key(provider, model);
+        self.learned_context_lengths
+            .get(&key)
+            .map(|limit| limit.saturating_mul(80) / 100)
+            .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+    }
+
+    pub fn record_context_limit(&mut self, key: String, observed_limit: u32) -> bool {
+        use std::collections::hash_map::Entry;
+
+        match self.learned_context_lengths.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(observed_limit);
+                true
+            }
+            Entry::Occupied(mut entry) if observed_limit < *entry.get() => {
+                entry.insert(observed_limit);
+                true
+            }
+            Entry::Occupied(_) => false,
         }
     }
 
