@@ -77,13 +77,7 @@ impl App {
                 }
             }
             ":models" | ":model" => {
-                self.ui_state.model_picker_provider = self.config.provider;
-                self.ui_state.model_picker_selected = 0;
-                self.ui_state.model_picker_search.clear();
-                if self.config.get_models_for_provider(self.config.provider).is_empty() {
-                    self.trigger_fetch_models();
-                }
-                self.ui_state.show_model_picker = true;
+                self.open_model_picker();
             }
             ":provider" | ":providers" => {
                 if parts.len() > 1 {
@@ -288,12 +282,7 @@ impl App {
         .context("Command completion DB task panicked")??;
 
         // Add output to chat log
-        self.append_chat_message(ChatMessage {
-            role: "output".to_string(),
-            content: result.output.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-        }).await;
+        self.append_chat_message(ChatMessage::output(result.output.clone())).await;
         self.ui_state.log_at_bottom = true;
 
         if let Some(discovered_target_id) = parse_result {
@@ -327,12 +316,7 @@ impl App {
         let req_id = self.next_request_id();
 
         // Add to chat log
-        self.append_chat_message(ChatMessage {
-            role: "user".to_string(),
-            content: format!("$ {}", cmd_str),
-            tool_calls: None,
-            tool_call_id: None,
-        }).await;
+        self.append_chat_message(ChatMessage::user(format!("$ {}", cmd_str))).await;
         self.ui_state.log_at_bottom = true;
 
         self.command_run.running = Some((req_id, cmd_str.clone(), Instant::now()));
@@ -530,12 +514,7 @@ impl App {
             self.event_tx.clone(),
             self.pty_dimensions(),
         )?;
-        self.append_chat_message(ChatMessage {
-            role: "user".to_string(),
-            content: format!("Started interactive command in tab {}: {}", tab.id, command),
-            tool_calls: None,
-            tool_call_id: None,
-        }).await;
+        self.append_chat_message(ChatMessage::user(format!("Started interactive command in tab {}: {}", tab.id, command))).await;
         self.next_tab_id += 1;
         let label = tab.label.clone();
         self.tabs.push(tab);

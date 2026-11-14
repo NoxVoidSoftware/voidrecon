@@ -1,8 +1,13 @@
-//! PTY control
+//! PTY tab lifecycle, sizing, and key translation
 use crate::app::state::{App, NotifLevel};
 use crate::llm::LlmRequestState;
+use crate::pty::tab::PtyTab;
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Instant;
+
+/// Width of the expanded sidebar in terminal columns.
+const SIDEBAR_WIDTH: u16 = 40;
 
 impl App {
     pub async fn handle_pty_data(&mut self, _tab_id: usize, _data: Vec<u8>) -> Result<()> {
@@ -93,14 +98,98 @@ impl App {
         Ok(())
     }
 
+    /// Columns currently taken by the sidebar (0 when collapsed).
+    pub fn sidebar_width(&self) -> u16 {
+        if self.ui_state.sidebar_collapsed {
+            0
+        } else {
+            SIDEBAR_WIDTH
+        }
+    }
+
     pub fn pty_dimensions(&self) -> (u16, u16) {
         let (term_cols, term_rows) = self.terminal_size;
-        let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
         (
-            term_cols.saturating_sub(sidebar_width).max(20),
+            term_cols.saturating_sub(self.sidebar_width()).max(20),
             term_rows.saturating_sub(3).max(5),
         )
     }
 
+    /// Id of the terminal tab that currently has focus, if any.
+    pub fn active_terminal_tab_id(&self) -> Option<usize> {
+        self.active_tab
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.id)
+    }
 
+    pub async fn new_shell_tab(&mut self) -> Result<()> {
+        let tab = PtyTab::new_shell(
+            self.next_tab_id,
+            self.event_tx.clone(),
+            self.pty_dimensions(),
+        )?;
+        self.next_tab_id += 1;
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len(); // switch focus to the new shell tab (Tab 1..N)
+        Ok(())
+    }
+    
+    pub async fn spawn_listener_tab(&mut self, lport: u16) -> Result<()> {
+        let tab = PtyTab::new_listener(
+            self.next_tab_id,
+            lport,
+            self.event_tx.clone(),
+            self.pty_dimensions(),
+        )?;
+        self.next_tab_id += 1;
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len(); // switch focus to the listener tab
+        Ok(())
+    }
+    
+    pub async fn close_current_shell(&mut self) -> Result<()> {
+        if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
+            self.tabs.remove(self.active_tab - 1);
+            if self.active_tab > self.tabs.len() {
+                self.active_tab = self.tabs.len();
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Convert crossterm KeyEvent to raw terminal bytes for PTY master stream
+pub(super) fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let ascii = (c as u8).to_ascii_uppercase();
+                if (b'@'..=b'_').contains(&ascii) {
+                    Some(vec![ascii - b'@'])
+                } else {
+                    None
+                }
+            } else {
+                let mut b = [0u8; 4];
+                let s = c.encode_utf8(&mut b);
+                Some(s.as_bytes().to_vec())
+            }
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![8]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Esc => Some(vec![27]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        _ => None,
+    }
+}
+

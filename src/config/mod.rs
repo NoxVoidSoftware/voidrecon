@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use dirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;

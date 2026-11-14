@@ -31,12 +31,7 @@ pub fn strip_ansi_escapes(s: &str) -> String {
                 Some('(') | Some(')') => {
                     chars.next();
                 }
-                Some(other) => {
-                    if !(0x40..=0x7E).contains(&(other as u32)) {
-                        // ignore
-                    }
-                }
-                None => {}
+                Some(_) | None => {}
             }
         } else if c == '\t' {
             out.push_str("    ");
@@ -150,7 +145,7 @@ pub fn calculate_line_wrapped_rows(line_text: &str, max_width: usize) -> usize {
         let word_width = word.width();
         if word_width == 0 {
             // space
-            if current_row_width + 1 <= max_width {
+            if current_row_width < max_width {
                 current_row_width += 1;
             } else {
                 rows += 1;

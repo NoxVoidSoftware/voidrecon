@@ -4,6 +4,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use anyhow::Result;
 
 impl App {
+    /// Opens the model picker on the active provider, fetching its model
+    /// list first if none is cached.
+    pub fn open_model_picker(&mut self) {
+        self.ui_state.model_picker_provider = self.config.provider;
+        self.ui_state.model_picker_selected = 0;
+        self.ui_state.model_picker_search.clear();
+        if self.config.get_models_for_provider(self.config.provider).is_empty() {
+            self.trigger_fetch_models();
+        }
+        self.ui_state.show_model_picker = true;
+    }
+
     pub async fn handle_model_picker_key(&mut self, key: KeyEvent) -> Result<()> {
         let provider = self.ui_state.model_picker_provider;
         let models_count = if self.ui_state.model_picker_free_only {

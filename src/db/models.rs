@@ -26,6 +26,32 @@ pub struct Finding {
     pub created_at: DateTime<Utc>,
 }
 
+/// Fields for inserting a finding. `confidence` defaults to 100 when `None`.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFinding<'a> {
+    pub target_id: i64,
+    pub title: &'a str,
+    pub description: &'a str,
+    pub severity: &'a str,
+    pub source_cmd: Option<&'a str>,
+    pub confidence: Option<i32>,
+    pub evidence_path: Option<&'a str>,
+}
+
+impl<'a> NewFinding<'a> {
+    pub fn new(target_id: i64, title: &'a str, description: &'a str, severity: &'a str) -> Self {
+        Self {
+            target_id,
+            title,
+            description,
+            severity,
+            source_cmd: None,
+            confidence: None,
+            evidence_path: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
     pub id: i64,

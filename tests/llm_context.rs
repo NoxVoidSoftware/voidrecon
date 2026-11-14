@@ -3,7 +3,8 @@ use voidrecon::app::App;
 use voidrecon::config::{Config, ProviderKind};
 use voidrecon::db::models::{Command, Target};
 use voidrecon::llm::{
-    build_system_prompt, parse_llm_response, ChatMessage, ToolCall, ToolFunction,
+    build_system_prompt, parse_llm_response, ChatMessage, SystemPromptContext, ToolCall,
+    ToolFunction,
 };
 use voidrecon::tools::get_tool_definitions;
 
@@ -151,19 +152,19 @@ async fn system_prompt_includes_recent_commands_and_notes_as_data() {
         duration_ms: Some(250),
         executed_at: Utc::now(),
     };
-    let prompt = build_system_prompt(
-        "test",
-        "2026-01-01T00:00:00Z",
-        1,
-        &[target.clone()],
-        Some(&target),
-        &[(target.id, Vec::new())],
-        &[(target.id, Vec::new())],
-        &[command],
-        1,
-        false,
-        None,
-    )
+    let prompt = build_system_prompt(SystemPromptContext {
+        session_name: "test",
+        session_created: "2026-01-01T00:00:00Z",
+        targets_count: 1,
+        all_targets: std::slice::from_ref(&target),
+        active_target: Some(&target),
+        all_findings: &[(target.id, Vec::new())],
+        all_facts: &[(target.id, Vec::new())],
+        recent_commands: &[command],
+        command_count: 1,
+        suggest_next_step: false,
+        workspace_path: None,
+    })
     .await
     .unwrap();
 
@@ -176,19 +177,19 @@ async fn system_prompt_includes_recent_commands_and_notes_as_data() {
 #[tokio::test]
 async fn malformed_target_ports_are_reported() {
     let target = target(Some("not-json".to_string()), None);
-    let error = build_system_prompt(
-        "test",
-        "2026-01-01T00:00:00Z",
-        1,
-        &[target.clone()],
-        Some(&target),
-        &[],
-        &[],
-        &[],
-        0,
-        false,
-        None,
-    )
+    let error = build_system_prompt(SystemPromptContext {
+        session_name: "test",
+        session_created: "2026-01-01T00:00:00Z",
+        targets_count: 1,
+        all_targets: std::slice::from_ref(&target),
+        active_target: Some(&target),
+        all_findings: &[],
+        all_facts: &[],
+        recent_commands: &[],
+        command_count: 0,
+        suggest_next_step: false,
+        workspace_path: None,
+    })
     .await
     .unwrap_err();
     assert!(error
@@ -332,4 +333,56 @@ async fn build_session_context_prompt_does_not_deadlock() {
         .await
         .expect("build_session_context_prompt with next step failed");
     assert!(prompt_next.contains("Session:"));
+}
+
+#[tokio::test]
+async fn listener_approval_keeps_tool_cycle_complete() {
+    let mut app = App::new().await.expect("App::new failed");
+    let call = |id: &str, name: &str, arguments: &str| ToolCall {
+        id: id.to_string(),
+        call_type: "function".to_string(),
+        function: ToolFunction {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    };
+    let request_id = app.next_request_id();
+    app.llm.pending_tool_calls = vec![
+        call(
+            "call-listener",
+            "run_command",
+            r#"{"command": "nc -lvnp 4444", "explanation": "Catch the reverse shell"}"#,
+        ),
+        call("call-after", "list_terminal_tabs", "{}"),
+    ];
+
+    app.handle_llm_done(request_id)
+        .await
+        .expect("handle_llm_done failed");
+
+    // The listener waits for approval: its result is not written yet, and the
+    // call after it is answered as not executed instead of being left open.
+    assert!(app.pending_exploit_approval.is_some());
+    let tool_results: Vec<_> = app
+        .llm
+        .chat_log
+        .iter()
+        .filter(|message| message.role == "tool")
+        .collect();
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0].tool_call_id.as_deref(), Some("call-after"));
+    assert!(tool_results[0].content.contains("not_executed"));
+
+    // Once the approval outcome is recorded, the LLM sees the whole turn,
+    // including that outcome.
+    app.llm.chat_log.push(ChatMessage::tool_result(
+        "call-listener",
+        r#"{"status":"rejected"}"#,
+    ));
+    let messages = app.build_chat_messages();
+    assert_eq!(messages.len(), 3);
+    assert!(messages
+        .iter()
+        .any(|message| message.tool_call_id.as_deref() == Some("call-listener")
+            && message.content.contains("rejected")));
 }

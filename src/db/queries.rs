@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::db::models::{Command, Finding, ImportantFact, Target};
+use crate::db::models::{Command, Finding, ImportantFact, NewFinding, Target};
 
 /// Parse datetime from SQLite TEXT
 fn parse_datetime(s: &str) -> DateTime<Utc> {
@@ -117,7 +117,7 @@ impl DatabaseQueries {
         conn.query_row(
             "SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets WHERE id = ?1",
             params![id],
-            |row| Self::row_to_target(row),
+            Self::row_to_target,
         )
         .optional()
         .context("Failed to query target")
@@ -128,7 +128,7 @@ impl DatabaseQueries {
         conn.query_row(
             "SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets WHERE LOWER(ip_host) = ?1 OR LOWER(ip_host) = ?2 LIMIT 1",
             params![ip_host.to_lowercase(), normalized],
-            |row| Self::row_to_target(row),
+            Self::row_to_target,
         )
         .optional()
         .context("Failed to query target by IP")
@@ -139,7 +139,7 @@ impl DatabaseQueries {
             .prepare("SELECT id, ip_host, ports_json, metadata_json, notes, created_at FROM targets ORDER BY created_at DESC")
             .context("Failed to prepare query")?;
         let targets = stmt
-            .query_map([], |row| Self::row_to_target(row))
+            .query_map([], Self::row_to_target)
             .context("Failed to query targets")?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to collect targets")?;
@@ -169,16 +169,16 @@ impl DatabaseQueries {
     }
 
     // Finding operations
-    pub fn add_finding(
-        conn: &Connection,
-        target_id: i64,
-        title: &str,
-        description: &str,
-        severity: &str,
-        source_cmd: Option<&str>,
-        confidence: Option<i32>,
-        evidence_path: Option<&str>,
-    ) -> Result<i64> {
+    pub fn add_finding(conn: &Connection, finding: &NewFinding<'_>) -> Result<i64> {
+        let NewFinding {
+            target_id,
+            title,
+            description,
+            severity,
+            source_cmd,
+            confidence,
+            evidence_path,
+        } = *finding;
         let title_clean = title.trim();
         let description = truncate(description, 200);
         let confidence = confidence.unwrap_or(100).clamp(0, 100);
@@ -215,7 +215,7 @@ impl DatabaseQueries {
     }
 
     pub fn add_note(conn: &Connection, target_id: i64, text: &str) -> Result<i64> {
-        Self::add_finding(conn, target_id, "note", text, "info", None, Some(100), None)
+        Self::add_finding(conn, &NewFinding::new(target_id, "note", text, "info"))
     }
 
     // Important facts operations
@@ -312,7 +312,7 @@ impl DatabaseQueries {
             )
             .context("Failed to prepare query")?;
         let findings = stmt
-            .query_map(params![target_id], |row| Self::row_to_finding(row))
+            .query_map(params![target_id], Self::row_to_finding)
             .context("Failed to query findings")?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to collect findings")?;
@@ -326,7 +326,7 @@ impl DatabaseQueries {
             )
             .context("Failed to prepare query")?;
         let findings = stmt
-            .query_map([], |row| Self::row_to_finding(row))
+            .query_map([], Self::row_to_finding)
             .context("Failed to query all findings")?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to collect all findings")?;
@@ -381,7 +381,7 @@ impl DatabaseQueries {
             )
             .context("Failed to prepare query")?;
         let commands = stmt
-            .query_map(params![target_id, limit as i64], |row| Self::row_to_command(row))
+            .query_map(params![target_id, limit as i64], Self::row_to_command)
             .context("Failed to query commands")?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to collect commands")?;
@@ -774,8 +774,14 @@ Nmap done: 1 IP address (1 host up) scanned in 16.65 seconds
         conn.execute("INSERT INTO targets (ip_host) VALUES ('http://unclaimed.htb/')", []).unwrap();
         let id2 = conn.last_insert_rowid();
 
-        DatabaseQueries::add_finding(&conn, id1, "SQLi in /ask", "SQL Injection", "critical", None, Some(90), None).unwrap();
-        DatabaseQueries::add_finding(&conn, id2, "SQLi in /ask", "Duplicate finding", "critical", None, Some(95), None).unwrap();
+        DatabaseQueries::add_finding(
+            &conn,
+            &NewFinding { confidence: Some(90), ..NewFinding::new(id1, "SQLi in /ask", "SQL Injection", "critical") },
+        ).unwrap();
+        DatabaseQueries::add_finding(
+            &conn,
+            &NewFinding { confidence: Some(95), ..NewFinding::new(id2, "SQLi in /ask", "Duplicate finding", "critical") },
+        ).unwrap();
 
         DatabaseQueries::deduplicate_targets_and_findings(&conn).unwrap();
 

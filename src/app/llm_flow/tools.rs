@@ -1,0 +1,444 @@
+//! Dispatch of LLM tool calls: terminal-tab tools, approval requests, and
+//! post-processing of tool results.
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+use crate::app::state::{App, ApprovalKind, ExploitApproval, NotifLevel};
+use crate::db::DatabaseQueries;
+use crate::llm::types::{LlmSuggestion, ToolCall};
+use crate::llm::ChatMessage;
+use crate::pty::tab::PtyTab;
+
+/// Whether the tool loop may move on to the next call or must wait for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolFlow {
+    Continue,
+    AwaitUser,
+}
+
+const DEFAULT_LISTENER_PORT: u16 = 4444;
+
+fn str_field(value: &Value, key: &str, default: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn tab_id_arg(args: &Value) -> Result<usize> {
+    args.get("tab_id")
+        .and_then(Value::as_u64)
+        .and_then(|id| usize::try_from(id).ok())
+        .context("Invalid tab_id")
+}
+
+/// Reverse-shell listener commands (nc/ncat/socat) would block the workspace
+/// terminal, so they are run in a dedicated listener tab instead.
+fn is_listener_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    ["nc -lv", "nc -l ", "ncat -l", "socat tcp-listen"]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+/// First non-privileged port number mentioned in the command.
+fn listener_port(cmd: &str) -> u16 {
+    cmd.split_whitespace()
+        .filter_map(|token| token.parse::<u16>().ok())
+        .find(|port| *port > 1024)
+        .unwrap_or(DEFAULT_LISTENER_PORT)
+}
+
+impl App {
+    /// Runs every tool call of the finished assistant turn, appending each
+    /// result to the conversation.
+    ///
+    /// Returns `false` when the loop stopped early because an action is
+    /// waiting for user approval.
+    pub(super) async fn process_tool_calls(&mut self, tool_calls: &[ToolCall]) -> Result<bool> {
+        for (index, tool_call) in tool_calls.iter().enumerate() {
+            let managed_result = match self.handle_terminal_management_tool(tool_call) {
+                Ok(result) => result,
+                Err(error) => Some(self.tool_error(tool_call, &error)),
+            };
+            if self.pending_exploit_approval.is_some() {
+                self.defer_tool_calls(&tool_calls[index + 1..]).await;
+                return Ok(false);
+            }
+
+            let result = match managed_result {
+                Some(result) => result,
+                None => {
+                    let executed = crate::tools::execute_tool_call(
+                        tool_call,
+                        &self.db,
+                        self.active_target_id,
+                        &self.session_meta.workspace_path(),
+                        &self.event_tx,
+                    )
+                    .await;
+                    match executed {
+                        Ok(result) => result,
+                        Err(error) => self.tool_error(tool_call, &error),
+                    }
+                }
+            };
+
+            if self.apply_tool_result(tool_call, result).await? == ToolFlow::AwaitUser {
+                self.defer_tool_calls(&tool_calls[index + 1..]).await;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Answers the tool calls that are skipped because an earlier one is
+    /// waiting for approval. Every call of an assistant turn needs a result,
+    /// otherwise the whole turn is dropped from the next request.
+    async fn defer_tool_calls(&mut self, deferred: &[ToolCall]) {
+        for tool_call in deferred {
+            self.append_chat_message(ChatMessage::tool_result(
+                tool_call.id.clone(),
+                json!({
+                    "status": "not_executed",
+                    "message": "A prior action is waiting for user approval."
+                })
+                .to_string(),
+            ))
+            .await;
+        }
+    }
+
+    fn tool_error(&mut self, tool_call: &ToolCall, error: &anyhow::Error) -> Value {
+        self.add_notification(
+            format!("Tool {} error: {}", tool_call.function.name, error),
+            NotifLevel::Error,
+        );
+        json!({
+            "status": "error",
+            "error": error.to_string()
+        })
+    }
+
+    /// Applies tool-specific side effects (notifications, suggestions, approval
+    /// requests) and records the tool result in the conversation.
+    async fn apply_tool_result(&mut self, tool_call: &ToolCall, result: Value) -> Result<ToolFlow> {
+        match tool_call.function.name.as_str() {
+            "save_exploit_script" => {
+                if let Some(path) = result.get("path").and_then(Value::as_str) {
+                    self.add_notification(format!("Saved exploit to {}", path), NotifLevel::Info);
+                }
+            }
+            "run_command" => {
+                // A listener's tool result is written once the user approves or rejects it.
+                if self.apply_run_command(tool_call, &result).await == ToolFlow::AwaitUser {
+                    return Ok(ToolFlow::AwaitUser);
+                }
+            }
+            "save_workspace_file" => {
+                self.request_workspace_file_approval(tool_call, &result).await;
+                return Ok(ToolFlow::AwaitUser);
+            }
+            "set_target" | "add_target" => self.activate_target_from_result(&result),
+            "execute_exploit_script" => {
+                return self.request_exploit_approval(tool_call, &result).await;
+            }
+            _ => {}
+        }
+
+        // Add tool result to conversation for next LLM call
+        self.append_chat_message(ChatMessage::tool_result(
+            tool_call.id.clone(),
+            result.to_string(),
+        ))
+        .await;
+        Ok(ToolFlow::Continue)
+    }
+
+    fn request_approval(&mut self, approval: ExploitApproval, notification: String) {
+        self.pending_exploit_approval = Some(approval);
+        self.add_notification(notification, NotifLevel::Warning);
+    }
+
+    /// Display name of a target for approval prompts.
+    async fn target_ip_label(&self, target_id: i64) -> String {
+        if target_id <= 0 {
+            return "active_target".to_string();
+        }
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            DatabaseQueries::get_target(&db.conn(), target_id)
+                .ok()
+                .flatten()
+                .map(|target| target.ip_host)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "target".to_string())
+    }
+
+    /// A suggested command is either offered to the user for execution or, for
+    /// reverse-shell listeners, turned into a listener-tab approval request.
+    async fn apply_run_command(&mut self, tool_call: &ToolCall, result: &Value) -> ToolFlow {
+        let Ok(args) = serde_json::from_str::<Value>(&tool_call.function.arguments) else {
+            return ToolFlow::Continue;
+        };
+        let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+        if cmd.is_empty() {
+            return ToolFlow::Continue;
+        }
+
+        if is_listener_command(cmd) {
+            let port = listener_port(cmd);
+            let target_id = self.active_target_id.unwrap_or(0);
+            let target_ip = self.target_ip_label(target_id).await;
+            self.request_approval(
+                ExploitApproval {
+                    target_id,
+                    target_ip,
+                    kind: ApprovalKind::ReverseShellListener {
+                        lhost: "0.0.0.0".to_string(),
+                        lport: port,
+                        shell_type: "bash".to_string(),
+                    },
+                    tool_call: tool_call.clone(),
+                },
+                format!("Approval required for reverse shell on port {}", port),
+            );
+            ToolFlow::AwaitUser
+        } else {
+            let interactive = result
+                .get("interactive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || Self::is_interactive_command(cmd);
+            self.llm.suggestion = Some(LlmSuggestion {
+                command: Some(cmd.to_string()),
+                explanation: str_field(&args, "explanation", ""),
+                interactive,
+            });
+            self.llm.suggestion_visible = true;
+            ToolFlow::Continue
+        }
+    }
+
+    async fn request_workspace_file_approval(&mut self, tool_call: &ToolCall, result: &Value) {
+        let target_id = result
+            .get("target_id")
+            .and_then(Value::as_i64)
+            .or(self.active_target_id)
+            .unwrap_or(0);
+        let target_ip = self.target_ip_label(target_id).await;
+        let filename = str_field(result, "filename", "file.txt");
+        let notification = format!("Approval required to save file to {}", filename);
+        self.request_approval(
+            ExploitApproval {
+                target_id,
+                target_ip,
+                kind: ApprovalKind::SaveWorkspaceFile {
+                    folder: str_field(result, "folder", "evidence"),
+                    filename,
+                    description: str_field(result, "description", ""),
+                    content: str_field(result, "content", ""),
+                },
+                tool_call: tool_call.clone(),
+            },
+            notification,
+        );
+    }
+
+    fn activate_target_from_result(&mut self, result: &Value) {
+        let target_id = result
+            .get("id")
+            .and_then(Value::as_i64)
+            .or_else(|| result.get("target_id").and_then(Value::as_i64));
+        if let Some(target_id) = target_id {
+            self.active_target_id = Some(target_id);
+            let ip = result
+                .get("ip_host")
+                .and_then(Value::as_str)
+                .unwrap_or("target");
+            self.add_notification(
+                format!("Active target: {} (ID: {})", ip, target_id),
+                NotifLevel::Info,
+            );
+        }
+    }
+
+    /// Exploit scripts only run against targets in scope, and only after approval.
+    async fn request_exploit_approval(
+        &mut self,
+        tool_call: &ToolCall,
+        result: &Value,
+    ) -> Result<ToolFlow> {
+        let target_id = result.get("target_id").and_then(Value::as_i64).unwrap_or(0);
+        let db = self.db.clone();
+        let target = tokio::task::spawn_blocking(move || {
+            DatabaseQueries::get_target(&db.conn(), target_id)
+        })
+        .await
+        .context("Target lookup task panicked")??;
+
+        let Some(target) = target else {
+            self.append_chat_message(ChatMessage::tool_result(
+                tool_call.id.clone(),
+                json!({
+                    "error": format!("Target ID {} is not within current assessment scope", target_id)
+                })
+                .to_string(),
+            ))
+            .await;
+            return Ok(ToolFlow::Continue);
+        };
+
+        let script_name = str_field(result, "script_name", "exploit.py");
+        let notification = format!("Approval required to execute {}", script_name);
+        self.request_approval(
+            ExploitApproval {
+                target_id,
+                target_ip: target.ip_host,
+                kind: ApprovalKind::ExecuteExploit {
+                    script_name,
+                    command_line: str_field(result, "command_line", ""),
+                },
+                tool_call: tool_call.clone(),
+            },
+            notification,
+        );
+        Ok(ToolFlow::AwaitUser)
+    }
+
+    fn open_tab(&self, tab_id: usize) -> Result<&PtyTab> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .with_context(|| format!("Terminal tab {} is not open", tab_id))
+    }
+
+    fn request_terminal_approval(
+        &mut self,
+        tool_call: &ToolCall,
+        kind: ApprovalKind,
+        notification: String,
+    ) -> Value {
+        self.request_approval(
+            ExploitApproval {
+                target_id: self.active_target_id.unwrap_or_default(),
+                target_ip: "terminal session".to_string(),
+                kind,
+                tool_call: tool_call.clone(),
+            },
+            notification,
+        );
+        json!({"status": "requires_user_approval"})
+    }
+
+    /// Handles the tools that operate on terminal tabs, which live in `App`
+    /// rather than the database. Returns `None` for any other tool.
+    fn handle_terminal_management_tool(&mut self, tool_call: &ToolCall) -> Result<Option<Value>> {
+        let name = tool_call.function.name.as_str();
+        if !matches!(
+            name,
+            "list_terminal_tabs" | "read_terminal_tab" | "send_terminal_input" | "close_terminal_tab"
+        ) {
+            return Ok(None);
+        }
+        crate::tools::validate_tool_call(tool_call)?;
+        let args: Value = serde_json::from_str(&tool_call.function.arguments)
+            .context("Failed to parse terminal tool arguments")?;
+
+        let result = match name {
+            "list_terminal_tabs" => self.list_terminal_tabs(),
+            "read_terminal_tab" => self.read_terminal_tab(&args)?,
+            "send_terminal_input" => self.request_terminal_input(tool_call, &args)?,
+            "close_terminal_tab" => {
+                let tab_id = tab_id_arg(&args)?;
+                let label = self.open_tab(tab_id)?.label.clone();
+                self.request_terminal_approval(
+                    tool_call,
+                    ApprovalKind::CloseTerminalTab { tab_id, label },
+                    format!("Approval required to close terminal tab {}", tab_id),
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
+    }
+
+    fn list_terminal_tabs(&self) -> Value {
+        let active_tab_id = self.active_terminal_tab_id();
+        let mut tabs = vec![json!({
+            "tab_id": 0,
+            "label": "Workspace & LLM",
+            "kind": "workspace",
+            "state": "open",
+            "active": self.active_tab == 0,
+            "manageable": false
+        })];
+        tabs.extend(self.tabs.iter().map(|tab| {
+            json!({
+                "tab_id": tab.id,
+                "label": tab.label,
+                "kind": tab.kind.as_str(),
+                "state": tab.state_label(),
+                "active": active_tab_id == Some(tab.id)
+            })
+        }));
+        json!({"tabs": tabs})
+    }
+
+    fn read_terminal_tab(&self, args: &Value) -> Result<Value> {
+        let tab_id = tab_id_arg(args)?;
+        let tab = self.open_tab(tab_id)?;
+        let max_chars = args
+            .get("max_chars")
+            .and_then(Value::as_u64)
+            .unwrap_or(8_000)
+            .clamp(1, 12_000) as usize;
+        let screen = tab.screen_text();
+        let tail = screen
+            .char_indices()
+            .rev()
+            .nth(max_chars.saturating_sub(1))
+            .map(|(index, _)| &screen[index..])
+            .unwrap_or(&screen);
+        Ok(json!({
+            "tab_id": tab_id,
+            "label": tab.label,
+            "state": tab.state_label(),
+            "screen": tail
+        }))
+    }
+
+    fn request_terminal_input(&mut self, tool_call: &ToolCall, args: &Value) -> Result<Value> {
+        let tab_id = tab_id_arg(args)?;
+        if self.open_tab(tab_id)?.exit_code.is_some() {
+            anyhow::bail!("Terminal tab {} has already exited", tab_id);
+        }
+        let input = args
+            .get("input")
+            .and_then(Value::as_str)
+            .context("Missing terminal input")?;
+        if input.len() > 100 || input.chars().any(|character| character.is_control()) {
+            anyhow::bail!(
+                "Terminal input must be at most 100 UTF-8 bytes and contain no control characters"
+            );
+        }
+        let press_enter = args
+            .get("press_enter")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(self.request_terminal_approval(
+            tool_call,
+            ApprovalKind::TerminalInput {
+                tab_id,
+                input: input.to_string(),
+                press_enter,
+            },
+            format!("Approval required to send input to terminal tab {}", tab_id),
+        ))
+    }
+}

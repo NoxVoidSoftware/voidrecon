@@ -411,12 +411,7 @@ impl LlmClient {
                 tool_call_id: None,
             }
         } else {
-            crate::llm::types::ChatMessage {
-                role: "assistant".to_string(),
-                content: String::new(),
-                tool_calls: None,
-                tool_call_id: None,
-            }
+            crate::llm::types::ChatMessage::assistant(String::new())
         };
 
         Ok(ChatCompletionResponse {

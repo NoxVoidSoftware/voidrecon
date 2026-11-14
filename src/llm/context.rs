@@ -4,22 +4,39 @@ use crate::db::models::{Command, Finding, ImportantFact, PortInfo, Target, Targe
 use anyhow::{Context, Result};
 use tokio::fs;
 
-/// Build the system prompt with context from database.
+/// Everything the system prompt is built from, loaded from the database by the caller.
 ///
 /// `all_findings` and `all_facts` are keyed by target id and mirror the sidebar view.
-pub async fn build_system_prompt(
-    session_name: &str,
-    session_created: &str,
-    targets_count: i64,
-    all_targets: &[Target],
-    active_target: Option<&Target>,
-    all_findings: &[(i64, Vec<Finding>)],
-    all_facts: &[(i64, Vec<ImportantFact>)],
-    recent_commands: &[Command],
-    command_count: i64,
-    suggest_next_step: bool,
-    workspace_path: Option<&std::path::Path>,
-) -> Result<String> {
+#[derive(Debug, Clone, Copy)]
+pub struct SystemPromptContext<'a> {
+    pub session_name: &'a str,
+    pub session_created: &'a str,
+    pub targets_count: i64,
+    pub all_targets: &'a [Target],
+    pub active_target: Option<&'a Target>,
+    pub all_findings: &'a [(i64, Vec<Finding>)],
+    pub all_facts: &'a [(i64, Vec<ImportantFact>)],
+    pub recent_commands: &'a [Command],
+    pub command_count: i64,
+    pub suggest_next_step: bool,
+    pub workspace_path: Option<&'a std::path::Path>,
+}
+
+/// Build the system prompt with context from database.
+pub async fn build_system_prompt(context: SystemPromptContext<'_>) -> Result<String> {
+    let SystemPromptContext {
+        session_name,
+        session_created,
+        targets_count,
+        all_targets,
+        active_target,
+        all_findings,
+        all_facts,
+        recent_commands,
+        command_count,
+        suggest_next_step,
+        workspace_path,
+    } = context;
     let mut prompt = String::from(
         r#"You are an expert penetration tester working an active session in voidrecon.
 Be concise.
@@ -288,7 +305,7 @@ pub async fn list_workspace_files(
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if extension.map_or(true, |ext| name.ends_with(ext)) {
+        if extension.is_none_or(|ext| name.ends_with(ext)) {
             files.push(format!("{} ({} bytes)", quoted(&name), metadata.len()));
         }
     }

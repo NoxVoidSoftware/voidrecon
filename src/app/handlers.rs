@@ -1,17 +1,14 @@
-//! Event handlers for voidrecon
+//! Main event loop and keyboard dispatch for voidrecon
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::Backend;
 use std::time::Instant;
 
 use crate::app::events::AppEvent;
-use crate::app::state::{App, InputMode, NotifLevel, SidebarNode, WindowFocus};
-use crate::db::DatabaseQueries;
-use crate::db::models::Finding;
+use crate::app::pty_control::key_to_pty_bytes;
+use crate::app::state::{App, InputMode, NotifLevel, WindowFocus};
 use crate::llm::{ChatMessage, LlmRequestState};
-
-use crate::pty::tab::PtyTab;
 use crate::ui::render_ui;
 
 impl App {
@@ -136,579 +133,103 @@ impl App {
             }
         });
     }
-    
+
+    /// Routes a key press: open modals and pending approvals take priority,
+    /// then global shortcuts, then the active tab.
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Defensive check: ignore key release events to prevent double inputs and flickering
         if key.kind == crossterm::event::KeyEventKind::Release {
             return Ok(());
         }
 
-        // If Session Picker modal is open, handle session picker keys first
         if self.ui_state.show_session_picker {
-            self.handle_session_picker_key(key).await?;
-            return Ok(());
+            return self.handle_session_picker_key(key).await;
         }
-
-        // If Provider & API key setup modal is open, intercept keys
         if self.ui_state.show_api_key_prompt {
-            let providers = crate::config::ALL_PROVIDERS;
-            let total_providers = providers.len();
-            match key.code {
-                KeyCode::Esc => {
-                    self.ui_state.show_api_key_prompt = false;
-                    self.ui_state.api_key_input.clear();
-                    self.add_notification(
-                        "Provider configuration closed".to_string(),
-                        NotifLevel::Info,
-                    );
-                }
-                KeyCode::Tab | KeyCode::Right => {
-                    self.ui_state.provider_picker_selected = (self.ui_state.provider_picker_selected + 1) % total_providers;
-                    self.ui_state.api_key_input.clear();
-                }
-                KeyCode::BackTab | KeyCode::Left => {
-                    if self.ui_state.provider_picker_selected == 0 {
-                        self.ui_state.provider_picker_selected = total_providers - 1;
-                    } else {
-                        self.ui_state.provider_picker_selected -= 1;
-                    }
-                    self.ui_state.api_key_input.clear();
-                }
-                KeyCode::Enter => {
-                    let selected_provider = providers[self.ui_state.provider_picker_selected.min(total_providers - 1)];
-                    let key_val = self.ui_state.api_key_input.trim().to_string();
-
-                    if !key_val.is_empty() {
-                        self.config.set_api_key(selected_provider, key_val);
-                        self.add_notification(
-                            format!("Saved key for {} and activated", selected_provider.as_str()),
-                            NotifLevel::Info,
-                        );
-                    } else if self.config.has_api_key(selected_provider) {
-                        self.add_notification(
-                            format!("Activated {} (using saved key)", selected_provider.as_str()),
-                            NotifLevel::Info,
-                        );
-                    } else if !selected_provider.requires_api_key() {
-                        self.add_notification(
-                            format!("Activated {}", selected_provider.as_str()),
-                            NotifLevel::Info,
-                        );
-                    } else {
-                        self.add_notification(
-                            format!("No API key entered for {}", selected_provider.as_str()),
-                            NotifLevel::Warning,
-                        );
-                        return Ok(());
-                    }
-
-                    self.config.set_provider(selected_provider, None);
-                    let _ = self.config.save().await;
-                    if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
-                        self.llm_client = client;
-                    } else {
-                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
-                    }
-                    self.ui_state.show_api_key_prompt = false;
-                    self.ui_state.api_key_input.clear();
-                    if self.config.models_cache.is_empty() {
-                        self.trigger_fetch_models();
-                    }
-                }
-                KeyCode::Char(c) => {
-                    self.ui_state.api_key_input.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.ui_state.api_key_input.pop();
-                }
-                _ => {}
-            }
-            return Ok(());
+            return self.handle_api_key_prompt_key(key).await;
         }
-
-        // If Exploit Approval is pending, intercept y/n/Enter/Esc
         if let Some(approval) = self.pending_exploit_approval.clone() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.pending_exploit_approval = None;
-                    match &approval.kind {
-                        crate::app::state::ApprovalKind::ReverseShellListener { lhost, lport, shell_type } => {
-                            match self.spawn_listener_tab(*lport).await {
-                                Ok(()) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "approved",
-                                            "message": format!("Listener spawned on port {}", lport),
-                                            "target_id": approval.target_id,
-                                            "lhost": lhost,
-                                            "lport": lport,
-                                            "shell_type": shell_type,
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(
-                                        format!("Spawned listener on port {}", lport),
-                                        NotifLevel::Info,
-                                    );
-                                }
-                                Err(e) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "error",
-                                            "message": format!("Failed to spawn listener on port {}: {}", lport, e),
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(
-                                        format!("Failed to spawn listener: {}", e),
-                                        NotifLevel::Error,
-                                    );
-                                }
-                            }
-                        }
-                        crate::app::state::ApprovalKind::ExecuteExploit { script_name, command_line } => {
-                            let start = Instant::now();
-                            self.append_chat_message(ChatMessage {
-                                role: "user".to_string(),
-                                content: format!("$ {}", command_line),
-                                tool_calls: None,
-                                tool_call_id: None,
-                            }).await;
-
-                            let output_result = self.run_command_capture(command_line).await;
-                            let duration_ms = start.elapsed().as_millis() as i64;
-
-                            match output_result {
-                                Ok(out) => {
-                                    let lines: Vec<&str> = out.lines().collect();
-                                    self.append_chat_message(ChatMessage {
-                                        role: "output".to_string(),
-                                        content: out.clone(),
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                    }).await;
-
-                                    // Record command and output artifact in database
-                                    // (blocking SQLite + artifact write runs off the event loop)
-                                    let db = self.db.clone();
-                                    let session_path = self.session_meta.path();
-                                    let command_line_for_db = command_line.to_string();
-                                    let out_for_db = out.clone();
-                                    let target_id_for_db = approval.target_id;
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let _ = DatabaseQueries::add_command(
-                                            &db.conn(),
-                                            &session_path,
-                                            Some(target_id_for_db),
-                                            &command_line_for_db,
-                                            Some(&out_for_db),
-                                            Some(0),
-                                            Some(duration_ms),
-                                        );
-                                        let _ = DatabaseQueries::add_chat_message(
-                                            &db.conn(),
-                                            Some(target_id_for_db),
-                                            "user",
-                                            &format!("$ {}", command_line_for_db),
-                                        );
-                                        let _ = DatabaseQueries::add_chat_message(
-                                            &db.conn(),
-                                            Some(target_id_for_db),
-                                            "assistant",
-                                            &out_for_db,
-                                        );
-                                    }).await;
-
-                                    let tool_out = if lines.len() > 30 {
-                                        let top = lines[..25].join("\n");
-                                        format!("{}\n... [truncated {} lines, full output displayed above] ...", top, lines.len() - 25)
-                                    } else {
-                                        out.clone()
-                                    };
-
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "executed",
-                                            "script": script_name,
-                                            "exit_code": 0,
-                                            "duration_ms": duration_ms,
-                                            "output": tool_out
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(format!("Exploit executed ({})", script_name), NotifLevel::Info);
-                                }
-                                Err(e) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "execution_failed",
-                                            "script": script_name,
-                                            "error": e.to_string()
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(format!("Exploit failed: {}", e), NotifLevel::Error);
-                                }
-                            }
-                            self.ui_state.log_at_bottom = true;
-                        }
-                        crate::app::state::ApprovalKind::SaveWorkspaceFile { folder, filename, description, content } => {
-                            let target_dir = self.session_meta.workspace_path().join(&folder);
-                            let _ = tokio::fs::create_dir_all(&target_dir).await;
-                            let file_path = target_dir.join(&filename);
-                            match tokio::fs::write(&file_path, &content).await {
-                                Ok(_) => {
-                                    let rel_path = format!("workspace/{}/{}", folder, filename);
-                                    let db = self.db.clone();
-                                    let description = description.clone();
-                                    let folder_for_db = folder.clone();
-                                    let filename_for_db = filename.clone();
-                                    let rel_path_for_db = rel_path.clone();
-                                    let content_len = content.len();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        if folder_for_db == "evidence" {
-                                            let title = if description.is_empty() {
-                                                format!("Evidence: {}", filename_for_db)
-                                            } else {
-                                                format!("Evidence: {} ({})", filename_for_db, description)
-                                            };
-                                            let _ = DatabaseQueries::add_finding(
-                                                &db.conn(),
-                                                approval.target_id,
-                                                &title,
-                                                &description,
-                                                "info",
-                                                None,
-                                                Some(100),
-                                                Some(&rel_path_for_db),
-                                            );
-                                        } else if folder_for_db == "artifacts" {
-                                            let note_text = if description.is_empty() {
-                                                format!("Saved artifact: {}", rel_path_for_db)
-                                            } else {
-                                                format!("Saved artifact {}: {}", rel_path_for_db, description)
-                                            };
-                                            let _ = DatabaseQueries::add_note(&db.conn(), approval.target_id, &note_text);
-                                        }
-                                    }).await;
-
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "approved_and_saved",
-                                            "folder": folder,
-                                            "file": filename,
-                                            "path": rel_path,
-                                            "bytes": content_len
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(format!("Approved & saved: {}", rel_path), NotifLevel::Info);
-                                    let _ = self.reload_sidebar().await;
-                                    self.refresh_exploit_cache().await;
-                                }
-                                Err(e) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "save_failed",
-                                            "error": e.to_string()
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(format!("Failed to save file: {}", e), NotifLevel::Error);
-                                }
-                            }
-                        }
-                        crate::app::state::ApprovalKind::TerminalInput {
-                            tab_id,
-                            input,
-                            press_enter,
-                        } => {
-                            let result = if let Some(tab) =
-                                self.tabs.iter_mut().find(|tab| tab.id == *tab_id)
-                            {
-                                if tab.exit_code.is_some() {
-                                    Err(anyhow::anyhow!(
-                                        "Terminal tab {} has already exited",
-                                        tab_id
-                                    ))
-                                } else {
-                                    let mut bytes = input.as_bytes().to_vec();
-                                    if *press_enter {
-                                        bytes.push(b'\n');
-                                    }
-                                    tab.write(&bytes).map(|()| {
-                                        serde_json::json!({
-                                            "status": "input_sent",
-                                            "tab_id": tab_id,
-                                            "press_enter": press_enter
-                                        })
-                                    })
-                                }
-                            } else {
-                                Err(anyhow::anyhow!("Terminal tab {} is no longer open", tab_id))
-                            };
-                            match result {
-                                Ok(result) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: result.to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(
-                                        format!("Sent approved input to terminal tab {}", tab_id),
-                                        NotifLevel::Info,
-                                    );
-                                }
-                                Err(error) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "error",
-                                            "message": error.to_string()
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(
-                                        format!("Failed to send terminal input: {}", error),
-                                        NotifLevel::Error,
-                                    );
-                                }
-                            }
-                        }
-                        crate::app::state::ApprovalKind::CloseTerminalTab { tab_id, .. } => {
-                            match self.close_terminal_tab(*tab_id) {
-                                Ok(label) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "closed",
-                                            "tab_id": tab_id,
-                                            "label": label
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(
-                                        format!("Closed terminal tab {}", tab_id),
-                                        NotifLevel::Info,
-                                    );
-                                }
-                                Err(error) => {
-                                    self.append_chat_message(ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: serde_json::json!({
-                                            "status": "error",
-                                            "message": error.to_string()
-                                        }).to_string(),
-                                        tool_calls: None,
-                                        tool_call_id: Some(approval.tool_call.id),
-                                    }).await;
-                                    self.add_notification(
-                                        format!("Failed to close terminal tab: {}", error),
-                                        NotifLevel::Error,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    self.continue_llm_conversation().await?;
-                    return Ok(());
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.pending_exploit_approval = None;
-                    let reject_msg = match &approval.kind {
-                        crate::app::state::ApprovalKind::ReverseShellListener { .. } => "User rejected spawning reverse shell listener",
-                        crate::app::state::ApprovalKind::ExecuteExploit { .. } => "User rejected exploit script execution",
-                        crate::app::state::ApprovalKind::SaveWorkspaceFile { .. } => "User rejected saving workspace file",
-                        crate::app::state::ApprovalKind::TerminalInput { .. } => "User rejected sending terminal input",
-                        crate::app::state::ApprovalKind::CloseTerminalTab { .. } => "User rejected closing terminal tab",
-                    };
-                    self.append_chat_message(ChatMessage {
-                        role: "tool".to_string(),
-                        content: serde_json::json!({
-                            "status": "rejected",
-                            "message": reject_msg
-                        }).to_string(),
-                        tool_calls: None,
-                        tool_call_id: Some(approval.tool_call.id),
-                    }).await;
-                    self.add_notification("Action rejected".to_string(), NotifLevel::Info);
-                    self.continue_llm_conversation().await?;
-                    return Ok(());
-                }
-                KeyCode::Char('?') => {
-                    self.pending_exploit_approval = None;
-                    self.input_mode = InputMode::LlmQuery;
-                    self.input_buffer.clear();
-                    self.ui_state.input_cursor = 0;
-                    self.add_notification("Action cancelled - entering LLM query mode".to_string(), NotifLevel::Info);
-                    return Ok(());
-                }
-                _ => {
-                    self.add_notification("Action pending: Press [Y/Enter] to approve, [N/Esc] to reject, or [?] to ask query".to_string(), NotifLevel::Warning);
-                    return Ok(());
-                }
-            }
+            return self.handle_approval_key(key, approval).await;
         }
-
-        // If Help modal is open, intercept keys
         if self.ui_state.show_help {
             if self.is_help_key(key) || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.ui_state.show_help = false;
             }
             return Ok(());
         }
-
-        // If Model Picker modal is open, handle picker keys
         if self.ui_state.show_model_picker {
-            self.handle_model_picker_key(key).await?;
-            return Ok(());
+            return self.handle_model_picker_key(key).await;
         }
-
-        // Help hotkey (global check)
         if self.is_help_key(key) {
             self.ui_state.show_help = true;
             return Ok(());
         }
 
-        // If LLM is generating, Ctrl+C or Esc cancels the request
-        if matches!(self.llm.request_state, LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls) {
-            if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-                || key.code == KeyCode::Esc {
-                self.cancel_llm_request().await;
-                return Ok(());
-            }
+        // While the LLM is generating, Ctrl+C or Esc cancels the request
+        let llm_busy = matches!(
+            self.llm.request_state,
+            LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
+        );
+        let is_cancel_key = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if llm_busy && is_cancel_key {
+            self.cancel_llm_request().await;
+            return Ok(());
         }
 
-        // If on interactive Shell tab (Tab 1..N), pass raw input to PTY
+        if self.handle_global_shortcut(key).await? {
+            return Ok(());
+        }
         if self.active_tab > 0 {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
-                    self.ui_state.should_quit = true;
-                    return Ok(());
-                }
-                (KeyCode::F(2), _) => {
-                    self.ui_state.model_picker_provider = self.config.provider;
-                    self.ui_state.model_picker_selected = 0;
-                    self.ui_state.model_picker_search.clear();
-                    if self.config.get_models_for_provider(self.config.provider).is_empty() {
-                        self.trigger_fetch_models();
-                    }
-                    self.ui_state.show_model_picker = true;
-                    return Ok(());
-                }
-                (KeyCode::F(3), _) => {
-                    self.new_shell_tab().await?;
-                    return Ok(());
-                }
-                (KeyCode::F(4), _) | (KeyCode::Char('m'), KeyModifiers::ALT) => {
-                    self.toggle_mouse_capture()?;
-                    return Ok(());
-                }
-                (KeyCode::BackTab, _) => {
-                    self.cycle_focus_backward();
-                    return Ok(());
-                }
-                (KeyCode::Esc, _) => {
-                    // Esc switches back from Shell tab to Workspace & LLM (Tab 0)
-                    self.active_tab = 0;
-                    self.input_mode = InputMode::Shell;
-                    return Ok(());
-                }
-                (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
-                    self.input_mode = InputMode::LlmQuery;
-                    self.input_buffer.clear();
-                    self.ui_state.input_cursor = 0;
-                    self.active_tab = 0; // return to Workspace & LLM tab
-                    return Ok(());
-                }
-                _ => {
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab - 1) {
-                        if let Some(bytes) = key_to_pty_bytes(key) {
-                            let _ = tab.write(&bytes);
-                        }
-                    }
-                    return Ok(());
-                }
-            }
+            self.handle_shell_tab_key(key);
+            return Ok(());
         }
+        self.handle_workspace_key(key).await
+    }
 
-        // Tab 0 (Workspace & LLM) shortcuts
+    /// Shortcuts that work on every tab. Returns `true` when the key was consumed.
+    async fn handle_global_shortcut(&mut self, key: KeyEvent) -> Result<bool> {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if let Some(handle) = self.command_run.abort_handle.take() {
-                    handle.abort();
-                    self.command_run.running = None;
-                    self.command_run.stdin_tx = None;
-                    self.command_run.output.clear();
-                    self.command_run.raw.clear();
-                    self.append_chat_message(ChatMessage {
-                        role: "system".to_string(),
-                        content: "⚠️ Command cancelled by user (Ctrl+C)".to_string(),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    }).await;
-                    self.add_notification("Command cancelled".to_string(), NotifLevel::Warning);
-                    return Ok(());
-                }
-                if let Some(handle) = self.llm.abort_handle.take() {
-                    handle.abort();
-                    self.llm.request_state = LlmRequestState::Idle;
-                    self.append_chat_message(ChatMessage {
-                        role: "system".to_string(),
-                        content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    }).await;
-                    self.add_notification("LLM cancelled".to_string(), NotifLevel::Warning);
-                    return Ok(());
-                }
-            }
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
-                self.ui_state.should_quit = true;
-                return Ok(());
-            }
+            (KeyCode::Char('q'), KeyModifiers::CONTROL) => self.ui_state.should_quit = true,
             (KeyCode::Char('l'), KeyModifiers::CONTROL) => {
                 self.input_mode = InputMode::LlmQuery;
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
-                return Ok(());
+                self.active_tab = 0; // LLM queries are typed on the Workspace & LLM tab
             }
-            (KeyCode::F(2), _) => {
-                self.ui_state.model_picker_provider = self.config.provider;
-                self.ui_state.model_picker_selected = 0;
-                self.ui_state.model_picker_search.clear();
-                if self.config.get_models_for_provider(self.config.provider).is_empty() {
-                    self.trigger_fetch_models();
-                }
-                self.ui_state.show_model_picker = true;
-                return Ok(());
-            }
-            (KeyCode::F(3), _) => {
-                self.new_shell_tab().await?;
-                return Ok(());
-            }
+            (KeyCode::F(2), _) => self.open_model_picker(),
+            (KeyCode::F(3), _) => self.new_shell_tab().await?,
             (KeyCode::F(4), _) | (KeyCode::Char('m'), KeyModifiers::ALT) => {
-                self.toggle_mouse_capture()?;
-                return Ok(());
+                self.toggle_mouse_capture()?
             }
-            (KeyCode::BackTab, _) => {
-                self.cycle_focus_backward();
-                return Ok(());
+            (KeyCode::BackTab, _) => self.cycle_focus_backward(),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Interactive shell tabs (Tab 1..N): Esc returns to the workspace, every
+    /// other key goes to the PTY as raw input.
+    fn handle_shell_tab_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.active_tab = 0;
+            self.input_mode = InputMode::Shell;
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab - 1) {
+            if let Some(bytes) = key_to_pty_bytes(key) {
+                let _ = tab.write(&bytes);
+            }
+        }
+    }
+
+    /// Tab 0 (Workspace & LLM): local shortcuts, then the current input mode.
+    async fn handle_workspace_key(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if self.cancel_running_work().await {
+                    return Ok(());
+                }
             }
             (KeyCode::Esc, _) => {
                 self.input_mode = InputMode::Shell;
@@ -724,19 +245,45 @@ impl App {
             }
             (KeyCode::Char('['), _) if self.input_buffer.is_empty() => {
                 self.ui_state.sidebar_collapsed = !self.ui_state.sidebar_collapsed;
-                self.update_pty_dimensions().await?;
-                return Ok(());
+                return self.update_pty_dimensions().await;
             }
             _ => {}
         }
-        
-        // Mode-specific handling
+
         match self.input_mode {
-            InputMode::Shell => self.handle_shell_key(key).await?,
-            InputMode::LlmQuery => self.handle_llm_query_key(key).await?,
-            InputMode::EditCommand => self.handle_edit_command_key(key).await?,
+            InputMode::Shell => self.handle_shell_key(key).await,
+            InputMode::LlmQuery => self.handle_llm_query_key(key).await,
+            InputMode::EditCommand => self.handle_edit_command_key(key).await,
         }
-        Ok(())
+    }
+
+    /// Ctrl+C: aborts the running workspace command, or else the pending LLM
+    /// request. Returns `false` when there was nothing to cancel.
+    async fn cancel_running_work(&mut self) -> bool {
+        if let Some(handle) = self.command_run.abort_handle.take() {
+            handle.abort();
+            self.command_run.running = None;
+            self.command_run.stdin_tx = None;
+            self.command_run.output.clear();
+            self.command_run.raw.clear();
+            self.append_chat_message(ChatMessage::system(
+                "⚠️ Command cancelled by user (Ctrl+C)",
+            ))
+            .await;
+            self.add_notification("Command cancelled".to_string(), NotifLevel::Warning);
+            return true;
+        }
+        if let Some(handle) = self.llm.abort_handle.take() {
+            handle.abort();
+            self.llm.request_state = LlmRequestState::Idle;
+            self.append_chat_message(ChatMessage::system(
+                "⚠️ LLM generation cancelled by user (Ctrl+C)",
+            ))
+            .await;
+            self.add_notification("LLM cancelled".to_string(), NotifLevel::Warning);
+            return true;
+        }
+        false
     }
 
     fn is_help_key(&self, key: KeyEvent) -> bool {
@@ -753,122 +300,7 @@ impl App {
         self.update_pty_dimensions().await?;
         Ok(())
     }
-    
-    pub async fn reload_sidebar(&mut self) -> Result<()> {
-        let db = self.db.clone();
-        let workspace_path = self.session_meta.workspace_path();
-        let session_path = self.session_meta.path();
-        let active_target_id = self.active_target_id;
 
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<SidebarNode>> {
-            let _ = DatabaseQueries::deduplicate_targets_and_findings(&db.conn());
-            let targets = DatabaseQueries::get_all_targets(&db.conn())?;
-            let mut nodes = Vec::new();
-
-            for target in targets {
-                let findings = DatabaseQueries::get_findings_for_target(&db.conn(), target.id)?;
-                let mut by_severity: std::collections::HashMap<String, Vec<Finding>> = std::collections::HashMap::new();
-                for finding in findings {
-                    // If finding references an evidence file in workspace/evidence, verify it still exists on disk.
-                    // If user deleted the file manually, automatically prune the orphaned finding from the DB.
-                    if let Some(ref ep) = finding.evidence_path {
-                        if ep.starts_with("workspace/evidence") || ep.starts_with("evidence") {
-                            let rel = ep.trim_start_matches("workspace/").trim_start_matches("workspace\\");
-                            let sub = rel.trim_start_matches("evidence/").trim_start_matches("evidence\\");
-                            let full_p = workspace_path.join("evidence").join(sub);
-                            let direct_p = session_path.join(ep);
-                            if !full_p.exists() && !direct_p.exists() {
-                                let _ = DatabaseQueries::delete_finding(&db.conn(), finding.id);
-                                continue;
-                            }
-                        }
-                    }
-                    by_severity.entry(finding.severity.clone()).or_default().push(finding);
-                }
-                let mut findings_by_severity: Vec<_> = by_severity.into_iter().collect();
-                findings_by_severity.sort_by(|a, b| {
-                    let severity_order = |s: &str| match s {
-                        "critical" => 0,
-                        "high" => 1,
-                        "medium" => 2,
-                        "low" => 3,
-                        "info" => 4,
-                        _ => 5,
-                    };
-                    severity_order(&a.0).cmp(&severity_order(&b.0))
-                });
-
-                let ports = if let Some(ports_json) = &target.ports_json {
-                    serde_json::from_str::<Vec<crate::db::models::PortInfo>>(ports_json).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                let facts = DatabaseQueries::get_important_facts(&db.conn(), target.id)?;
-                nodes.push(SidebarNode {
-                    target,
-                    ports,
-                    expanded: true,
-                    findings_by_severity,
-                    facts,
-                });
-            }
-            Ok(nodes)
-        })
-        .await
-        .context("Sidebar reload task panicked")??;
-
-        // Determine active target validity from the reloaded data
-        if let Some(act_id) = active_target_id {
-            if !result.iter().any(|n| n.target.id == act_id) {
-                self.active_target_id = result.first().map(|n| n.target.id);
-            }
-        }
-        self.sidebar_nodes = result;
-
-        // If no active target, select first
-        if self.active_target_id.is_none() && !self.sidebar_nodes.is_empty() {
-            self.active_target_id = Some(self.sidebar_nodes[0].target.id);
-        }
-
-        Ok(())
-    }
-    
-    pub async fn new_shell_tab(&mut self) -> Result<()> {
-        let tab = PtyTab::new_shell(
-            self.next_tab_id,
-            self.event_tx.clone(),
-            self.pty_dimensions(),
-        )?;
-        self.next_tab_id += 1;
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len(); // switch focus to the new shell tab (Tab 1..N)
-        Ok(())
-    }
-    
-    pub async fn spawn_listener_tab(&mut self, lport: u16) -> Result<()> {
-        let tab = PtyTab::new_listener(
-            self.next_tab_id,
-            lport,
-            self.event_tx.clone(),
-            self.pty_dimensions(),
-        )?;
-        self.next_tab_id += 1;
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len(); // switch focus to the listener tab
-        Ok(())
-    }
-    
-    pub async fn close_current_shell(&mut self) -> Result<()> {
-        if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
-            self.tabs.remove(self.active_tab - 1);
-            if self.active_tab > self.tabs.len() {
-                self.active_tab = self.tabs.len();
-            }
-        }
-        Ok(())
-    }
-    
     pub fn cycle_focus_backward(&mut self) {
         if self.active_tab > 0 {
             if self.active_tab == 1 {
@@ -892,186 +324,6 @@ impl App {
             WindowFocus::Sidebar => self.ui_state.focus = WindowFocus::Input,
         }
     }
-    
-    pub async fn show_targets_table(&mut self) -> Result<()> {
-        // Blocking SQLite queries run off the event loop.
-        let db = self.db.clone();
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String, usize, usize)>> {
-            let targets = DatabaseQueries::get_all_targets(&db.conn())?;
-            let mut rows = Vec::with_capacity(targets.len());
-            for target in targets {
-                let ports_count = target.ports_json.as_ref()
-                    .and_then(|p| serde_json::from_str::<Vec<crate::db::models::PortInfo>>(p).ok())
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-                let findings_count = DatabaseQueries::get_findings_for_target(&db.conn(), target.id)?.len();
-                rows.push((target.id, target.ip_host, ports_count, findings_count));
-            }
-            Ok(rows)
-        })
-        .await
-        .context("Targets table task panicked")??;
-
-        let mut table = String::from("ID | IP/Host | Ports | Findings\n");
-        table.push_str("---|---------|-------|---------\n");
-        for (id, ip_host, ports_count, findings_count) in rows {
-            table.push_str(&format!("{} | {} | {} | {}\n", id, ip_host, ports_count, findings_count));
-        }
-        self.append_chat_message(ChatMessage {
-            role: "assistant".to_string(),
-            content: table,
-            tool_calls: None,
-            tool_call_id: None,
-        }).await;
-        Ok(())
-    }
-    
-    pub async fn show_findings(&mut self, target_id: Option<i64>) -> Result<()> {
-        let target_id = target_id.or(self.active_target_id);
-        if let Some(id) = target_id {
-            // Blocking SQLite queries run off the event loop.
-            let db = self.db.clone();
-            let findings = tokio::task::spawn_blocking(move || -> Result<Vec<Finding>> {
-                DatabaseQueries::get_findings_for_target(&db.conn(), id)
-            })
-            .await
-            .context("Findings task panicked")??;
-            let mut output = String::from("Findings:\n");
-            for f in findings {
-                output.push_str(&format!("[{}] {}: {} (from: {})\n", f.severity, f.title, f.description, f.source_cmd.unwrap_or_default()));
-            }
-            self.append_chat_message(ChatMessage {
-                role: "assistant".to_string(),
-                content: output,
-                tool_calls: None,
-                tool_call_id: None,
-            }).await;
-        }
-        Ok(())
-    }
-    
-    pub fn toggle_mouse_capture(&mut self) -> Result<()> {
-        self.mouse_capture_enabled = !self.mouse_capture_enabled;
-        if self.mouse_capture_enabled {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-            self.add_notification(
-                "Mouse Mode ON: Wheel scrolling & tab clicks active (Hold Shift to select text)".to_string(),
-                NotifLevel::Info,
-            );
-        } else {
-            crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
-            self.add_notification(
-                "Mouse Mode OFF: Native terminal text selection & copy enabled".to_string(),
-                NotifLevel::Info,
-            );
-        }
-        Ok(())
-    }
-
-    pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
-        if !self.mouse_capture_enabled {
-            return Ok(());
-        }
-
-        use crossterm::event::{MouseButton, MouseEventKind};
-        use crate::app::state::WindowFocus;
-
-        let term_rows = self.terminal_size.1;
-        let sidebar_width = if self.ui_state.sidebar_collapsed { 0 } else { 40 };
-
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left)
-            | MouseEventKind::Up(MouseButton::Left)
-            | MouseEventKind::Drag(MouseButton::Left) => {
-                // If any modal is showing, do not change focus
-                if self.ui_state.show_model_picker
-                    || self.ui_state.show_session_picker
-                    || self.ui_state.show_api_key_prompt
-                    || self.ui_state.show_help
-                {
-                    return Ok(());
-                }
-
-                // Check tab bar click (row 1)
-                if mouse.row == 1 && mouse.column >= sidebar_width {
-                    let col_in_tabs = mouse.column.saturating_sub(sidebar_width);
-                    if col_in_tabs < 24 {
-                        self.active_tab = 0;
-                    } else {
-                        let shell_tab_idx = (col_in_tabs.saturating_sub(24) / 16) as usize;
-                        if shell_tab_idx < self.tabs.len() {
-                            self.active_tab = shell_tab_idx + 1;
-                        }
-                    }
-                    return Ok(());
-                }
-
-                // In Tab 0:
-                if self.active_tab == 0 {
-                    // Check if clicked in sidebar
-                    if !self.ui_state.sidebar_collapsed && mouse.column < sidebar_width {
-                        self.ui_state.focus = WindowFocus::Sidebar;
-                        let target_idx = (mouse.row.saturating_sub(2) as usize) / 2;
-                        if target_idx < self.sidebar_nodes.len() {
-                            let tid = self.sidebar_nodes[target_idx].target.id;
-                            self.active_target_id = Some(tid);
-                        }
-                        return Ok(());
-                    }
-
-                    // Input line is at row term_rows - 2 (footer is term_rows - 1)
-                    let input_row = term_rows.saturating_sub(2);
-                    let suggestion_height = if self.llm.suggestion_visible { 5 } else { 0 };
-                    let approval_height = if self.pending_exploit_approval.is_some() { 5 } else { 0 };
-                    let panels_height = suggestion_height + approval_height;
-                    let input_area_start = input_row.saturating_sub(panels_height as u16);
-
-                    if mouse.row >= input_area_start {
-                        // Clicked on input line or action panels -> focus input
-                        self.ui_state.focus = WindowFocus::Input;
-                        let prompt_len = 2; // "> " or "? "
-                        let click_col = mouse.column.saturating_sub(sidebar_width + prompt_len);
-                        self.set_input_cursor_from_column(click_col as usize);
-                    } else if mouse.row >= 2 {
-                        // Clicked inside the chat / log window -> focus chat window
-                        self.ui_state.focus = WindowFocus::ChatLog;
-                    }
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                if self.ui_state.show_model_picker {
-                    self.ui_state.model_picker_selected = self.ui_state.model_picker_selected.saturating_sub(1);
-                    return Ok(());
-                }
-                if self.ui_state.show_session_picker {
-                    self.ui_state.session_picker_selected = self.ui_state.session_picker_selected.saturating_sub(1);
-                    return Ok(());
-                }
-                if self.active_tab == 0 {
-                    self.ui_state.focus = WindowFocus::ChatLog;
-                    self.ui_state.log_at_bottom = false;
-                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_sub(3);
-                }
-            }
-            MouseEventKind::ScrollDown => {
-                if self.ui_state.show_model_picker {
-                    self.ui_state.model_picker_selected = self.ui_state.model_picker_selected.saturating_add(1);
-                    return Ok(());
-                }
-                if self.ui_state.show_session_picker {
-                    self.ui_state.session_picker_selected = self.ui_state.session_picker_selected.saturating_add(1);
-                    return Ok(());
-                }
-                if self.active_tab == 0 {
-                    self.ui_state.focus = WindowFocus::ChatLog;
-                    self.ui_state.log_scroll = self.ui_state.log_scroll.saturating_add(3);
-                }
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
 
     pub fn add_notification(&mut self, message: String, level: NotifLevel) {
         self.notifications.push(crate::app::state::Notification {
@@ -1082,39 +334,5 @@ impl App {
         if self.notifications.len() > 3 {
             self.notifications.remove(0);
         }
-    }
-}
-
-/// Convert crossterm KeyEvent to raw terminal bytes for PTY master stream
-fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    match key.code {
-        KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                let ascii = (c as u8).to_ascii_uppercase();
-                if (b'@'..=b'_').contains(&ascii) {
-                    Some(vec![ascii - b'@'])
-                } else {
-                    None
-                }
-            } else {
-                let mut b = [0u8; 4];
-                let s = c.encode_utf8(&mut b);
-                Some(s.as_bytes().to_vec())
-            }
-        }
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Backspace => Some(vec![8]),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::Esc => Some(vec![27]),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Home => Some(b"\x1b[H".to_vec()),
-        KeyCode::End => Some(b"\x1b[F".to_vec()),
-        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
-        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
-        _ => None,
     }
 }

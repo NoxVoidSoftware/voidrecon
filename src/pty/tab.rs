@@ -17,6 +17,16 @@ pub enum TerminalKind {
     Command,
 }
 
+impl TerminalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TerminalKind::LocalShell => "shell",
+            TerminalKind::Listener => "listener",
+            TerminalKind::Command => "command",
+        }
+    }
+}
+
 /// A PTY terminal tab
 pub struct PtyTab {
     pub id: usize,
@@ -469,6 +479,12 @@ impl PtyTab {
         self.writer.write_all(data).context("Failed to write to PTY")?;
         self.writer.flush().context("Failed to flush PTY")?;
         Ok(())
+    }
+
+    /// Human-readable process state: `running` or `exited (<code>)`.
+    pub fn state_label(&self) -> String {
+        self.exit_code
+            .map_or_else(|| "running".to_string(), |code| format!("exited ({code})"))
     }
 
     /// Read the currently visible terminal screen as plain text.

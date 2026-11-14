@@ -176,7 +176,7 @@ impl SessionMeta {
                 _ => {}
             }
         }
-        list.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        list.sort_by_key(|meta| std::cmp::Reverse(meta.last_activity));
         list
     }
 }
@@ -296,10 +296,10 @@ impl App {
             while let Some(event) = reader.next().await {
                 if let Ok(crossterm::event::Event::Key(key)) = event {
                     // Discard Release events to prevent duplicate inputs and flickering on Windows
-                    if key.kind != crossterm::event::KeyEventKind::Release {
-                        if tx_keys.send(AppEvent::Key(key)).is_err() {
-                            break;
-                        }
+                    if key.kind != crossterm::event::KeyEventKind::Release
+                        && tx_keys.send(AppEvent::Key(key)).is_err()
+                    {
+                        break;
                     }
                 } else if let Ok(crossterm::event::Event::Mouse(mouse)) = event {
                     if tx_keys.send(AppEvent::Mouse(mouse)).is_err() {
@@ -377,12 +377,7 @@ impl App {
         self.llm.request_state = LlmRequestState::Idle;
         self.llm.pending_tool_calls.clear();
         self.llm.response_buffer.clear();
-        self.append_chat_message(ChatMessage {
-            role: "system".to_string(),
-            content: "⚠️ LLM generation cancelled by user (Ctrl+C)".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-        }).await;
+        self.append_chat_message(ChatMessage::system("⚠️ LLM generation cancelled by user (Ctrl+C)")).await;
         self.ui_state.log_at_bottom = true;
         self.add_notification("LLM generation cancelled".to_string(), NotifLevel::Info);
     }
@@ -534,17 +529,12 @@ impl SessionMeta {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowFocus {
     ChatLog,
+    #[default]
     Input,
     Sidebar,
-}
-
-impl Default for WindowFocus {
-    fn default() -> Self {
-        WindowFocus::Input
-    }
 }
 
 #[derive(Debug, Default)]

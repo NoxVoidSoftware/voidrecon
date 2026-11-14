@@ -49,12 +49,12 @@ impl App {
                 KeyCode::Backspace => {
                     self.ui_state.session_name_input.pop();
                 }
-                KeyCode::Char(c) => {
-                    if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ' {
-                        let c = if c == ' ' { '-' } else { c };
-                        if self.ui_state.session_name_input.len() < 50 {
-                            self.ui_state.session_name_input.push(c);
-                        }
+                KeyCode::Char(c)
+                    if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ' =>
+                {
+                    let c = if c == ' ' { '-' } else { c };
+                    if self.ui_state.session_name_input.len() < 50 {
+                        self.ui_state.session_name_input.push(c);
                     }
                 }
                 _ => {}

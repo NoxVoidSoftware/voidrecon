@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::db::{Database, DatabaseQueries};
+use crate::db::{Database, DatabaseQueries, NewFinding};
 use crate::tools::definitions::get_tool_definitions;
 use crate::llm::types::ToolCall;
 
@@ -211,7 +211,10 @@ fn execute_tool_call_blocking(
             let source_cmd = args.get("source_cmd").and_then(|v| v.as_str());
             let confidence = args.get("confidence").and_then(|v| v.as_i64()).map(|c| c as i32);
             let evidence_path = args.get("evidence_path").and_then(|v| v.as_str());
-            let id = DatabaseQueries::add_finding(&conn, target_id, title, description, severity, source_cmd, confidence, evidence_path)?;
+            let id = DatabaseQueries::add_finding(
+                &conn,
+                &NewFinding { target_id, title, description, severity, source_cmd, confidence, evidence_path },
+            )?;
             let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
             Ok(serde_json::json!({"success": true, "finding_id": id, "target_id": target_id}))
         }
@@ -300,13 +303,11 @@ fn execute_tool_call_blocking(
                 let rel_path = format!("workspace/exploits/{}", clean_name);
                 let _ = DatabaseQueries::add_finding(
                     &conn,
-                    tid,
-                    &finding_title,
-                    &finding_desc,
-                    "high",
-                    Some(&source_cmd),
-                    Some(100),
-                    Some(&rel_path),
+                    &NewFinding {
+                        source_cmd: Some(&source_cmd),
+                        evidence_path: Some(&rel_path),
+                        ..NewFinding::new(tid, &finding_title, &finding_desc, "high")
+                    },
                 );
                 let _ = app_tx.send(crate::app::AppEvent::SidebarReload);
             }

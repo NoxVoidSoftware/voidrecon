@@ -314,16 +314,11 @@ impl App {
                 if self.command_run.running.is_some() && self.active_tab == 0 {
                     if let Some(tx) = &self.command_run.stdin_tx {
                         let _ = tx.send(format!("{}\n", cmd));
-                        self.append_chat_message(ChatMessage {
-                            role: "user".to_string(),
-                            content: if cmd.trim().is_empty() {
-                                "[stdin] > <Enter>".to_string()
-                            } else {
-                                format!("[stdin] > {}", cmd.trim())
-                            },
-                            tool_calls: None,
-                            tool_call_id: None,
-                        }).await;
+                        self.append_chat_message(ChatMessage::user(if cmd.trim().is_empty() {
+                            "[stdin] > <Enter>".to_string()
+                        } else {
+                            format!("[stdin] > {}", cmd.trim())
+                        })).await;
                         self.add_notification("Sent input to running process".to_string(), NotifLevel::Info);
                     } else {
                         self.add_notification("Command is running (stdin closed). Press Ctrl+C to cancel.".to_string(), NotifLevel::Warning);

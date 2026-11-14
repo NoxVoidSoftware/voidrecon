@@ -51,6 +51,42 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    /// Raw command output shown in the chat log (sent to the LLM as quoted user content).
+    pub fn output(content: impl Into<String>) -> Self {
+        Self::new("output", content)
+    }
+
+    /// Result of the tool call identified by `tool_call_id`.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(tool_call_id.into()),
+            ..Self::new("tool", content)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
