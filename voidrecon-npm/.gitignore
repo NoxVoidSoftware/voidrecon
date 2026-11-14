@@ -1,7 +1,6 @@
 # voidrecon-npm
 node_modules/
 *.tgz
-package-lock.json
 
 # Cache
 .cache/
