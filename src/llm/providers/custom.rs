@@ -1,30 +1,26 @@
-use crate::config::ProviderKind;
-use super::LlmProvider;
+use super::{ApiKeyPolicy, ProviderSpec};
 
-/// Custom / generic OpenAI-compatible provider (LM Studio, vLLM, Groq, Together, LocalAI)
-#[derive(Debug, Clone)]
-pub struct CustomProvider {
-    pub base_url: String,
-    pub api_key: Option<String>,
-}
+/// Custom / generic OpenAI-compatible endpoint (LM Studio, vLLM, Groq, Together, LocalAI)
+pub struct Custom;
 
-impl CustomProvider {
-    pub fn new(base_url: String, api_key: Option<String>) -> Self {
-        Self { base_url, api_key }
+impl ProviderSpec for Custom {
+    fn name(&self) -> &'static str {
+        "Custom Endpoint"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["custom"]
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        "http://localhost:1234/v1"
+    }
+
+    fn api_key_policy(&self) -> ApiKeyPolicy {
+        ApiKeyPolicy::Optional
+    }
+
+    fn accepts_custom_url(&self) -> bool {
+        true
     }
 }
-
-impl LlmProvider for CustomProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Custom
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn api_key(&self) -> Option<&str> {
-        self.api_key.as_deref()
-    }
-}
-

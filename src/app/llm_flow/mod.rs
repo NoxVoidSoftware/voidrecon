@@ -8,7 +8,7 @@ use crate::db::models::{Finding, ImportantFact, Target};
 use crate::db::DatabaseQueries;
 use crate::llm::types::{ChatCompletionRequest, ToolCall};
 use crate::llm::{
-    build_system_prompt, parse_llm_response, ChatMessage, LlmProvider, LlmRequestState,
+    build_system_prompt, parse_llm_response, ChatMessage, LlmRequestState,
     SystemPromptContext, POST_EXEC_PROMPT,
 };
 use crate::tools::get_tool_definitions;

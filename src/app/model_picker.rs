@@ -1,4 +1,5 @@
 //! Model picker key handling
+use crate::config::ProviderKind;
 use crate::app::state::{App, NotifLevel};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use anyhow::Result;
@@ -143,17 +144,37 @@ impl App {
 }
 
 impl App {
-    pub async fn switch_to_provider(&mut self, provider: crate::config::ProviderKind) -> Result<()> {
+    /// Rebuilds the LLM client after the provider, key or base URL changed.
+    pub(super) fn rebuild_llm_client(&mut self) {
+        match crate::llm::LlmClient::from_config(&self.config) {
+            Ok(client) => self.llm_client = client,
+            Err(_) => self.add_notification(
+                "Failed to rebuild LLM client".to_string(),
+                NotifLevel::Error,
+            ),
+        }
+    }
+
+    /// Activates a self-hosted provider, optionally at a non-default URL, and
+    /// refreshes its model list.
+    pub async fn activate_provider_at(&mut self, provider: ProviderKind, base_url: Option<String>) {
+        self.config.set_provider(provider, base_url);
+        let _ = self.config.save().await;
+        self.rebuild_llm_client();
+        self.add_notification(
+            format!("Switched provider to {}", provider.as_str()),
+            NotifLevel::Info,
+        );
+        self.trigger_fetch_models();
+    }
+
+    pub async fn switch_to_provider(&mut self, provider: ProviderKind) -> Result<()> {
         if self.config.provider == provider {
             return Ok(());
         }
         self.config.set_provider(provider, None);
         let _ = self.config.save().await;
-        if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
-                        self.llm_client = client;
-                    } else {
-                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
-                    }
+        self.rebuild_llm_client();
         self.ui_state.model_picker_selected = 0;
         self.ui_state.model_picker_search.clear();
 
@@ -180,5 +201,4 @@ impl App {
         self.trigger_fetch_models();
         Ok(())
     }
-    
 }

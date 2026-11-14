@@ -5,7 +5,6 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::app::state::{App, NotifLevel};
 use crate::config::ALL_PROVIDERS;
-use crate::llm::LlmClient;
 
 impl App {
     pub(super) async fn handle_api_key_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -76,14 +75,7 @@ impl App {
 
         self.config.set_provider(selected_provider, None);
         let _ = self.config.save().await;
-        if let Ok(client) = LlmClient::from_config(&self.config) {
-            self.llm_client = client;
-        } else {
-            self.add_notification(
-                "Failed to rebuild LLM client".to_string(),
-                NotifLevel::Error,
-            );
-        }
+        self.rebuild_llm_client();
         self.ui_state.show_api_key_prompt = false;
         self.ui_state.api_key_input.clear();
         if self.config.models_cache.is_empty() {

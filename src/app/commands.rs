@@ -1,6 +1,7 @@
 //! Special commands and workspace command execution
 use crate::app::state::{App, NotifLevel};
 use crate::app::events::AppEvent;
+use crate::config::{ProviderKind, ALL_PROVIDERS};
 use crate::db::DatabaseQueries;
 use crate::llm::ChatMessage;
 use anyhow::{Context, Result};
@@ -82,49 +83,29 @@ impl App {
             ":provider" | ":providers" => {
                 if parts.len() > 1 {
                     let subparts: Vec<&str> = parts[1].split_whitespace().collect();
-                    match subparts.first().copied().unwrap_or("") {
-                        "openrouter" => {
-                            self.switch_to_provider(crate::config::ProviderKind::OpenRouter).await?;
+                    let name = subparts.first().copied().unwrap_or("");
+                    if matches!(name, "setup" | "menu") {
+                        self.ui_state.show_api_key_prompt = true;
+                    } else if let Some(provider) = ProviderKind::from_alias(name) {
+                        let custom_url = subparts.get(1).map(|url| url.to_string());
+                        if provider.spec().accepts_custom_url() {
+                            self.activate_provider_at(provider, custom_url).await;
+                        } else {
+                            self.switch_to_provider(provider).await?;
                         }
-                        "nvidia" | "nvidianim" | "nim" => {
-                            self.switch_to_provider(crate::config::ProviderKind::NvidiaNim).await?;
-                        }
-                        "openai" => {
-                            self.switch_to_provider(crate::config::ProviderKind::OpenAi).await?;
-                        }
-                        "ollama" => {
-                            let url = subparts.get(1).map(|u| u.to_string());
-                            self.config.set_provider(crate::config::ProviderKind::Ollama, url);
-                            let _ = self.config.save().await;
-                            if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
-                        self.llm_client = client;
                     } else {
-                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
-                    }
-                            self.add_notification("Switched provider to Ollama (Local)".to_string(), NotifLevel::Info);
-                            self.trigger_fetch_models();
-                        }
-                        "custom" => {
-                            let url = subparts.get(1).map(|u| u.to_string());
-                            self.config.set_provider(crate::config::ProviderKind::Custom, url);
-                            let _ = self.config.save().await;
-                            if let Ok(client) = crate::llm::LlmClient::from_config(&self.config) {
-                        self.llm_client = client;
-                    } else {
-                        self.add_notification("Failed to rebuild LLM client".to_string(), NotifLevel::Error);
-                    }
-                            self.add_notification("Switched provider to Custom endpoint".to_string(), NotifLevel::Info);
-                            self.trigger_fetch_models();
-                        }
-                        "setup" | "menu" => {
-                            self.ui_state.show_api_key_prompt = true;
-                        }
-                        other => {
-                            self.add_notification(
-                                format!("Unknown provider '{}'. Supported: openrouter, nvidia, openai, ollama, custom, setup", other),
-                                NotifLevel::Warning,
-                            );
-                        }
+                        let supported: Vec<&str> = ALL_PROVIDERS
+                            .iter()
+                            .filter_map(|kind| kind.spec().aliases().first().copied())
+                            .collect();
+                        self.add_notification(
+                            format!(
+                                "Unknown provider '{}'. Supported: {}, setup",
+                                name,
+                                supported.join(", ")
+                            ),
+                            NotifLevel::Warning,
+                        );
                     }
                 } else {
                     self.ui_state.show_api_key_prompt = true;

@@ -6,8 +6,8 @@ use reqwest::{Client, header::CONTENT_TYPE};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{Config, ModelInfo, ModelPricing, ProviderKind};
-use crate::llm::providers::{LlmProvider, Provider};
+use crate::config::{Config, ModelInfo, ModelPricing};
+use crate::llm::providers::Provider;
 use crate::llm::types::{
     ChatCompletionRequest, ChatCompletionResponse, Choice, StreamChunk,
 };
@@ -92,19 +92,34 @@ impl LlmClient {
         &self.inner.provider
     }
 
-    /// Fetch available models from the active provider dynamically
-    pub async fn fetch_models(&self) -> Result<Vec<ModelInfo>> {
-        let mut req = self
+    fn with_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.inner.provider.api_key() {
+            Some(key) => request.header("Authorization", format!("Bearer {}", key)),
+            None => request,
+        }
+    }
+
+    /// POST to the chat completions endpoint with auth and provider-specific headers.
+    fn chat_request(&self) -> reqwest::RequestBuilder {
+        let provider = &self.inner.provider;
+        let request = self
             .inner
             .client
-            .get(self.inner.provider.models_endpoint())
-            .timeout(Duration::from_secs(15));
+            .post(provider.chat_endpoint())
+            .header(CONTENT_TYPE, "application/json");
+        provider
+            .extra_headers()
+            .iter()
+            .fold(self.with_auth(request), |request, (name, value)| {
+                request.header(*name, *value)
+            })
+    }
 
-        if let Some(key) = self.inner.provider.api_key() {
-            if !key.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", key.trim()));
-            }
-        }
+    /// Fetch available models from the active provider dynamically
+    pub async fn fetch_models(&self) -> Result<Vec<ModelInfo>> {
+        let req = self
+            .with_auth(self.inner.client.get(self.inner.provider.models_endpoint()))
+            .timeout(Duration::from_secs(15));
 
         let response = req.send().await.context("Failed to fetch models from provider")?;
 
@@ -199,16 +214,7 @@ impl LlmClient {
         }
 
         // Filter out non-chat models (embeddings, reward, detectors, etc.)
-        if self.inner.provider.kind() == ProviderKind::NvidiaNim {
-            models.retain(|m| {
-                let id = m.id.to_lowercase();
-                !id.contains("embed")
-                    && !id.contains("reward")
-                    && !id.contains("detector")
-                    && !id.contains("calibration")
-                    && !id.contains("nvclip")
-            });
-        }
+        models.retain(|m| self.inner.provider.is_chat_model(&m.id));
 
         models.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -227,23 +233,7 @@ impl LlmClient {
 
         let mut retry_count = 0;
         let response = loop {
-            let mut req = self
-                .inner
-                .client
-                .post(self.inner.provider.chat_endpoint())
-                .header(CONTENT_TYPE, "application/json");
-
-            if let Some(key) = self.inner.provider.api_key() {
-                if !key.trim().is_empty() {
-                    req = req.header("Authorization", format!("Bearer {}", key.trim()));
-                }
-            }
-
-            if self.inner.provider.kind() == ProviderKind::OpenRouter {
-                req = req
-                    .header("HTTP-Referer", "https://github.com/NoxVoid/voidrecon")
-                    .header("X-Title", "voidrecon");
-            }
+            let req = self.chat_request();
 
             let resp = match req.json(&request).send().await {
                 Ok(resp) => resp,
@@ -430,24 +420,7 @@ impl LlmClient {
     pub async fn complete_chat(&self, mut request: ChatCompletionRequest) -> Result<String> {
         request.stream = false;
 
-        let mut req = self
-            .inner
-            .client
-            .post(self.inner.provider.chat_endpoint())
-            .header(CONTENT_TYPE, "application/json")
-            .timeout(Duration::from_secs(120));
-
-        if let Some(key) = self.inner.provider.api_key() {
-            if !key.trim().is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", key.trim()));
-            }
-        }
-
-        if self.inner.provider.kind() == ProviderKind::OpenRouter {
-            req = req
-                .header("HTTP-Referer", "https://github.com/NoxVoid/voidrecon")
-                .header("X-Title", "voidrecon");
-        }
+        let req = self.chat_request().timeout(Duration::from_secs(120));
 
         let resp = req
             .json(&request)

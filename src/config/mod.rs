@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+// Provider identity lives with the provider registry; re-exported here because
+// it is part of the config schema.
+pub use crate::llm::providers::{ProviderKind, ALL_PROVIDERS};
+
 const DEFAULT_CONTEXT_LENGTH: u32 = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,25 +48,6 @@ pub struct ModelArchitecture {
     pub tokenizer: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    #[default]
-    OpenRouter,
-    NvidiaNim,
-    OpenAi,
-    Ollama,
-    Custom,
-}
-
-pub const ALL_PROVIDERS: &[ProviderKind] = &[
-    ProviderKind::OpenRouter,
-    ProviderKind::NvidiaNim,
-    ProviderKind::OpenAi,
-    ProviderKind::Ollama,
-    ProviderKind::Custom,
-];
-
 pub fn mask_key(key: &str) -> String {
     let trimmed = key.trim();
     if trimmed.is_empty() {
@@ -76,42 +61,9 @@ pub fn mask_key(key: &str) -> String {
     format!("{}...{}", prefix, suffix)
 }
 
-fn default_provider() -> ProviderKind {
-    ProviderKind::OpenRouter
-}
-
-impl ProviderKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::OpenRouter => "OpenRouter",
-            Self::NvidiaNim => "NVIDIA NIM",
-            Self::OpenAi => "OpenAI",
-            Self::Ollama => "Ollama (Local)",
-            Self::Custom => "Custom Endpoint",
-        }
-    }
-
-    pub fn default_base_url(&self) -> &'static str {
-        match self {
-            Self::OpenRouter => "https://openrouter.ai/api/v1",
-            Self::NvidiaNim => "https://integrate.api.nvidia.com/v1",
-            Self::OpenAi => "https://api.openai.com/v1",
-            Self::Ollama => "http://localhost:11434/v1",
-            Self::Custom => "http://localhost:1234/v1",
-        }
-    }
-
-    pub fn requires_api_key(&self) -> bool {
-        match self {
-            Self::OpenRouter | Self::NvidiaNim | Self::OpenAi => true,
-            Self::Ollama | Self::Custom => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default = "default_provider")]
+    #[serde(default)]
     pub provider: ProviderKind,
     #[serde(default)]
     pub base_url: Option<String>,
@@ -143,24 +95,6 @@ impl ModelInfo {
         let prompt_zero = self.pricing.prompt.trim().parse::<f64>().map(|v| v == 0.0).unwrap_or(false);
         let completion_zero = self.pricing.completion.trim().parse::<f64>().map(|v| v == 0.0).unwrap_or(false);
         prompt_zero && completion_zero
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            provider: ProviderKind::OpenRouter,
-            base_url: None,
-            api_key: String::new(),
-            provider_keys: HashMap::new(),
-            provider_models: HashMap::new(),
-            provider_models_updated_at: HashMap::new(),
-            provider_active_models: HashMap::new(),
-            active_model: String::new(),
-            models_cache: Vec::new(),
-            models_cache_updated_at: None,
-            learned_context_lengths: HashMap::new(),
-        }
     }
 }
 
@@ -293,19 +227,7 @@ impl Config {
     }
 
     pub fn is_configured(&self, provider: ProviderKind) -> bool {
-        match provider {
-            ProviderKind::Ollama => {
-                self.provider == ProviderKind::Ollama
-                    || self.has_api_key(provider)
-                    || (self.base_url.is_some() && self.provider == ProviderKind::Ollama)
-            }
-            ProviderKind::Custom => {
-                self.provider == ProviderKind::Custom
-                    || self.has_api_key(provider)
-                    || (self.base_url.is_some() && self.provider == ProviderKind::Custom)
-            }
-            _ => self.has_api_key(provider) || self.provider == provider,
-        }
+        self.has_api_key(provider) || self.provider == provider
     }
 
     pub fn configured_providers(&self) -> Vec<ProviderKind> {

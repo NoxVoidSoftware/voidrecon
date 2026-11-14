@@ -1,32 +1,18 @@
-use crate::config::ProviderKind;
-use super::LlmProvider;
+use super::ProviderSpec;
 
-/// OpenAI direct provider
-#[derive(Debug, Clone)]
-pub struct OpenAiProvider {
-    pub base_url: String,
-    pub api_key: String,
-}
+/// OpenAI direct API
+pub struct OpenAi;
 
-impl OpenAiProvider {
-    pub fn new(api_key: String, custom_base_url: Option<String>) -> Self {
-        Self {
-            base_url: custom_base_url.unwrap_or_else(|| ProviderKind::OpenAi.default_base_url().to_string()),
-            api_key,
-        }
-    }
-}
-
-impl LlmProvider for OpenAiProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::OpenAi
+impl ProviderSpec for OpenAi {
+    fn name(&self) -> &'static str {
+        "OpenAI"
     }
 
-    fn base_url(&self) -> &str {
-        &self.base_url
+    fn aliases(&self) -> &'static [&'static str] {
+        &["openai"]
     }
 
-    fn api_key(&self) -> Option<&str> {
-        Some(&self.api_key)
+    fn default_base_url(&self) -> &'static str {
+        "https://api.openai.com/v1"
     }
 }
