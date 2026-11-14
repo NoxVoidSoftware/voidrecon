@@ -107,10 +107,15 @@ jobs:
         run: npm ci
         working-directory: ./voidrecon-npm
 
-      - name: Update package version from tag
+      - name: Update package version from tag (if needed)
         run: |
           TAG=${GITHUB_REF_NAME#v}
-          npm version $TAG --no-git-tag-version
+          CURRENT=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$CURRENT" ]; then
+            npm version $TAG --no-git-tag-version
+          else
+            echo "Version already $TAG, skipping version bump"
+          fi
         working-directory: ./voidrecon-npm
 
       - name: Publish to npm
