@@ -191,6 +191,8 @@ pub struct LlmState {
     pub pending_context_tokens: Option<usize>,
     pub pending_context_limit_key: Option<String>,
     pub post_exec_mode: bool,
+    /// Automatic continuations sent after truncated replies in the current turn.
+    pub auto_continues: u8,
     pub abort_handle: Option<tokio::task::AbortHandle>,
     pub suggestion: Option<LlmSuggestion>,
     pub suggestion_visible: bool,
@@ -275,43 +277,6 @@ impl App {
         let session_list = SessionMeta::list_sessions().await;
         
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        
-        // Spawn tick event generator
-        let tx_tick = event_tx.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
-            loop {
-                interval.tick().await;
-                if tx_tick.send(AppEvent::Tick).is_err() {
-                    break;
-                }
-            }
-        });
-        
-        // Spawn crossterm event reader
-        let tx_keys = event_tx.clone();
-        tokio::spawn(async move {
-            let mut reader = crossterm::event::EventStream::new();
-            use futures_util::StreamExt;
-            while let Some(event) = reader.next().await {
-                if let Ok(crossterm::event::Event::Key(key)) = event {
-                    // Discard Release events to prevent duplicate inputs and flickering on Windows
-                    if key.kind != crossterm::event::KeyEventKind::Release
-                        && tx_keys.send(AppEvent::Key(key)).is_err()
-                    {
-                        break;
-                    }
-                } else if let Ok(crossterm::event::Event::Mouse(mouse)) = event {
-                    if tx_keys.send(AppEvent::Mouse(mouse)).is_err() {
-                        break;
-                    }
-                } else if let Ok(crossterm::event::Event::Resize(cols, rows)) = event {
-                    if tx_keys.send(AppEvent::Resize(cols, rows)).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
         
         let prompt_api_key = config.provider.requires_api_key() && config.api_key.is_empty();
 

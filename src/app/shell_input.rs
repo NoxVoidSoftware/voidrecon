@@ -215,7 +215,11 @@ impl App {
     pub fn set_input_cursor_from_column(&mut self, column: usize) {
         let mut display_column = 0;
         for (byte_index, character) in self.input_buffer.char_indices() {
-            let width = UnicodeWidthChar::width(character).unwrap_or(0);
+            // Newlines and tabs are drawn as one-column glyphs in the input line.
+            let width = match character {
+                '\n' | '\t' => 1,
+                _ => UnicodeWidthChar::width(character).unwrap_or(0),
+            };
             if column < display_column + width {
                 self.ui_state.input_cursor = byte_index;
                 return;

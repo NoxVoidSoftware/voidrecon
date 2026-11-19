@@ -12,7 +12,7 @@ mod ui;
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::DisableMouseCapture,
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -25,7 +25,7 @@ struct TermGuard;
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
         original_hook(panic_info);
     }));
 
@@ -44,6 +44,9 @@ async fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
+    // Bracketed paste delivers multi-line pastes as one event instead of a
+    // burst of key presses (where each newline would submit the input).
+    let _ = execute!(stdout(), EnableBracketedPaste);
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = ratatui::Terminal::new(backend)?;
 

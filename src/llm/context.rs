@@ -44,6 +44,7 @@ Be concise.
 ## Operating rules
 - Use the provided tools; their schemas are authoritative. Do not guess tool names or parameters.
 - Execute commands only via `run_command`; never write commands to files to execute them.
+- When you decide on a next step, take it in the same reply by calling the tool. Do not announce an action ("Next I will ...") and then stop; end your reply only when the task is done or you need the user's input or approval.
 - Mark commands that need an interactive terminal (for example SSH, Evil-WinRM, database clients, or REPLs) as interactive so they start in a dedicated tab.
 - Use `list_terminal_tabs` and `read_terminal_tab` to inspect active sessions. After launching an interactive session, read its screen before requesting input. Every `send_terminal_input` and `close_terminal_tab` action requires the user's confirmation; never repeatedly request inputs without reviewing each result and honoring the user's scope.
 - `nc`, `ncat` and `socat` listeners started via `run_command` are intercepted and open a dedicated listener tab after user approval.
@@ -328,23 +329,35 @@ pub const POST_EXEC_PROMPT: &str = r#"Analyze the command output in the context 
 - STRICTLY RESPECT USER INSTRUCTIONS: Review previous conversation messages. If the user asked not to use certain tools, flags, or techniques, do NOT suggest or invoke them.
 - Provide a concise 1-2 sentence summary, and if appropriate, suggest the next logical pentest step via `run_command`."#;
 
-/// Parse LLM response JSON into typed suggestion
-pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSuggestion> {
-    let mut text = response.trim();
-
-    // Strip <think>...</think> if present (reasoning models)
-    let cleaned_text;
-    if let Some(think_end) = text.find("</think>") {
-        if let Some(think_start) = text.find("<think>") {
-            if think_end > think_start {
-                cleaned_text = format!("{}{}", &text[..think_start], &text[think_end + 8..]);
-                text = cleaned_text.trim();
-            }
-        } else {
-            cleaned_text = text[think_end + 8..].to_string();
-            text = cleaned_text.trim();
+/// Removes `<think>...</think>` reasoning blocks (including an unterminated one
+/// left by a truncated stream, or a closing tag without an opening one).
+pub fn strip_reasoning(text: &str) -> String {
+    let mut rest = text;
+    if let Some(end) = rest.find("</think>") {
+        if !rest[..end].contains("<think>") {
+            rest = &rest[end + "</think>".len()..];
         }
     }
+    let mut result = String::with_capacity(rest.len());
+    while let Some(start) = rest.find("<think>") {
+        result.push_str(&rest[..start]);
+        match rest[start..].find("</think>") {
+            Some(end) => rest = &rest[start + end + "</think>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    result.push_str(rest);
+    result.trim().to_string()
+}
+
+/// Parse LLM response JSON into typed suggestion
+pub fn parse_llm_response(response: &str) -> Result<crate::llm::types::LlmSuggestion> {
+    // Strip <think>...</think> if present (reasoning models)
+    let cleaned_text = strip_reasoning(response);
+    let text = cleaned_text.as_str();
 
     let suggestion = 'parse: {
         // 1. Direct JSON parse

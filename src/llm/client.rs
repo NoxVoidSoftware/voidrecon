@@ -295,6 +295,13 @@ impl LlmClient {
         let mut stream = response.bytes_stream();
         let mut tool_calls_accumulated: Vec<crate::llm::types::ToolCall> = Vec::new();
         let mut line_buffer = String::new();
+        let mut finish_reason: Option<String> = None;
+        // Reasoning deltas are streamed inside <think> tags so they can be shown
+        // while thinking but stripped from the final answer and history.
+        let mut in_reasoning = false;
+        let send_chunk = |text: String| {
+            let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, text));
+        };
 
         use futures_util::StreamExt;
         'stream_loop: while let Some(chunk_result) = stream.next().await {
@@ -317,17 +324,27 @@ impl LlmClient {
                     }
                     if let Ok(stream_chunk) = serde_json::from_str::<StreamChunk>(data) {
                         for choice in stream_chunk.choices {
-                            // 1. Content delta
-                            if let Some(content) = &choice.delta.content {
-                                if !content.is_empty() {
-                                    let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, content.clone()));
+                            // 1. Reasoning delta (DeepSeek R1, Qwen3, gpt-oss, ...)
+                            let reasoning = choice
+                                .delta
+                                .reasoning_content
+                                .as_deref()
+                                .filter(|text| !text.is_empty())
+                                .or_else(|| choice.delta.reasoning.as_deref().filter(|text| !text.is_empty()));
+                            if let Some(reasoning) = reasoning {
+                                if !in_reasoning {
+                                    in_reasoning = true;
+                                    send_chunk("<think>\n".to_string());
                                 }
+                                send_chunk(reasoning.to_string());
                             }
-                            // 2. Reasoning delta (DeepSeek R1 / V4.1)
-                            if let Some(reasoning) = &choice.delta.reasoning_content {
-                                if !reasoning.is_empty() {
-                                    let _ = tx.send(crate::app::AppEvent::LlmChunk(request_id, reasoning.clone()));
+                            // 2. Content delta
+                            if let Some(content) = choice.delta.content.as_deref().filter(|text| !text.is_empty()) {
+                                if in_reasoning {
+                                    in_reasoning = false;
+                                    send_chunk("\n</think>\n".to_string());
                                 }
+                                send_chunk(content.to_string());
                             }
                             // 3. Tool call delta
                             if let Some(tool_calls) = &choice.delta.tool_calls {
@@ -363,7 +380,8 @@ impl LlmClient {
                                     }
                                 }
                             }
-                            if choice.finish_reason.is_some() {
+                            if let Some(reason) = choice.finish_reason.filter(|reason| !reason.is_empty()) {
+                                finish_reason = Some(reason);
                                 break 'stream_loop;
                             }
                         }
@@ -384,13 +402,18 @@ impl LlmClient {
             }
         }
 
+        if in_reasoning {
+            send_chunk("\n</think>\n".to_string());
+        }
+
         // Dispatch tool calls if any accumulated
         if !tool_calls_accumulated.is_empty() {
             for tc in &tool_calls_accumulated {
                 let _ = tx.send(crate::app::AppEvent::LlmToolCall(request_id, tc.clone()));
             }
         }
-        let _ = tx.send(crate::app::AppEvent::LlmDone(request_id));
+        let truncated = finish_reason.as_deref() == Some("length");
+        let _ = tx.send(crate::app::AppEvent::LlmDone(request_id, truncated));
 
         // Build final response
         let final_message = if !tool_calls_accumulated.is_empty() {

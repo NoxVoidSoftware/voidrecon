@@ -16,29 +16,24 @@ impl App {
         Ok(())
     }
     
+    /// A PTY process exited: its tab is closed. Interactive command tabs (nc,
+    /// ssh, ...) keep their last screen in the chat log so the output survives.
     pub async fn handle_pty_exited(&mut self, tab_id: usize, exit_code: i32) -> Result<()> {
-        if let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) {
-            if self.tabs[pos].kind == crate::pty::tab::TerminalKind::Command {
-                if self.tabs[pos].exit_code.is_none() {
-                    self.tabs[pos].exit_code = Some(exit_code);
-                    self.tabs[pos].label.push_str(&format!(" (exited {exit_code})"));
-                }
-                return Ok(());
-            }
-            let label = self.tabs[pos].label.clone();
-            self.tabs.remove(pos);
-            let tab_index = pos + 1;
-            if self.active_tab == tab_index {
-                // If on the closed tab, switch to previous tab or Tab 0 (Workspace & LLM)
-                self.active_tab = pos;
-            } else if self.active_tab > tab_index {
-                self.active_tab -= 1;
-            }
-            if self.active_tab > self.tabs.len() {
-                self.active_tab = self.tabs.len();
-            }
-            self.add_notification(format!("{} closed (exit code {})", label, exit_code), NotifLevel::Info);
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return Ok(());
+        };
+        let final_screen = (tab.kind == crate::pty::tab::TerminalKind::Command)
+            .then(|| tab.screen_text())
+            .filter(|text| !text.is_empty());
+        let label = self.close_terminal_tab(tab_id)?;
+        if let Some(text) = final_screen {
+            self.append_chat_message(crate::llm::ChatMessage::output(format!(
+                "[{} exited with code {}]\n{}",
+                label, exit_code, text
+            )))
+            .await;
         }
+        self.add_notification(format!("{} closed (exit code {})", label, exit_code), NotifLevel::Info);
         Ok(())
     }
 
@@ -55,6 +50,10 @@ impl App {
             self.active_tab = pos;
         } else if self.active_tab > tab_index {
             self.active_tab -= 1;
+        }
+        self.active_tab = self.active_tab.min(self.tabs.len());
+        if self.active_tab == 0 {
+            self.ui_state.focus = crate::app::state::WindowFocus::Input;
         }
         Ok(label)
     }

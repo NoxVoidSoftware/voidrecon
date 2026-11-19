@@ -483,10 +483,28 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("Connecting to provider & generating response... {}", spinner), Style::default().fg(Color::Yellow)),
             ]));
         } else {
+            // Reasoning arrives wrapped in <think> tags; show it dimmed.
+            let mut in_reasoning = false;
             for line in app.llm.response_buffer.lines() {
+                match line.trim() {
+                    "<think>" => {
+                        in_reasoning = true;
+                        continue;
+                    }
+                    "</think>" => {
+                        in_reasoning = false;
+                        continue;
+                    }
+                    _ => {}
+                }
+                let text_style = if in_reasoning {
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(Color::White)
+                };
                 display_lines.push(Line::from(vec![
                     Span::styled("│ ", Style::default().fg(Color::Yellow)),
-                    Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(line.to_string(), text_style),
                 ]));
             }
             display_lines.push(Line::from(vec![
@@ -650,6 +668,9 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
         ),
     };
     
+    // Pasted multi-line input stays in the buffer; show newlines and tabs as
+    // single-width glyphs so the line and the cursor column stay aligned.
+    let display_input = |text: &str| text.replace('\n', "⏎").replace('\t', " ");
     let input_span = if app.input_buffer.is_empty() {
         if is_running_cmd {
             Span::styled(
@@ -660,7 +681,7 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("")
         }
     } else {
-        Span::raw(&app.input_buffer)
+        Span::raw(display_input(&app.input_buffer))
     };
 
     let input = Paragraph::new(Line::from(vec![
@@ -678,7 +699,7 @@ fn render_input_line(f: &mut Frame, app: &App, area: Rect) {
             .input_buffer
             .get(..app.ui_state.input_cursor)
             .unwrap_or(&app.input_buffer);
-        let cursor_offset = UnicodeWidthStr::width(cursor);
+        let cursor_offset = UnicodeWidthStr::width(display_input(cursor).as_str());
         let cursor_x = (area.x
             + mode_indicator.len() as u16
             + cursor_offset.min(u16::MAX as usize) as u16)
@@ -692,6 +713,25 @@ fn render_shell_tab(f: &mut Frame, app: &mut App, area: Rect) {
         let tab = &app.tabs[app.active_tab - 1];
         let widget = crate::ui::widgets::VtScreenWidget { parser: &tab.parser };
         f.render_widget(widget, area);
+
+        // Show the terminal cursor where the PTY program placed it, unless the
+        // program hid it or a modal is covering the tab.
+        let modal_open = app.ui_state.show_help
+            || app.ui_state.show_model_picker
+            || app.ui_state.show_session_picker
+            || app.ui_state.show_api_key_prompt;
+        if modal_open {
+            return;
+        }
+        if let Ok(parser) = tab.parser.lock() {
+            let screen = parser.screen();
+            if !screen.hide_cursor() {
+                let (row, col) = screen.cursor_position();
+                if row < area.height && col < area.width {
+                    f.set_cursor(area.x + col, area.y + row);
+                }
+            }
+        }
     } else {
         let msg = Paragraph::new("No active shell tab. Press F3 to create a new shell tab.")
             .block(Block::default().borders(Borders::ALL).title(" Shell "));
@@ -709,22 +749,35 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let mouse_label = if app.mouse_capture_enabled { "F4/Alt+M:Mouse[ON]" } else { "F4/Alt+M:Mouse[OFF]" };
     let mouse_fg = if app.mouse_capture_enabled { Color::Green } else { Color::Yellow };
 
+    let key_style = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let alert_style = Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD);
+    let in_shell_tab = app.active_tab > 0;
+
     let mut footer_spans = vec![
-        Span::styled(" F1/Alt+H:Help ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::styled(" F2:Models ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::styled(" F3:New Shell ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(" F1:Help ", key_style),
+        Span::styled(" F2:Models ", key_style),
+        Span::styled(" F3:New Shell ", key_style),
         Span::styled(format!(" {} ", mouse_label), Style::default().bg(Color::DarkGray).fg(mouse_fg)),
-        Span::styled(" Tab:Switch Tab ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::styled(" Esc:Workspace ", Style::default().bg(Color::DarkGray).fg(Color::White)),
     ];
+    if !app.tabs.is_empty() {
+        footer_spans.push(Span::styled(" Shift+Tab:Next Tab ", key_style));
+    }
+    if in_shell_tab {
+        footer_spans.push(Span::styled(" Esc:Workspace ", key_style));
+        footer_spans.push(Span::styled(" Ctrl+C:To Process ", key_style));
+    } else {
+        footer_spans.push(Span::styled(" Tab:Complete ", key_style));
+        footer_spans.push(Span::styled(" Ctrl+L:Ask LLM ", key_style));
+    }
     if app.pending_exploit_approval.is_some() {
-        footer_spans.push(Span::styled(" [Y: Approve | N: Reject] ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+        footer_spans.push(Span::styled(" [Y: Approve | N: Reject] ", alert_style));
     }
-    if app.command_run.running.is_some() {
-        footer_spans.push(Span::styled(" Ctrl+C: Cancel Process ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
-    }
-    if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
-        footer_spans.push(Span::styled(" Ctrl+C: Cancel LLM ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+    if !in_shell_tab {
+        if app.command_run.running.is_some() {
+            footer_spans.push(Span::styled(" Ctrl+C: Cancel Process ", alert_style));
+        } else if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
+            footer_spans.push(Span::styled(" Ctrl+C/Esc: Cancel LLM ", alert_style));
+        }
     }
     footer_spans.push(Span::styled(format!(" [{}] ", mode_text), Style::default().bg(Color::Blue).fg(Color::White)));
 

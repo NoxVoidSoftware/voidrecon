@@ -1,6 +1,6 @@
 [package]
 name = "voidrecon"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2021"
 description = "Production-grade interactive TUI terminal application for security auditing, CLI workflows, and LLM-assisted terminal operations. Developed under NoxVoid Software."
 authors = ["NoxVoid Software"]
@@ -36,9 +36,6 @@ uuid = { version = "1.7", features = ["v4", "serde", "fast-rng"] }
 futures-util = "0.3"
 sha2 = "0.10"
 which = "6.0"
-
-# Terminal size detection
-terminal_size = "0.2"
 unicode-width = "0.1"
 
 [dev-dependencies]

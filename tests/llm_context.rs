@@ -3,7 +3,7 @@ use voidrecon::app::App;
 use voidrecon::config::{Config, ProviderKind};
 use voidrecon::db::models::{Command, Target};
 use voidrecon::llm::{
-    build_system_prompt, parse_llm_response, ChatMessage, SystemPromptContext, ToolCall,
+    build_system_prompt, parse_llm_response, strip_reasoning, ChatMessage, SystemPromptContext, ToolCall,
     ToolFunction,
 };
 use voidrecon::tools::get_tool_definitions;
@@ -300,6 +300,17 @@ fn llm_response_parsing_still_handles_json_and_mixed_output() {
     assert_eq!(with_think.explanation, "Here is the analysis.");
 }
 
+#[test]
+fn strip_reasoning_handles_partial_think_blocks() {
+    assert_eq!(strip_reasoning("<think>\nplan\n</think>\nAnswer"), "Answer");
+    assert_eq!(strip_reasoning("Before <think>a</think> after"), "Before  after");
+    // Truncated stream: the reasoning block never closed.
+    assert_eq!(strip_reasoning("Partial <think>\nstill thinking"), "Partial");
+    // Some models emit only the closing tag.
+    assert_eq!(strip_reasoning("reasoning</think>Answer"), "Answer");
+    assert_eq!(strip_reasoning("Plain answer"), "Plain answer");
+}
+
 #[tokio::test]
 async fn chat_history_handles_large_non_ascii_output() {
     let mut app = App::new().await.expect("App::new failed");
@@ -356,7 +367,7 @@ async fn listener_approval_keeps_tool_cycle_complete() {
         call("call-after", "list_terminal_tabs", "{}"),
     ];
 
-    app.handle_llm_done(request_id)
+    app.handle_llm_done(request_id, false)
         .await
         .expect("handle_llm_done failed");
 

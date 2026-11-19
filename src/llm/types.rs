@@ -162,6 +162,9 @@ pub struct ChatDelta {
     pub content: Option<String>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Newer vLLM-based servers (incl. some NVIDIA NIM models) use `reasoning`.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<StreamToolCall>>,
 }

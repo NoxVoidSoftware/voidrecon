@@ -12,7 +12,52 @@ use crate::llm::{ChatMessage, LlmRequestState};
 use crate::ui::render_ui;
 
 impl App {
+    pub fn spawn_event_generators(&self) {
+        // Spawn tick event generator
+        let tx_tick = self.event_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(50));
+            loop {
+                interval.tick().await;
+                if tx_tick.send(AppEvent::Tick).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Spawn crossterm event reader
+        let tx_keys = self.event_tx.clone();
+        tokio::spawn(async move {
+            let mut reader = crossterm::event::EventStream::new();
+            use futures_util::StreamExt;
+            while let Some(event) = reader.next().await {
+                if let Ok(crossterm::event::Event::Key(key)) = event {
+                    // Discard Release events to prevent duplicate inputs and flickering on Windows
+                    if key.kind != crossterm::event::KeyEventKind::Release
+                        && tx_keys.send(AppEvent::Key(key)).is_err()
+                    {
+                        break;
+                    }
+                } else if let Ok(crossterm::event::Event::Mouse(mouse)) = event {
+                    if tx_keys.send(AppEvent::Mouse(mouse)).is_err() {
+                        break;
+                    }
+                } else if let Ok(crossterm::event::Event::Paste(text)) = event {
+                    if tx_keys.send(AppEvent::Paste(text)).is_err() {
+                        break;
+                    }
+                } else if let Ok(crossterm::event::Event::Resize(cols, rows)) = event {
+                    if tx_keys.send(AppEvent::Resize(cols, rows)).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn run<B: Backend>(&mut self, terminal: &mut ratatui::Terminal<B>) -> Result<()> {
+        self.spawn_event_generators();
+
         // Initial render
         terminal.draw(|f| render_ui(f, self))?;
         
@@ -47,6 +92,10 @@ impl App {
                 self.handle_mouse(mouse).await?;
                 Ok(true)
             }
+            AppEvent::Paste(text) => {
+                self.handle_paste(text);
+                Ok(true)
+            }
             AppEvent::PtyData(tab_id, data) => {
                 self.handle_pty_data(tab_id, data).await?;
                 Ok(true)
@@ -71,8 +120,8 @@ impl App {
                 self.handle_llm_request_failed(request_id, error).await;
                 Ok(true)
             }
-            AppEvent::LlmDone(request_id) => {
-                self.handle_llm_done(request_id).await?;
+            AppEvent::LlmDone(request_id, truncated) => {
+                self.handle_llm_done(request_id, truncated).await?;
                 Ok(true)
             }
             AppEvent::CommandStarted(request_id, cmd) => {
@@ -165,14 +214,15 @@ impl App {
             return Ok(());
         }
 
-        // While the LLM is generating, Ctrl+C or Esc cancels the request
+        // While the LLM is generating, Ctrl+C or Esc on the workspace tab cancels
+        // the request. In shell tabs these keys belong to the running process.
         let llm_busy = matches!(
             self.llm.request_state,
             LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
         );
         let is_cancel_key = key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
-        if llm_busy && is_cancel_key {
+        if self.active_tab == 0 && llm_busy && is_cancel_key {
             self.cancel_llm_request().await;
             return Ok(());
         }
@@ -185,6 +235,70 @@ impl App {
             return Ok(());
         }
         self.handle_workspace_key(key).await
+    }
+
+    /// Pasted text goes to whatever currently receives typed input. Multi-line
+    /// text is kept intact in the workspace input instead of being submitted
+    /// line by line.
+    fn handle_paste(&mut self, text: String) {
+        if text.is_empty() || self.ui_state.show_help || self.pending_exploit_approval.is_some() {
+            return;
+        }
+        let single_line = || text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        if self.ui_state.show_session_picker {
+            // Session names are capped at 50 bytes, same as typed input.
+            let input = &mut self.ui_state.session_name_input;
+            for c in single_line().chars() {
+                if input.len() + c.len_utf8() > 50 {
+                    break;
+                }
+                input.push(c);
+            }
+            return;
+        }
+        if self.ui_state.show_api_key_prompt {
+            self.ui_state.api_key_input.push_str(text.trim());
+            return;
+        }
+        if self.ui_state.show_model_picker {
+            self.ui_state.model_picker_search.push_str(&single_line());
+            self.ui_state.model_picker_selected = 0;
+            return;
+        }
+        if self.active_tab > 0 {
+            self.paste_into_shell_tab(&text);
+            return;
+        }
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        for c in normalized.chars() {
+            if c == '\n' || c == '\t' || !c.is_control() {
+                self.insert_input_char(c);
+            }
+        }
+        self.ui_state.focus = WindowFocus::Input;
+    }
+
+    /// Writes pasted text to the active PTY, wrapped in bracketed-paste markers
+    /// when the program asked for them (so shells don't run each line).
+    fn paste_into_shell_tab(&mut self, text: &str) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab - 1) else {
+            return;
+        };
+        let bracketed = tab
+            .parser
+            .lock()
+            .is_ok_and(|parser| parser.screen().bracketed_paste());
+        let body = text.replace("\r\n", "\r").replace('\n', "\r");
+        let mut bytes = Vec::with_capacity(body.len() + 12);
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
+        }
+        bytes.extend_from_slice(body.as_bytes());
+        if bracketed {
+            bytes.extend_from_slice(b"\x1b[201~");
+        }
+        let _ = tab.write(&bytes);
     }
 
     /// Shortcuts that work on every tab. Returns `true` when the key was consumed.
@@ -202,7 +316,7 @@ impl App {
             (KeyCode::F(4), _) | (KeyCode::Char('m'), KeyModifiers::ALT) => {
                 self.toggle_mouse_capture()?
             }
-            (KeyCode::BackTab, _) => self.cycle_focus_backward(),
+            (KeyCode::BackTab, _) => self.cycle_tabs(),
             _ => return Ok(false),
         }
         Ok(true)
@@ -301,27 +415,13 @@ impl App {
         Ok(())
     }
 
-    pub fn cycle_focus_backward(&mut self) {
-        if self.active_tab > 0 {
-            if self.active_tab == 1 {
-                self.active_tab = 0;
-                self.ui_state.focus = WindowFocus::Input;
-            } else {
-                self.active_tab -= 1;
-            }
-            return;
-        }
-
-        match self.ui_state.focus {
-            WindowFocus::Input => self.ui_state.focus = WindowFocus::ChatLog,
-            WindowFocus::ChatLog if !self.ui_state.sidebar_collapsed => {
-                self.ui_state.focus = WindowFocus::Sidebar;
-            }
-            WindowFocus::ChatLog | WindowFocus::Sidebar if !self.tabs.is_empty() => {
-                self.active_tab = self.tabs.len();
-            }
-            WindowFocus::ChatLog => self.ui_state.focus = WindowFocus::Input,
-            WindowFocus::Sidebar => self.ui_state.focus = WindowFocus::Input,
+    /// Shift+Tab: switches to the next tab, wrapping from the last shell tab
+    /// back to the workspace (Tab 0).
+    pub fn cycle_tabs(&mut self) {
+        let tab_count = self.tabs.len() + 1;
+        self.active_tab = (self.active_tab + 1) % tab_count;
+        if self.active_tab == 0 {
+            self.ui_state.focus = WindowFocus::Input;
         }
     }
 
