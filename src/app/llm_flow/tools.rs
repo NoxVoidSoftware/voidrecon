@@ -138,7 +138,7 @@ impl App {
 
     /// Applies tool-specific side effects (notifications, suggestions, approval
     /// requests) and records the tool result in the conversation.
-    async fn apply_tool_result(&mut self, tool_call: &ToolCall, result: Value) -> Result<ToolFlow> {
+    async fn apply_tool_result(&mut self, tool_call: &ToolCall, mut result: Value) -> Result<ToolFlow> {
         match tool_call.function.name.as_str() {
             "save_exploit_script" => {
                 if let Some(path) = result.get("path").and_then(Value::as_str) {
@@ -146,8 +146,16 @@ impl App {
                 }
             }
             "run_command" => {
-                // A listener's tool result is written once the user approves or rejects it.
-                if self.apply_run_command(tool_call, &result).await == ToolFlow::AwaitUser {
+                if let Some(conflict) = self.port_conflict(tool_call).await {
+                    // Starting a second server on a busy port only fails; tell the LLM instead.
+                    self.add_notification(conflict.clone(), NotifLevel::Warning);
+                    result = json!({
+                        "status": "not_run",
+                        "reason": "port_in_use",
+                        "message": conflict
+                    });
+                } else if self.apply_run_command(tool_call, &result).await == ToolFlow::AwaitUser {
+                    // A listener's tool result is written once the user approves or rejects it.
                     return Ok(ToolFlow::AwaitUser);
                 }
             }

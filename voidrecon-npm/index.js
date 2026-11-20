@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = resolve(__filename, '..');
 
-const VERSION = '0.1.7';
+const VERSION = '0.1.8';
 const REPO = 'NoxVoidSoftware/voidrecon';
 const BASE_URL = `https://github.com/${REPO}/releases/download/v${VERSION}`;
 

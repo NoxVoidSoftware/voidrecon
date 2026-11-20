@@ -105,6 +105,11 @@ pub struct PtyTab {
     /// Transcript offset up to which the LLM has read this tab's output.
     pub llm_read_offset: u64,
     pub label: String,
+    /// Full command line run in this tab (none for a plain shell).
+    pub command: Option<String>,
+    pub started: Instant,
+    /// Process id of the tab's top process.
+    pub pid: Option<u32>,
     pub kind: TerminalKind,
     pub exit_code: Option<i32>,
     pub master: Box<dyn MasterPty + Send>,
@@ -193,6 +198,7 @@ impl PtyTab {
             }
         });
 
+        let pid = child.process_id();
         let child_arc = Arc::new(Mutex::new(child));
         let child_clone = child_arc.clone();
         let tx_exit = tx.clone();
@@ -227,6 +233,9 @@ impl PtyTab {
             number: id,
             transcript,
             llm_read_offset: 0,
+            command: None,
+            started: Instant::now(),
+            pid,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -405,6 +414,7 @@ impl PtyTab {
             }
         });
 
+        let pid = child.process_id();
         let child_arc = Arc::new(Mutex::new(child));
         let child_clone = child_arc.clone();
         let tx_exit = tx.clone();
@@ -437,6 +447,9 @@ impl PtyTab {
             number: id,
             transcript,
             llm_read_offset: 0,
+            command: Some(format!("listener on port {}", lport)),
+            started: Instant::now(),
+            pid,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -516,6 +529,7 @@ impl PtyTab {
             }
         });
 
+        let pid = child.process_id();
         let child_arc = Arc::new(Mutex::new(child));
         let child_clone = child_arc.clone();
         let tx_exit = tx;
@@ -556,6 +570,9 @@ impl PtyTab {
             number: id,
             transcript,
             llm_read_offset: 0,
+            command: Some(command.to_string()),
+            started: Instant::now(),
+            pid,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,

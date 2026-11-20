@@ -1,7 +1,9 @@
 //! LLM conversation flow: building requests, streaming events, and finishing turns.
 
 mod budget;
+mod tab_context;
 mod tools;
+mod user_notes;
 mod web_tools;
 
 use crate::app::state::{App, NotifLevel};
@@ -173,40 +175,9 @@ impl App {
             workspace_path: Some(&self.session_meta.workspace_path()),
         })
         .await?;
-        let active_tab_id = self.active_terminal_tab_id();
-        prompt.push_str(&format!(
-            "\n\n## Open Terminal Tabs\nTab 0: Workspace & LLM [{}].",
-            if self.active_tab == 0 { "active" } else { "inactive" }
-        ));
-        for tab in &self.tabs {
-            let unread = tab.unread_bytes();
-            let activity = match (unread, tab.last_output()) {
-                (0, _) => "no new output since your last read".to_string(),
-                (bytes, Some(time)) => format!(
-                    "{} bytes of NEW output you have not read yet (last output {}s ago)",
-                    bytes,
-                    time.elapsed().as_secs()
-                ),
-                (bytes, None) => format!("{} bytes of NEW output you have not read yet", bytes),
-            };
-            prompt.push_str(&format!(
-                "\nTab {} (tab_id {}): {} [type: {}, {}, {}; {}]",
-                tab.number,
-                tab.number,
-                Self::quote_untrusted(&tab.label),
-                tab.kind.as_str(),
-                tab.state_label(),
-                if active_tab_id == Some(tab.number) {
-                    "active"
-                } else {
-                    "inactive"
-                },
-                activity
-            ));
-        }
-        if self.tabs.is_empty() {
-            prompt.push_str("\nNo terminal tabs are currently open.");
-        }
+        let ports = tab_context::PortSnapshot::take().await;
+        prompt.push_str(&self.terminal_tabs_prompt(ports.as_ref()));
+        prompt.push_str(&self.user_messages_prompt());
         if self.yolo.enabled {
             prompt.push_str("\n\n## YOLO Mode\nYOLO mode is ON: every command you suggest and every action that normally needs approval runs immediately, without the user reviewing it. Stay strictly within the authorized targets and the user's instructions, and prefer non-destructive steps.");
         }
@@ -247,6 +218,13 @@ impl App {
             return Ok(());
         }
         let mut split = self.llm.chat_log.len().saturating_sub(KEEP_RECENT);
+        // Keep the whole current turn (from the latest user message on), so
+        // the instruction being worked on is never summarized away.
+        if let Some(latest_query) = self.llm.chat_log.iter().rposition(user_notes::is_user_query) {
+            if latest_query > 0 {
+                split = split.min(latest_query);
+            }
+        }
         if split == 0 {
             split = self.llm.chat_log.len() - 1;
         }
@@ -299,8 +277,18 @@ impl App {
                     "[Compacted earlier conversation summary]\n{}",
                     summary.trim()
                 ));
-                let mut new_log = Vec::with_capacity(1 + self.llm.chat_log.len() - split);
+                // The user's own messages stay verbatim: a summary is treated as
+                // untrusted reference and would weaken their instructions.
+                let compacted = &self.llm.chat_log[..split];
+                let user_messages: Vec<ChatMessage> = compacted
+                    .iter()
+                    .filter(|message| user_notes::is_user_query(message))
+                    .cloned()
+                    .collect();
+                let skip = user_messages.len().saturating_sub(user_notes::KEPT_ON_COMPACTION);
+                let mut new_log = Vec::with_capacity(1 + user_messages.len() + self.llm.chat_log.len() - split);
                 new_log.push(summary_msg);
+                new_log.extend(user_messages.into_iter().skip(skip));
                 new_log.extend_from_slice(&self.llm.chat_log[split..]);
                 self.llm.chat_log = new_log;
                 self.save_chat_history().await;
@@ -333,6 +321,9 @@ impl App {
         }
 
         self.yolo.auto_actions = 0;
+        // The user spoke while the LLM was still working: stop that work so
+        // the new message is answered now and not lost behind it.
+        self.interrupt_for_new_query().await;
         // A suggestion left unanswered was not run: the user moved on.
         self.skip_suggestion().await;
         // Add user question to visible chat log
@@ -367,6 +358,33 @@ impl App {
         self.llm.pending_request = Some(query.to_string());
 
         Ok(())
+    }
+
+    /// Stops LLM work still in progress when the user sends a new message:
+    /// the stream is aborted, a background tool's calls are answered as
+    /// interrupted (so the turn stays valid history), and late events of the
+    /// old request are ignored.
+    async fn interrupt_for_new_query(&mut self) {
+        let busy = self.llm.abort_handle.is_some()
+            || self.llm.background_tool.is_some()
+            || matches!(
+                self.llm.request_state,
+                LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
+            );
+        if !busy {
+            return;
+        }
+        self.abandon_background_tool("Interrupted: the user sent a new message.")
+            .await;
+        if let Some(handle) = self.llm.abort_handle.take() {
+            handle.abort();
+        }
+        self.next_request_id();
+        self.llm.pending_tool_calls.clear();
+        self.llm.response_buffer.clear();
+        self.llm.pending_request = None;
+        self.llm.post_exec_mode = false;
+        self.llm.request_state = LlmRequestState::Idle;
     }
 
     pub async fn send_post_exec_analysis(
