@@ -85,6 +85,8 @@ pub struct Config {
     pub models_cache_updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub learned_context_lengths: HashMap<String, u32>,
+    #[serde(default)]
+    pub web_search: crate::web::WebSearchConfig,
 }
 
 impl ModelInfo {

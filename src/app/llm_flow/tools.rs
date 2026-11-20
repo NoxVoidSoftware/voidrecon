@@ -19,6 +19,16 @@ enum ToolFlow {
 
 const DEFAULT_LISTENER_PORT: u16 = 4444;
 
+const NO_NEW_OUTPUT_MESSAGE: &str = "Nothing new since your last read of this tab. Do not keep re-reading it: pass wait_seconds to wait for output (e.g. an incoming callback), or end your turn and tell the user what you are waiting for.";
+
+/// The last `max_chars` characters of `text`.
+fn tail_chars(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .rev()
+        .nth(max_chars.saturating_sub(1))
+        .map_or(text, |(index, _)| &text[index..])
+}
+
 fn str_field(value: &Value, key: &str, default: &str) -> String {
     value
         .get(key)
@@ -59,6 +69,10 @@ impl App {
     /// waiting for user approval.
     pub(super) async fn process_tool_calls(&mut self, tool_calls: &[ToolCall]) -> Result<bool> {
         for (index, tool_call) in tool_calls.iter().enumerate() {
+            if let Some((task, label)) = self.background_tool_task(tool_call) {
+                self.start_background_tool(tool_call, task, label, tool_calls[index + 1..].to_vec());
+                return Ok(false);
+            }
             let managed_result = match self.handle_terminal_management_tool(tool_call) {
                 Ok(result) => result,
                 Err(error) => Some(self.tool_error(tool_call, &error)),
@@ -111,7 +125,7 @@ impl App {
         }
     }
 
-    fn tool_error(&mut self, tool_call: &ToolCall, error: &anyhow::Error) -> Value {
+    pub(super) fn tool_error(&mut self, tool_call: &ToolCall, error: &anyhow::Error) -> Value {
         self.add_notification(
             format!("Tool {} error: {}", tool_call.function.name, error),
             NotifLevel::Error,
@@ -384,42 +398,81 @@ impl App {
                 "label": tab.label,
                 "kind": tab.kind.as_str(),
                 "state": tab.state_label(),
-                "active": active_tab_id == Some(tab.number)
+                "active": active_tab_id == Some(tab.number),
+                "unread_bytes": tab.unread_bytes()
             })
         }));
         json!({"tabs": tabs})
     }
 
-    fn read_terminal_tab(&self, args: &Value) -> Result<Value> {
+    /// Reads a tab for the LLM. The default `new` mode returns only output
+    /// printed since the LLM's previous read of that tab, so it can tell what
+    /// it has already seen from what just arrived.
+    pub(super) fn read_terminal_tab(&mut self, args: &Value) -> Result<Value> {
         let tab_id = tab_id_arg(args)?;
-        let tab = self.open_tab(tab_id)?;
         let max_chars = args
             .get("max_chars")
             .and_then(Value::as_u64)
             .unwrap_or(8_000)
-            .clamp(1, 12_000) as usize;
-        // Command tabs keep their full output; `scrollback` reads its end
-        // instead of only what currently fits on the screen.
-        let scrollback = args.get("scrollback").and_then(Value::as_bool).unwrap_or(false);
-        let transcript = scrollback
-            .then(|| PtyTab::transcript_text(&tab.transcript))
-            .filter(|text| !text.is_empty());
-        let source = if transcript.is_some() { "scrollback" } else { "screen" };
-        let screen = transcript.unwrap_or_else(|| tab.screen_text());
-        let tail = screen
-            .char_indices()
-            .rev()
-            .nth(max_chars.saturating_sub(1))
-            .map(|(index, _)| &screen[index..])
-            .unwrap_or(&screen);
-        Ok(json!({
+            .clamp(200, 12_000) as usize;
+        let legacy_scrollback = args.get("scrollback").and_then(Value::as_bool) == Some(true);
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or(if legacy_scrollback { "all" } else { "new" });
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.number == tab_id)
+            .with_context(|| {
+                format!(
+                    "Terminal tab {} is not open. If it exited, its output was saved and posted to the chat.",
+                    tab_id
+                )
+            })?;
+
+        let (unread, last_output) = tab.unread_output();
+        let mut result = json!({
             "tab_id": tab_id,
             "label": tab.label,
             "state": tab.state_label(),
-            "source": source,
-            "total_chars": screen.chars().count(),
-            "screen": tail
-        }))
+            "mode": mode,
+            "seconds_since_last_output": last_output.map(|time| time.elapsed().as_secs()),
+        });
+        match mode {
+            "screen" => {
+                // A look at the screen does not mark the output as read.
+                result["screen"] = json!(tail_chars(&tab.screen_text(), max_chars));
+                result["unread_chars"] = json!(unread.text.chars().count());
+            }
+            "all" => {
+                let output = PtyTab::transcript_text(&tab.transcript);
+                result["total_chars"] = json!(output.chars().count());
+                result["output"] = json!(tail_chars(&output, max_chars));
+                tab.llm_read_offset = unread.end;
+            }
+            _ => {
+                result["mode"] = json!("new");
+                let new_chars = unread.text.chars().count();
+                result["has_new_output"] = json!(new_chars > 0);
+                if new_chars == 0 {
+                    result["new_output"] = json!("");
+                    result["message"] = json!(NO_NEW_OUTPUT_MESSAGE);
+                    result["screen_tail"] = json!(tail_chars(&tab.screen_text(), 600));
+                } else {
+                    result["new_output"] = json!(tail_chars(&unread.text, max_chars));
+                    if new_chars > max_chars {
+                        result["omitted_chars"] = json!(new_chars - max_chars);
+                        result["note"] = json!("Only the end of the new output is shown. Use mode=all with a larger max_chars, or read_workspace_file once the tab exits.");
+                    }
+                    if unread.lost_bytes > 0 {
+                        result["lost_bytes"] = json!(unread.lost_bytes);
+                    }
+                }
+                tab.llm_read_offset = unread.end;
+            }
+        }
+        Ok(result)
     }
 
     fn request_terminal_input(&mut self, tool_call: &ToolCall, args: &Value) -> Result<Value> {
@@ -449,5 +502,68 @@ impl App {
             },
             format!("Approval required to send input to terminal tab {}", tab_id),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_terminal_tab_returns_only_new_output() {
+        let mut app = App::new().await.expect("App::new failed");
+        app.new_shell_tab().await.expect("shell tab");
+        let tab_id = app.tabs[0].number;
+        let args = json!({"tab_id": tab_id});
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        app.read_terminal_tab(&args).expect("initial read");
+
+        if let Ok(mut transcript) = app.tabs[0].transcript.lock() {
+            transcript.append(b"callback from 10.10.14.2\n");
+        }
+        let first = app.read_terminal_tab(&args).expect("read new output");
+        assert_eq!(first["has_new_output"], json!(true));
+        assert!(first["new_output"].as_str().unwrap_or("").contains("callback from 10.10.14.2"));
+
+        let again = app.read_terminal_tab(&args).expect("read again");
+        assert!(!again["new_output"].as_str().unwrap_or("").contains("callback"));
+        assert_eq!(app.tabs[0].unread_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_read_returns_when_output_arrives() {
+        let mut app = App::new().await.expect("App::new failed");
+        app.new_shell_tab().await.expect("shell tab");
+        let tab_id = app.tabs[0].number;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        app.read_terminal_tab(&json!({"tab_id": tab_id})).expect("initial read");
+
+        let call: ToolCall = serde_json::from_value(json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read_terminal_tab",
+                "arguments": json!({"tab_id": tab_id, "wait_seconds": 20}).to_string()
+            }
+        }))
+        .expect("tool call");
+        let (task, _) = app.background_tool_task(&call).expect("waits when nothing is new");
+
+        let transcript = app.tabs[0].transcript.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            if let Ok(mut transcript) = transcript.lock() {
+                transcript.append(b"GET /shell.sh HTTP/1.1\n");
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = task.await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "returned early");
+        assert!(outcome["waited_seconds"].is_u64());
+        // The shell may print first and end the wait sooner; let the append land.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let read = app.read_terminal_tab(&json!({"tab_id": tab_id})).expect("read");
+        assert!(read["new_output"].as_str().unwrap_or("").contains("GET /shell.sh"));
     }
 }

@@ -25,6 +25,8 @@ pub enum AppEvent {
     LlmRequestFailed(u64, String),
     /// Stream finished; `true` when the provider cut it off at `max_tokens`.
     LlmDone(u64, bool),
+    /// A background tool call (web tool, waiting terminal read) finished for the given LLM request.
+    BackgroundToolDone(u64, ToolCall, serde_json::Value),
     CommandStarted(u64, String),
     CommandChunk(u64, String),
     CommandCompleted(u64, CommandResult),

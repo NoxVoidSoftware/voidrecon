@@ -735,6 +735,7 @@ pub fn validate_tool_call(tool_call: &ToolCall) -> Result<()> {
     
     Ok(())
 }
+
 /// Bytes of file content returned by one `read_workspace_file` call.
 const READ_MAX_BYTES: usize = 24_000;
 /// Matching lines returned by one `read_workspace_file` pattern search.

@@ -5,3 +5,4 @@ pub mod llm;
 pub mod pty;
 pub mod tools;
 pub mod ui;
+pub mod web;

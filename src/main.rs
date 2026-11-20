@@ -8,6 +8,7 @@ mod llm;
 mod pty;
 mod tools;
 mod ui;
+mod web;
 
 use anyhow::Result;
 use app::App;

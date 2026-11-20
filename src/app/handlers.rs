@@ -124,6 +124,10 @@ impl App {
                 self.handle_llm_done(request_id, truncated).await?;
                 Ok(true)
             }
+            AppEvent::BackgroundToolDone(request_id, tool_call, result) => {
+                self.handle_background_tool_done(request_id, tool_call, result).await?;
+                Ok(true)
+            }
             AppEvent::CommandStarted(request_id, cmd) => {
                 self.handle_command_started(request_id, cmd);
                 Ok(true)
@@ -389,6 +393,7 @@ impl App {
         }
         if let Some(handle) = self.llm.abort_handle.take() {
             handle.abort();
+            self.abandon_background_tool("Cancelled by the user.").await;
             self.llm.request_state = LlmRequestState::Idle;
             self.append_chat_message(ChatMessage::system(
                 "⚠️ LLM generation cancelled by user (Ctrl+C)",

@@ -50,6 +50,7 @@ pub fn render_help_modal(f: &mut Frame, _app: &App) {
         Line::from("   :note <txt> - Add a note (info finding)"),
         Line::from("   :models     - Open model picker"),
         Line::from("   :provider   - LLM setup & provider switcher (openrouter/nvidia/openai/ollama/custom)"),
+        Line::from("   :websearch  - AI web search provider: duckduckgo (default) | brave | tavily | google <key> [cx]"),
         Line::from("   :sessions   - Switch or create assessment sessions"),
         Line::from("   :mouse      - Toggle mouse capture on/off (:mouse on, :mouse off)"),
         Line::from("   :newtab     - New shell tab"),

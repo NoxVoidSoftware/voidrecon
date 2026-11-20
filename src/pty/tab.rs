@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use vt100::Parser;
 
@@ -30,14 +31,65 @@ impl TerminalKind {
 /// Bytes of raw command output kept per tab (the tail is kept when exceeded).
 const TRANSCRIPT_LIMIT: usize = 256 * 1024;
 
-/// Appends PTY output to a tab's transcript, keeping only the newest bytes.
-fn append_transcript(transcript: &Mutex<Vec<u8>>, data: &[u8]) {
-    if let Ok(mut transcript) = transcript.lock() {
-        transcript.extend_from_slice(data);
-        if transcript.len() > TRANSCRIPT_LIMIT {
-            let excess = transcript.len() - TRANSCRIPT_LIMIT;
-            transcript.drain(..excess);
+/// Raw output of a tab: the newest bytes plus a running byte count, so
+/// readers can ask for "everything after offset N".
+#[derive(Debug, Default)]
+pub struct Transcript {
+    bytes: Vec<u8>,
+    /// Bytes ever appended; the offset just past the newest byte.
+    total: u64,
+    last_output: Option<Instant>,
+}
+
+/// Output appended after a read offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSlice {
+    /// New output with terminal escapes removed.
+    pub text: String,
+    /// Offset to pass next time to get only newer output.
+    pub end: u64,
+    /// New bytes that were already dropped from the kept tail.
+    pub lost_bytes: u64,
+}
+
+impl Transcript {
+    pub fn append(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+        self.total += data.len() as u64;
+        self.last_output = Some(Instant::now());
+        if self.bytes.len() > TRANSCRIPT_LIMIT {
+            let excess = self.bytes.len() - TRANSCRIPT_LIMIT;
+            self.bytes.drain(..excess);
         }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn last_output(&self) -> Option<Instant> {
+        self.last_output
+    }
+
+    /// Everything appended after `offset`.
+    pub fn since(&self, offset: u64) -> TranscriptSlice {
+        let kept_start = self.total - self.bytes.len() as u64;
+        let start = offset.clamp(kept_start, self.total);
+        let skip = usize::try_from(start - kept_start).unwrap_or(self.bytes.len());
+        let raw = String::from_utf8_lossy(&self.bytes[skip.min(self.bytes.len())..]);
+        TranscriptSlice {
+            text: crate::ui::text::sanitize_terminal_output(&raw).trim().to_string(),
+            end: self.total,
+            lost_bytes: start - offset.min(start),
+        }
+    }
+}
+
+pub type SharedTranscript = Arc<Mutex<Transcript>>;
+
+fn append_transcript(transcript: &Mutex<Transcript>, data: &[u8]) {
+    if let Ok(mut transcript) = transcript.lock() {
+        transcript.append(data);
     }
 }
 
@@ -49,7 +101,9 @@ pub struct PtyTab {
     /// free number is reused, so it stays stable while the tab is open.
     pub number: usize,
     /// Full raw output (screen text only holds what is visible), newest bytes kept.
-    pub transcript: Arc<Mutex<Vec<u8>>>,
+    pub transcript: SharedTranscript,
+    /// Transcript offset up to which the LLM has read this tab's output.
+    pub llm_read_offset: u64,
     pub label: String,
     pub kind: TerminalKind,
     pub exit_code: Option<i32>,
@@ -108,7 +162,7 @@ impl PtyTab {
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
 
         let parser_clone = parser.clone();
-        let transcript: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let transcript: SharedTranscript = Arc::default();
         let transcript_clone = transcript.clone();
         let tx_clone = tx.clone();
         let tab_id = id;
@@ -172,6 +226,7 @@ impl PtyTab {
             exit_code: None,
             number: id,
             transcript,
+            llm_read_offset: 0,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -325,7 +380,7 @@ impl PtyTab {
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
 
         let parser_clone = parser.clone();
-        let transcript: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let transcript: SharedTranscript = Arc::default();
         let transcript_clone = transcript.clone();
         let tx_clone = tx.clone();
         let tab_id = id;
@@ -381,6 +436,7 @@ impl PtyTab {
             exit_code: None,
             number: id,
             transcript,
+            llm_read_offset: 0,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -431,7 +487,7 @@ impl PtyTab {
             .context("Failed to take writer")?;
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
         let parser_clone = parser.clone();
-        let transcript: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let transcript: SharedTranscript = Arc::default();
         let transcript_clone = transcript.clone();
         let tx_clone = tx.clone();
         let tab_id = id;
@@ -499,6 +555,7 @@ impl PtyTab {
             exit_code: None,
             number: id,
             transcript,
+            llm_read_offset: 0,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -523,14 +580,35 @@ impl PtyTab {
     }
 
     /// Full command output captured so far, with terminal escapes removed.
-    pub fn transcript_text(transcript: &Mutex<Vec<u8>>) -> String {
-        let raw = transcript
+    pub fn transcript_text(transcript: &Mutex<Transcript>) -> String {
+        transcript
             .lock()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
-        crate::ui::text::sanitize_terminal_output(&raw)
-            .trim()
-            .to_string()
+            .map(|transcript| transcript.since(0).text)
+            .unwrap_or_default()
+    }
+
+    /// Output the LLM has not read yet and when the tab last printed anything.
+    pub fn unread_output(&self) -> (TranscriptSlice, Option<Instant>) {
+        self.transcript
+            .lock()
+            .map(|transcript| (transcript.since(self.llm_read_offset), transcript.last_output()))
+            .unwrap_or_else(|_| {
+                let empty = TranscriptSlice { text: String::new(), end: self.llm_read_offset, lost_bytes: 0 };
+                (empty, None)
+            })
+    }
+
+    /// When the tab last printed anything.
+    pub fn last_output(&self) -> Option<Instant> {
+        self.transcript.lock().ok().and_then(|transcript| transcript.last_output())
+    }
+
+    /// Bytes printed since the LLM last read this tab.
+    pub fn unread_bytes(&self) -> u64 {
+        self.transcript
+            .lock()
+            .map(|transcript| transcript.total().saturating_sub(self.llm_read_offset))
+            .unwrap_or(0)
     }
 
     /// Read the currently visible terminal screen as plain text.
@@ -571,5 +649,34 @@ impl Drop for PtyTab {
         if let Some(handle) = self._reader_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_returns_only_output_after_offset() {
+        let mut transcript = Transcript::default();
+        transcript.append(b"first line\n");
+        let first = transcript.since(0);
+        assert_eq!(first.text, "first line");
+
+        assert_eq!(transcript.since(first.end).text, "", "nothing new yet");
+        transcript.append(b"\x1b[32mconnect from 10.10.14.2\x1b[0m\n");
+        let second = transcript.since(first.end);
+        assert_eq!(second.text, "connect from 10.10.14.2");
+        assert_eq!(second.lost_bytes, 0);
+    }
+
+    #[test]
+    fn transcript_reports_bytes_dropped_from_the_tail() {
+        let mut transcript = Transcript::default();
+        transcript.append(&vec![b'a'; TRANSCRIPT_LIMIT]);
+        transcript.append(b"tail");
+        let slice = transcript.since(0);
+        assert_eq!(slice.lost_bytes, 4);
+        assert!(slice.text.ends_with("tail"));
+        assert_eq!(slice.end, TRANSCRIPT_LIMIT as u64 + 4);
     }
 }

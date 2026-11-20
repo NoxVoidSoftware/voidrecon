@@ -194,10 +194,18 @@ pub struct LlmState {
     /// Automatic continuations sent after truncated replies in the current turn.
     pub auto_continues: u8,
     pub abort_handle: Option<tokio::task::AbortHandle>,
+    /// Background tool call of the current turn and the calls queued behind it.
+    pub background_tool: Option<BackgroundToolWait>,
     pub suggestion: Option<LlmSuggestion>,
     pub suggestion_visible: bool,
     pub chat_log: Vec<ChatMessage>,
     pub cached_chat_lines: Vec<Line<'static>>,
+}
+
+/// A tool call running in the background and the tool calls queued behind it.
+pub struct BackgroundToolWait {
+    pub running: crate::llm::types::ToolCall,
+    pub queued: Vec<crate::llm::types::ToolCall>,
 }
 
 /// A command started by the LLM in a terminal tab.
@@ -349,6 +357,7 @@ impl App {
             abort.abort();
         }
         self.next_request_id();
+        self.abandon_background_tool("Cancelled by the user.").await;
         self.llm.request_state = LlmRequestState::Idle;
         self.llm.pending_tool_calls.clear();
         self.llm.response_buffer.clear();

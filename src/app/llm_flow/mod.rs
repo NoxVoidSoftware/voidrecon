@@ -2,6 +2,7 @@
 
 mod budget;
 mod tools;
+mod web_tools;
 
 use crate::app::state::{App, NotifLevel};
 use crate::db::models::{Finding, ImportantFact, Target};
@@ -178,8 +179,18 @@ impl App {
             if self.active_tab == 0 { "active" } else { "inactive" }
         ));
         for tab in &self.tabs {
+            let unread = tab.unread_bytes();
+            let activity = match (unread, tab.last_output()) {
+                (0, _) => "no new output since your last read".to_string(),
+                (bytes, Some(time)) => format!(
+                    "{} bytes of NEW output you have not read yet (last output {}s ago)",
+                    bytes,
+                    time.elapsed().as_secs()
+                ),
+                (bytes, None) => format!("{} bytes of NEW output you have not read yet", bytes),
+            };
             prompt.push_str(&format!(
-                "\nTab {} (tab_id {}): {} [type: {}, {}, {}]",
+                "\nTab {} (tab_id {}): {} [type: {}, {}, {}; {}]",
                 tab.number,
                 tab.number,
                 Self::quote_untrusted(&tab.label),
@@ -189,7 +200,8 @@ impl App {
                     "active"
                 } else {
                     "inactive"
-                }
+                },
+                activity
             ));
         }
         if self.tabs.is_empty() {
@@ -360,6 +372,9 @@ impl App {
         if self.llm_api_key_missing() {
             return Ok(());
         }
+        // A tool call still waiting in the background would be left without a result.
+        self.abandon_background_tool("A command finished in the meantime; its output follows.")
+            .await;
 
         let Some(base_prompt) = self.context_prompt_or_notify(true).await else {
             return Ok(());
@@ -531,7 +546,12 @@ impl App {
         if !self.process_tool_calls(&tool_calls).await? {
             return Ok(false);
         }
+        self.after_tool_calls().await
+    }
 
+    /// Continues the conversation once every tool call of the turn has a
+    /// result. Returns `false` when a pending user action stops the turn.
+    async fn after_tool_calls(&mut self) -> Result<bool> {
         // Reload sidebar to reflect any target/findings DB changes
         self.reload_sidebar().await?;
 

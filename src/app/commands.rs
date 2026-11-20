@@ -111,6 +111,9 @@ impl App {
                     self.ui_state.show_api_key_prompt = true;
                 }
             }
+            ":websearch" | ":search" => {
+                self.configure_web_search(parts.get(1).copied().unwrap_or("")).await;
+            }
             ":sessions" => {
                 self.ui_state.session_list = crate::app::state::SessionMeta::list_sessions().await;
                 self.ui_state.session_picker_selected = 0;
