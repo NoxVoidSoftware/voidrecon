@@ -598,6 +598,13 @@ impl PtyTab {
             })
     }
 
+    /// Marks everything printed so far as read by the LLM.
+    pub fn mark_read(&mut self) {
+        if let Ok(transcript) = self.transcript.lock() {
+            self.llm_read_offset = transcript.total();
+        }
+    }
+
     /// When the tab last printed anything.
     pub fn last_output(&self) -> Option<Instant> {
         self.transcript.lock().ok().and_then(|transcript| transcript.last_output())

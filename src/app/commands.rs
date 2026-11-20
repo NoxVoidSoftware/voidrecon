@@ -111,6 +111,9 @@ impl App {
                     self.ui_state.show_api_key_prompt = true;
                 }
             }
+            ":yolo" => {
+                self.set_yolo(parts.get(1).copied().unwrap_or("")).await?;
+            }
             ":websearch" | ":search" => {
                 self.configure_web_search(parts.get(1).copied().unwrap_or("")).await;
             }
@@ -298,7 +301,7 @@ impl App {
 
         // Trigger post-execution analysis
         self.llm.post_exec_mode = true;
-        self.send_post_exec_analysis(&result.cmd, &result.output, output_path.as_deref())
+        self.send_post_exec_analysis(&result.cmd, &result.output, output_path.as_deref(), None)
             .await?;
 
         Ok(())
@@ -517,6 +520,7 @@ impl App {
             crate::app::state::TabCommandRun {
                 command: command.to_string(),
                 started: Instant::now(),
+                reported_running: false,
             },
         );
         Ok(())

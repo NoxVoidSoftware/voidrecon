@@ -4,7 +4,13 @@ use crate::llm::LlmRequestState;
 use crate::pty::tab::PtyTab;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// A command the LLM ran that is still going after this long (a server, a
+/// listener, a long scan) is reported so the LLM can carry on meanwhile.
+const RUNNING_REPORT_AFTER: Duration = Duration::from_secs(15);
+/// ...once its output has been quiet for this long.
+const RUNNING_QUIET_FOR: Duration = Duration::from_secs(3);
 
 /// Width of the expanded sidebar in terminal columns.
 const SIDEBAR_WIDTH: u16 = 40;
@@ -140,6 +146,8 @@ impl App {
             self.refresh_exploit_cache().await;
         }
 
+        self.report_long_running_command().await;
+
         let is_animating = matches!(
             self.llm.request_state,
             LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
@@ -153,6 +161,68 @@ impl App {
         }
     }
     
+    /// The LLM only continues when a command it ran exits. A server never
+    /// exits, so once such a command has run for a while it gets the output
+    /// so far, learns that the command keeps running, and continues.
+    async fn report_long_running_command(&mut self) {
+        let llm_idle = !matches!(
+            self.llm.request_state,
+            LlmRequestState::Streaming | LlmRequestState::ProcessingToolCalls
+        ) && self.pending_exploit_approval.is_none()
+            && !self.llm.suggestion_visible
+            && self.llm.background_tool.is_none();
+        if !llm_idle {
+            return;
+        }
+        let due = self.tab_command_runs.iter().find_map(|(id, run)| {
+            if run.reported_running || run.started.elapsed() < RUNNING_REPORT_AFTER {
+                return None;
+            }
+            let tab = self.tabs.iter().find(|tab| tab.id == *id && tab.exit_code.is_none())?;
+            let quiet = tab
+                .last_output()
+                .is_none_or(|time| time.elapsed() >= RUNNING_QUIET_FOR);
+            quiet.then_some(*id)
+        });
+        let Some(id) = due else {
+            return;
+        };
+        let Some(run) = self.tab_command_runs.get_mut(&id) else {
+            return;
+        };
+        run.reported_running = true;
+        let command = run.command.clone();
+        let seconds = run.started.elapsed().as_secs();
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let number = tab.number;
+        let output = PtyTab::transcript_text(&tab.transcript);
+        tab.mark_read();
+
+        let shown = if output.is_empty() { "(no output yet)" } else { output.as_str() };
+        self.append_chat_message(crate::llm::ChatMessage::output(format!(
+            "[Tab {} still running after {}s: {}]\n{}",
+            number, seconds, command, shown
+        )))
+        .await;
+        self.ui_state.log_at_bottom = true;
+        let note = format!(
+            "NOTE: this command is STILL RUNNING in Tab {} after {}s (for example a server, listener or long scan); the output below is only what it printed so far. Do not wait for it to exit: carry on with the next step. Check it later with read_terminal_tab (wait_seconds waits for new output). Its full output is sent when it exits.",
+            number, seconds
+        );
+        self.llm.post_exec_mode = true;
+        if let Err(error) = self
+            .send_post_exec_analysis(&command, shown, None, Some(&note))
+            .await
+        {
+            self.add_notification(
+                format!("Failed to update the LLM about Tab {}: {}", number, error),
+                NotifLevel::Error,
+            );
+        }
+    }
+
     pub async fn update_pty_dimensions(&mut self) -> Result<()> {
         let (pty_cols, pty_rows) = self.pty_dimensions();
 

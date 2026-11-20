@@ -122,10 +122,12 @@ impl App {
             }
             AppEvent::LlmDone(request_id, truncated) => {
                 self.handle_llm_done(request_id, truncated).await?;
+                self.run_yolo_step().await?;
                 Ok(true)
             }
             AppEvent::BackgroundToolDone(request_id, tool_call, result) => {
                 self.handle_background_tool_done(request_id, tool_call, result).await?;
+                self.run_yolo_step().await?;
                 Ok(true)
             }
             AppEvent::CommandStarted(request_id, cmd) => {
@@ -353,7 +355,7 @@ impl App {
                 self.input_mode = InputMode::Shell;
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
-                self.llm.suggestion_visible = false;
+                self.skip_suggestion().await;
                 self.history_index = None;
                 self.ui_state.show_help = false;
                 self.ui_state.show_model_picker = false;

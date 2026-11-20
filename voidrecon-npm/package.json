@@ -1,7 +1,7 @@
 {
   "name": "voidrecon",
   "type": "module",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Production-grade interactive TUI terminal for security auditing, CLI workflows, and LLM-assisted terminal operations. Wrapper for native Rust binary.",
   "main": "index.js",
   "bin": {

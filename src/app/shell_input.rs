@@ -6,6 +6,9 @@ use anyhow::Result;
 use std::path::Path;
 use unicode_width::UnicodeWidthChar;
 
+/// Chat note recorded when the user skips a suggested command.
+pub const SKIPPED_COMMAND_PREFIX: &str = "Skipped suggested command (NOT executed, no output): ";
+
 fn input_token_bounds(input: &str, cursor: usize) -> (usize, usize) {
     let cursor = cursor_boundary(input, cursor);
     let start = input[..cursor]
@@ -377,7 +380,7 @@ impl App {
                             return Ok(());
                         }
                         's' => {
-                            self.llm.suggestion_visible = false;
+                            self.skip_suggestion().await;
                             return Ok(());
                         }
                         _ => {}
@@ -553,7 +556,11 @@ impl App {
                 self.ui_state.input_cursor = 0;
                 self.input_mode = InputMode::Shell;
                 self.llm.suggestion_visible = false;
-                if !cmd.is_empty() {
+                if cmd.is_empty() {
+                    self.skip_suggestion().await;
+                } else {
+                    // The edited command replaces the suggestion; its run is reported as usual.
+                    self.llm.suggestion = None;
                     self.command_history.push_back(cmd.clone());
                     // An edited LLM suggestion runs in its own tab like the original.
                     self.run_llm_command(&cmd, false).await?;
@@ -588,11 +595,27 @@ impl App {
                 self.input_mode = InputMode::Shell;
                 self.input_buffer.clear();
                 self.ui_state.input_cursor = 0;
-                self.llm.suggestion_visible = false;
+                self.skip_suggestion().await;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Hides the suggested command without running it and tells the LLM, so
+    /// it does not assume the command ran.
+    pub async fn skip_suggestion(&mut self) {
+        self.llm.suggestion_visible = false;
+        let Some(command) = self.llm.suggestion.take().and_then(|suggestion| suggestion.command)
+        else {
+            return;
+        };
+        self.append_chat_message(ChatMessage::user(format!(
+            "{}{}",
+            SKIPPED_COMMAND_PREFIX, command
+        )))
+        .await;
+        self.add_notification("Suggested command skipped".to_string(), NotifLevel::Info);
     }
     
 

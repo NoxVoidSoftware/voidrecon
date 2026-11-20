@@ -449,20 +449,26 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
 
-    let estimate_visual_rows = |lines_slice: &[Line]| -> usize {
-        if inner_width == 0 {
-            return lines_slice.len();
-        }
-        lines_slice
-            .iter()
-            .map(|l| {
-                let line_text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-                crate::ui::text::calculate_line_wrapped_rows(&line_text, inner_width)
-            })
-            .sum()
-    };
+    // History rows are wrapped once per width and extended as messages arrive.
+    let llm = &mut app.llm;
+    let cache = &mut llm.wrapped_chat;
+    if cache.width != inner_width
+        || cache.generation != llm.chat_lines_generation
+        || cache.source_len > llm.cached_chat_lines.len()
+    {
+        *cache = crate::app::state::WrappedChat {
+            width: inner_width,
+            generation: llm.chat_lines_generation,
+            ..Default::default()
+        };
+    }
+    for line in &llm.cached_chat_lines[cache.source_len..] {
+        cache.rows.extend(crate::ui::text::wrap_line(line, inner_width));
+    }
+    cache.source_len = llm.cached_chat_lines.len();
 
-    let mut display_lines = app.llm.cached_chat_lines.clone();
+    // Live content (streaming reply, running command) is wrapped every frame.
+    let mut display_lines: Vec<Line<'static>> = Vec::new();
     
     // Add streaming LLM response
     if matches!(app.llm.request_state, crate::llm::types::LlmRequestState::Streaming | crate::llm::types::LlmRequestState::ProcessingToolCalls) {
@@ -552,7 +558,12 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
         display_lines.push(Line::from(""));
     }
 
-    let total_visual_rows = estimate_visual_rows(&display_lines);
+    let live_rows: Vec<Line<'static>> = display_lines
+        .iter()
+        .flat_map(|line| crate::ui::text::wrap_line(line, inner_width))
+        .collect();
+    let history_rows = app.llm.wrapped_chat.rows.len();
+    let total_visual_rows = history_rows + live_rows.len();
     let max_scroll = total_visual_rows.saturating_sub(inner_height);
 
     let (scroll_offset, title) = if app.ui_state.log_at_bottom {
@@ -579,15 +590,23 @@ fn render_chat_log(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let title = format!("{}{}", title, focus_badge);
 
-    let log = Paragraph::new(display_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title(title),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset as u16, 0));
+    // Only the visible window is handed to ratatui, already wrapped.
+    let visible: Vec<Line<'static>> = app
+        .llm
+        .wrapped_chat
+        .rows
+        .iter()
+        .chain(live_rows.iter())
+        .skip(scroll_offset)
+        .take(inner_height)
+        .cloned()
+        .collect();
+    let log = Paragraph::new(visible).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(title),
+    );
 
     f.render_widget(log, area);
 }
@@ -753,12 +772,16 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let alert_style = Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD);
     let in_shell_tab = app.active_tab > 0;
 
-    let mut footer_spans = vec![
+    let mut footer_spans = Vec::new();
+    if app.yolo.enabled {
+        footer_spans.push(Span::styled(" YOLO ", alert_style));
+    }
+    footer_spans.extend([
         Span::styled(" F1:Help ", key_style),
         Span::styled(" F2:Models ", key_style),
         Span::styled(" F3:New Shell ", key_style),
         Span::styled(format!(" {} ", mouse_label), Style::default().bg(Color::DarkGray).fg(mouse_fg)),
-    ];
+    ]);
     if !app.tabs.is_empty() {
         footer_spans.push(Span::styled(" Shift+Tab:Next Tab ", key_style));
     }

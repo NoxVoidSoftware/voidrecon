@@ -1,7 +1,8 @@
 //! Web search and page fetching for the LLM's `web_search` / `fetch_url` tools.
 //!
-//! Search goes through a configurable provider: DuckDuckGo needs no key, while
-//! Google Programmable Search, Brave and Tavily use the key saved in config.
+//! Search goes through a configurable provider: DuckDuckGo and a SearXNG
+//! instance need no key, while Google Programmable Search, Brave and Tavily use
+//! keys saved in config. Other configured providers are tried when one fails.
 //! Everything returned here is untrusted web content.
 
 mod html;
@@ -9,6 +10,7 @@ mod html;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -21,7 +23,7 @@ const FETCH_MAX_BYTES: usize = 3 * 1024 * 1024;
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; voidrecon)";
 
 /// Search backend used by `web_search`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchProvider {
     #[default]
@@ -29,14 +31,16 @@ pub enum SearchProvider {
     Google,
     Brave,
     Tavily,
+    SearXng,
 }
 
 impl SearchProvider {
-    pub const ALL: [SearchProvider; 4] = [
+    pub const ALL: [SearchProvider; 5] = [
         SearchProvider::DuckDuckGo,
-        SearchProvider::Google,
         SearchProvider::Brave,
         SearchProvider::Tavily,
+        SearchProvider::Google,
+        SearchProvider::SearXng,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -45,18 +49,25 @@ impl SearchProvider {
             SearchProvider::Google => "google",
             SearchProvider::Brave => "brave",
             SearchProvider::Tavily => "tavily",
+            SearchProvider::SearXng => "searxng",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
         let name = name.trim().to_lowercase();
-        Self::ALL
-            .into_iter()
-            .find(|provider| provider.as_str() == name || (name == "ddg" && *provider == SearchProvider::DuckDuckGo))
+        match name.as_str() {
+            "ddg" => return Some(SearchProvider::DuckDuckGo),
+            "searx" => return Some(SearchProvider::SearXng),
+            _ => {}
+        }
+        Self::ALL.into_iter().find(|provider| provider.as_str() == name)
     }
 
     pub fn requires_api_key(self) -> bool {
-        self != SearchProvider::DuckDuckGo
+        matches!(
+            self,
+            SearchProvider::Google | SearchProvider::Brave | SearchProvider::Tavily
+        )
     }
 }
 
@@ -65,19 +76,74 @@ impl SearchProvider {
 pub struct WebSearchConfig {
     #[serde(default)]
     pub provider: SearchProvider,
-    /// API key for Google / Brave / Tavily.
-    #[serde(default)]
+    /// Key of the selected provider in configs written before `api_keys` existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
+    /// API keys for Google / Brave / Tavily, kept when switching providers.
+    #[serde(default)]
+    pub api_keys: BTreeMap<SearchProvider, String>,
     /// Google Programmable Search engine id (`cx`).
     #[serde(default)]
     pub google_cx: String,
+    /// Base URL of a SearXNG instance (JSON output enabled), e.g. http://localhost:8888.
+    #[serde(default)]
+    pub searxng_url: String,
 }
+
+impl WebSearchConfig {
+    pub fn key_for(&self, provider: SearchProvider) -> &str {
+        self.api_keys
+            .get(&provider)
+            .map(String::as_str)
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or(if provider == self.provider { self.api_key.as_str() } else { "" })
+            .trim()
+    }
+
+    /// Whether `provider` has everything it needs to run.
+    pub fn is_configured(&self, provider: SearchProvider) -> bool {
+        match provider {
+            SearchProvider::DuckDuckGo => true,
+            SearchProvider::SearXng => !self.searxng_url.trim().is_empty(),
+            SearchProvider::Google => {
+                !self.key_for(provider).is_empty() && !self.google_cx.trim().is_empty()
+            }
+            SearchProvider::Brave | SearchProvider::Tavily => !self.key_for(provider).is_empty(),
+        }
+    }
+
+    /// The selected provider first, then every other configured one as a
+    /// fallback (DuckDuckGo last, since it blocks automated searches).
+    pub fn provider_order(&self) -> Vec<SearchProvider> {
+        let mut order = vec![self.provider];
+        order.extend(SearchProvider::ALL.into_iter().filter(|provider| {
+            *provider != self.provider
+                && *provider != SearchProvider::DuckDuckGo
+                && self.is_configured(*provider)
+        }));
+        if self.provider != SearchProvider::DuckDuckGo {
+            order.push(SearchProvider::DuckDuckGo);
+        }
+        order
+    }
+}
+
+const NO_PROVIDER_HINT: &str = "Configure a search provider with :websearch: brave <api_key> or tavily <api_key> (both have free plans), google <api_key> <cx>, or searxng <url> for your own SearXNG instance (no key).";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+}
+
+/// Results of a search and the provider that produced them.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub provider: SearchProvider,
+    pub results: Vec<SearchResult>,
+    /// Providers tried before it, with their errors.
+    pub failed: Vec<String>,
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client> {
@@ -88,29 +154,37 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
         .context("Failed to create HTTP client")
 }
 
-/// Runs a web search and returns up to `max_results` results.
-pub async fn search(config: &WebSearchConfig, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+/// Runs a web search with the selected provider, falling back to the other
+/// configured providers when it fails.
+pub async fn search(config: &WebSearchConfig, query: &str, max_results: usize) -> Result<SearchOutcome> {
     let query = query.trim();
     if query.is_empty() {
         bail!("Search query is empty");
     }
     let max_results = max_results.clamp(1, 10);
-    if config.provider.requires_api_key() && config.api_key.trim().is_empty() {
-        bail!(
-            "Web search provider '{}' needs an API key. Set it with :websearch {} <key>",
-            config.provider.as_str(),
-            config.provider.as_str()
-        );
-    }
     let http = client(SEARCH_TIMEOUT)?;
-    let mut results = match config.provider {
-        SearchProvider::DuckDuckGo => search_duckduckgo(&http, query).await?,
-        SearchProvider::Google => search_google(&http, config, query, max_results).await?,
-        SearchProvider::Brave => search_brave(&http, config, query, max_results).await?,
-        SearchProvider::Tavily => search_tavily(&http, config, query, max_results).await?,
-    };
-    results.truncate(max_results);
-    Ok(results)
+    let mut failed = Vec::new();
+    for provider in config.provider_order() {
+        if !config.is_configured(provider) {
+            failed.push(format!("{}: not configured", provider.as_str()));
+            continue;
+        }
+        let attempt = match provider {
+            SearchProvider::DuckDuckGo => search_duckduckgo(&http, query).await,
+            SearchProvider::Google => search_google(&http, config, query, max_results).await,
+            SearchProvider::Brave => search_brave(&http, config, query, max_results).await,
+            SearchProvider::Tavily => search_tavily(&http, config, query, max_results).await,
+            SearchProvider::SearXng => search_searxng(&http, config, query).await,
+        };
+        match attempt {
+            Ok(mut results) => {
+                results.truncate(max_results);
+                return Ok(SearchOutcome { provider, results, failed });
+            }
+            Err(error) => failed.push(format!("{}: {:#}", provider.as_str(), error)),
+        }
+    }
+    bail!("Web search failed ({}). {}", failed.join("; "), NO_PROVIDER_HINT)
 }
 
 async fn get_json(request: reqwest::RequestBuilder, provider: &str) -> Result<Value> {
@@ -150,12 +224,9 @@ async fn search_google(
     query: &str,
     max_results: usize,
 ) -> Result<Vec<SearchResult>> {
-    if config.google_cx.trim().is_empty() {
-        bail!("Google search needs a search engine id. Set it with :websearch google <api_key> <cx>");
-    }
     let num = max_results.to_string();
     let request = http.get("https://www.googleapis.com/customsearch/v1").query(&[
-        ("key", config.api_key.trim()),
+        ("key", config.key_for(SearchProvider::Google)),
         ("cx", config.google_cx.trim()),
         ("q", query),
         ("num", num.as_str()),
@@ -174,7 +245,7 @@ async fn search_brave(
     let request = http
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("Accept", "application/json")
-        .header("X-Subscription-Token", config.api_key.trim())
+        .header("X-Subscription-Token", config.key_for(SearchProvider::Brave))
         .query(&[("q", query), ("count", count.as_str())]);
     let json = get_json(request, "Brave").await?;
     let items = json.get("web").and_then(|web| web.get("results"));
@@ -193,7 +264,7 @@ async fn search_tavily(
 ) -> Result<Vec<SearchResult>> {
     let request = http
         .post("https://api.tavily.com/search")
-        .bearer_auth(config.api_key.trim())
+        .bearer_auth(config.key_for(SearchProvider::Tavily))
         .json(&serde_json::json!({ "query": query, "max_results": max_results }));
     let json = get_json(request, "Tavily").await?;
     Ok(results_from(json.get("results"), "title", "url", "content"))
@@ -213,9 +284,28 @@ async fn search_duckduckgo(http: &reqwest::Client, query: &str) -> Result<Vec<Se
     }
     let results = html::parse_duckduckgo_results(&body);
     if results.is_empty() && body.contains("anomaly") {
-        bail!("DuckDuckGo blocked the automated search. Configure another provider with :websearch");
+        bail!("DuckDuckGo blocks automated searches from this connection");
     }
     Ok(results)
+}
+
+/// A SearXNG instance with `json` enabled in `search.formats` of its settings.yml.
+async fn search_searxng(
+    http: &reqwest::Client,
+    config: &WebSearchConfig,
+    query: &str,
+) -> Result<Vec<SearchResult>> {
+    let base = config.searxng_url.trim().trim_end_matches('/');
+    let url = reqwest::Url::parse(&format!("{}/search", base)).context("Invalid SearXNG URL")?;
+    let request = http.get(url).query(&[("q", query), ("format", "json")]);
+    let json = get_json(request, "SearXNG").await.map_err(|error| {
+        if error.to_string().contains("403") {
+            error.context("enable the json format under search.formats in SearXNG settings.yml")
+        } else {
+            error
+        }
+    })?;
+    Ok(results_from(json.get("results"), "title", "url", "content"))
 }
 
 /// Text of a fetched web page.
@@ -389,6 +479,39 @@ mod tests {
     }
 
     #[test]
+    fn configured_providers_are_tried_in_order_with_duckduckgo_last() {
+        let mut config = WebSearchConfig::default();
+        assert_eq!(config.provider_order(), vec![SearchProvider::DuckDuckGo]);
+
+        config.api_keys.insert(SearchProvider::Tavily, "tvly-key".to_string());
+        config.searxng_url = "http://localhost:8888".to_string();
+        config.provider = SearchProvider::Brave;
+        config.api_keys.insert(SearchProvider::Brave, "brave-key".to_string());
+        assert_eq!(
+            config.provider_order(),
+            vec![
+                SearchProvider::Brave,
+                SearchProvider::Tavily,
+                SearchProvider::SearXng,
+                SearchProvider::DuckDuckGo
+            ]
+        );
+        assert!(!config.is_configured(SearchProvider::Google), "no key or cx");
+    }
+
+    #[test]
+    fn legacy_single_key_config_still_works() {
+        let config: WebSearchConfig =
+            serde_json::from_str(r#"{"provider":"brave","api_key":"old-key","google_cx":""}"#)
+                .expect("old config");
+        assert_eq!(config.key_for(SearchProvider::Brave), "old-key");
+        assert_eq!(config.key_for(SearchProvider::Tavily), "");
+        let saved = serde_json::to_string(&config).expect("serialize");
+        let reloaded: WebSearchConfig = serde_json::from_str(&saved).expect("reload");
+        assert_eq!(reloaded.key_for(SearchProvider::Brave), "old-key");
+    }
+
+    #[test]
     fn provider_names_round_trip() {
         for provider in SearchProvider::ALL {
             assert_eq!(SearchProvider::from_name(provider.as_str()), Some(provider));
@@ -406,9 +529,10 @@ mod live_tests {
     #[tokio::test]
     #[ignore]
     async fn live_web_search_and_fetch() {
-        let results = search(&WebSearchConfig::default(), "CVE-2021-41773", 5)
+        let outcome = search(&WebSearchConfig::default(), "CVE-2021-41773", 5)
             .await
             .expect("search");
+        let results = outcome.results;
         for result in &results {
             println!("{} | {} | {}", result.title, result.url, result.snippet);
         }

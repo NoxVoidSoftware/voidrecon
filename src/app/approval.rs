@@ -85,7 +85,7 @@ impl App {
 
     /// Performs the approved action and reports its outcome as the tool result.
     /// Returns `false` when the LLM should wait (an exploit is still running).
-    async fn run_approved_action(&mut self, approval: ExploitApproval) -> bool {
+    pub(super) async fn run_approved_action(&mut self, approval: ExploitApproval) -> bool {
         let ExploitApproval {
             target_id,
             kind,
@@ -185,6 +185,7 @@ impl App {
                     TabCommandRun {
                         command: command_line.to_string(),
                         started: Instant::now(),
+                        reported_running: false,
                     },
                 );
                 (

@@ -515,7 +515,8 @@ fn execute_tool_call_blocking(
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let explanation = args.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
             Ok(serde_json::json!({
-                "status": "suggested",
+                "status": "awaiting_user",
+                "message": "Shown to the user, who can run, edit or skip it. It has NOT run yet: do not assume any result. If it runs, its output arrives in a later message; if the user skips it, you will be told.",
                 "command": command,
                 "explanation": explanation,
                 "interactive": args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)

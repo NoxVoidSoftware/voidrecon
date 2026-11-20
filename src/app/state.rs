@@ -200,6 +200,20 @@ pub struct LlmState {
     pub suggestion_visible: bool,
     pub chat_log: Vec<ChatMessage>,
     pub cached_chat_lines: Vec<Line<'static>>,
+    /// Bumped whenever `cached_chat_lines` is rebuilt rather than appended to.
+    pub chat_lines_generation: u64,
+    /// `cached_chat_lines` wrapped to the chat width, extended incrementally.
+    pub wrapped_chat: WrappedChat,
+}
+
+/// Chat lines wrapped into screen rows for one width.
+#[derive(Default)]
+pub struct WrappedChat {
+    pub width: usize,
+    pub generation: u64,
+    /// How many of `cached_chat_lines` are wrapped into `rows`.
+    pub source_len: usize,
+    pub rows: Vec<Line<'static>>,
 }
 
 /// A tool call running in the background and the tool calls queued behind it.
@@ -212,6 +226,8 @@ pub struct BackgroundToolWait {
 pub struct TabCommandRun {
     pub command: String,
     pub started: Instant,
+    /// The LLM was already told that this command keeps running.
+    pub reported_running: bool,
 }
 
 #[derive(Default)]
@@ -265,6 +281,8 @@ pub struct App {
     
     // Exploit approval prompt
     pub pending_exploit_approval: Option<ExploitApproval>,
+    /// YOLO mode: suggestions run and approvals pass without asking.
+    pub yolo: crate::app::yolo::YoloState,
 
     // Background workspace command execution (Tab 0)
     pub command_run: CommandRunState,
@@ -328,6 +346,7 @@ impl App {
             event_rx,
             terminal_size: crossterm::terminal::size().unwrap_or((80, 24)),
             pending_exploit_approval: None,
+            yolo: crate::app::yolo::YoloState::default(),
             command_run: CommandRunState::default(),
             mouse_capture_enabled: false,
             last_tick: Instant::now(),
@@ -372,6 +391,7 @@ impl App {
 
     pub fn rebuild_cached_chat_lines(&mut self) {
         self.llm.cached_chat_lines.clear();
+        self.llm.chat_lines_generation += 1;
         for msg in &self.llm.chat_log {
             let lines = crate::ui::layout::format_chat_message(msg, &self.config.active_model);
             self.llm.cached_chat_lines.extend(lines);
@@ -394,6 +414,7 @@ impl App {
             self.session_meta = SessionMeta::new("None".to_string());
             self.llm.chat_log.clear();
             self.llm.cached_chat_lines.clear();
+            self.llm.chat_lines_generation += 1;
             self.tabs.clear();
             self.sidebar_nodes.clear();
             self.active_target_id = None;
