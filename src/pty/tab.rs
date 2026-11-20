@@ -27,9 +27,29 @@ impl TerminalKind {
     }
 }
 
+/// Bytes of raw command output kept per tab (the tail is kept when exceeded).
+const TRANSCRIPT_LIMIT: usize = 256 * 1024;
+
+/// Appends PTY output to a tab's transcript, keeping only the newest bytes.
+fn append_transcript(transcript: &Mutex<Vec<u8>>, data: &[u8]) {
+    if let Ok(mut transcript) = transcript.lock() {
+        transcript.extend_from_slice(data);
+        if transcript.len() > TRANSCRIPT_LIMIT {
+            let excess = transcript.len() - TRANSCRIPT_LIMIT;
+            transcript.drain(..excess);
+        }
+    }
+}
+
 /// A PTY terminal tab
 pub struct PtyTab {
+    /// Internal key that routes PTY events; never reused.
     pub id: usize,
+    /// Number shown in the tab bar and used by the LLM ("Tab 1"). The lowest
+    /// free number is reused, so it stays stable while the tab is open.
+    pub number: usize,
+    /// Full raw output (screen text only holds what is visible), newest bytes kept.
+    pub transcript: Arc<Mutex<Vec<u8>>>,
     pub label: String,
     pub kind: TerminalKind,
     pub exit_code: Option<i32>,
@@ -88,6 +108,8 @@ impl PtyTab {
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
 
         let parser_clone = parser.clone();
+        let transcript: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let transcript_clone = transcript.clone();
         let tx_clone = tx.clone();
         let tab_id = id;
 
@@ -103,6 +125,7 @@ impl PtyTab {
                         if let Ok(mut p) = parser_clone.lock() {
                             p.process(data);
                         }
+                        append_transcript(&transcript_clone, data);
                         // Send to app event loop
                         if tx_clone.send(AppEvent::PtyData(tab_id, data.to_vec())).is_err() {
                             break;
@@ -147,6 +170,8 @@ impl PtyTab {
             label: format!("Shell {}", id),
             kind: TerminalKind::LocalShell,
             exit_code: None,
+            number: id,
+            transcript,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -300,6 +325,8 @@ impl PtyTab {
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
 
         let parser_clone = parser.clone();
+        let transcript: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let transcript_clone = transcript.clone();
         let tx_clone = tx.clone();
         let tab_id = id;
 
@@ -313,6 +340,7 @@ impl PtyTab {
                         if let Ok(mut p) = parser_clone.lock() {
                             p.process(data);
                         }
+                        append_transcript(&transcript_clone, data);
                         if tx_clone.send(AppEvent::PtyData(tab_id, data.to_vec())).is_err() {
                             break;
                         }
@@ -351,6 +379,8 @@ impl PtyTab {
             label: format!("Listener: :{}", lport),
             kind: TerminalKind::Listener,
             exit_code: None,
+            number: id,
+            transcript,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -401,6 +431,8 @@ impl PtyTab {
             .context("Failed to take writer")?;
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 0)));
         let parser_clone = parser.clone();
+        let transcript: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let transcript_clone = transcript.clone();
         let tx_clone = tx.clone();
         let tab_id = id;
         let reader_thread = std::thread::spawn(move || {
@@ -412,6 +444,7 @@ impl PtyTab {
                         if let Ok(mut parser) = parser_clone.lock() {
                             parser.process(&buf[..n]);
                         }
+                        append_transcript(&transcript_clone, &buf[..n]);
                         if tx_clone
                             .send(AppEvent::PtyData(tab_id, buf[..n].to_vec()))
                             .is_err()
@@ -464,6 +497,8 @@ impl PtyTab {
             label: format!("Command: {}", label),
             kind: TerminalKind::Command,
             exit_code: None,
+            number: id,
+            transcript,
             master: pty_pair.master,
             _slave: Some(pty_pair.slave),
             child: child_arc,
@@ -485,6 +520,17 @@ impl PtyTab {
     pub fn state_label(&self) -> String {
         self.exit_code
             .map_or_else(|| "running".to_string(), |code| format!("exited ({code})"))
+    }
+
+    /// Full command output captured so far, with terminal escapes removed.
+    pub fn transcript_text(transcript: &Mutex<Vec<u8>>) -> String {
+        let raw = transcript
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        crate::ui::text::sanitize_terminal_output(&raw)
+            .trim()
+            .to_string()
     }
 
     /// Read the currently visible terminal screen as plain text.

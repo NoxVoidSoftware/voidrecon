@@ -397,3 +397,22 @@ async fn listener_approval_keeps_tool_cycle_complete() {
         .any(|message| message.tool_call_id.as_deref() == Some("call-listener")
             && message.content.contains("rejected")));
 }
+
+#[test]
+fn output_excerpt_keeps_whole_lines_and_names_the_gap() {
+    let output: String = (1..=2000).map(|n| format!("line {n}\n")).collect();
+    let excerpt = App::output_excerpt(&output, 2_000, Some("workspace/outputs/x.txt"));
+    assert!(excerpt.len() <= 2_100);
+    assert!(excerpt.starts_with("line 1\n"));
+    assert!(excerpt.trim_end().ends_with("line 2000"));
+    assert!(excerpt.contains("omitted"));
+    assert!(excerpt.contains("of 2000 omitted"));
+    assert!(excerpt.contains("workspace/outputs/x.txt"));
+    // Every kept line is complete.
+    for line in excerpt.lines().filter(|l| l.starts_with("line ")) {
+        assert!(line["line ".len()..].parse::<u32>().is_ok(), "broken line: {line}");
+    }
+
+    let short = "only\nthree\nlines";
+    assert_eq!(App::output_excerpt(short, 2_000, None), short);
+}

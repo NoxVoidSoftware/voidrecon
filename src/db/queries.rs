@@ -35,10 +35,19 @@ fn truncate_output(s: &str) -> String {
     if s.len() <= MAX_LEN {
         s.to_string()
     } else {
+        // Cut on char boundaries: byte offsets can fall inside multi-byte UTF-8.
+        let mut head_end = HALF;
+        while !s.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = s.len() - HALF;
+        while !s.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
         format!(
             "{}\n...[truncated]...\n{}",
-            &s[..HALF],
-            &s[s.len() - HALF..]
+            &s[..head_end],
+            &s[tail_start..]
         )
     }
 }
@@ -66,6 +75,13 @@ fn save_output_artifact(session_path: &Path, output: &str) -> Result<(String, St
 }
 
 pub struct DatabaseQueries;
+
+impl DatabaseQueries {
+    /// Saves output to `workspace/outputs/` and returns its workspace-relative path.
+    pub fn save_output_file(session_path: &Path, output: &str) -> Result<String> {
+        save_output_artifact(session_path, output).map(|(path, _)| path)
+    }
+}
 
 pub fn normalize_target_host(raw: &str) -> String {
     let mut s = raw.trim();
@@ -357,7 +373,7 @@ impl DatabaseQueries {
         output: Option<&str>,
         exit_code: Option<i32>,
         duration_ms: Option<i64>,
-    ) -> Result<i64> {
+    ) -> Result<(i64, Option<String>)> {
         let (output_preview, output_path, output_hash) = if let Some(out) = output {
             let preview = truncate_output(out);
             let (path, hash) = save_output_artifact(session_path, out)?;
@@ -371,7 +387,7 @@ impl DatabaseQueries {
             params![target_id, raw_cmd, output_preview, output_path, output_hash, exit_code, duration_ms],
         )
         .context("Failed to insert command")?;
-        Ok(conn.last_insert_rowid())
+        Ok((conn.last_insert_rowid(), output_path))
     }
 
     pub fn get_recent_commands(conn: &Connection, target_id: i64, limit: usize) -> Result<Vec<Command>> {

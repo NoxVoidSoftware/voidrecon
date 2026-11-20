@@ -200,6 +200,12 @@ pub struct LlmState {
     pub cached_chat_lines: Vec<Line<'static>>,
 }
 
+/// A command started by the LLM in a terminal tab.
+pub struct TabCommandRun {
+    pub command: String,
+    pub started: Instant,
+}
+
 #[derive(Default)]
 pub struct CommandRunState {
     pub running: Option<(u64, String, Instant)>,
@@ -232,6 +238,9 @@ pub struct App {
     pub tabs: Vec<PtyTab>,
     pub active_tab: usize,
     pub next_tab_id: usize,
+    /// LLM-requested commands running in their own tab, keyed by tab id. Their
+    /// output is recorded and analyzed when the process exits.
+    pub tab_command_runs: std::collections::HashMap<usize, TabCommandRun>,
     
     // LLM state
     pub llm: LlmState,
@@ -304,6 +313,7 @@ impl App {
             tabs: Vec::new(), // Tab 0 is always Workspace & LLM; tabs holds Tab 1..N (Shell tabs)
             active_tab: 0,
             next_tab_id: 1,
+            tab_command_runs: std::collections::HashMap::new(),
             llm: LlmState::default(),
             notifications: Vec::new(),
             event_tx,

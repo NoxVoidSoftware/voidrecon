@@ -360,14 +360,7 @@ impl App {
                             if let Some(sug) = self.llm.suggestion.take() {
                                 self.llm.suggestion_visible = false;
                                 if let Some(cmd) = sug.command {
-                                    if sug.interactive {
-                                        self.spawn_command_tab(&cmd).await?;
-                                        self.continue_llm_conversation().await?;
-                                    } else if self.active_tab == 0 {
-                                        self.execute_workspace_command(&cmd).await?;
-                                    } else {
-                                        self.send_to_pty(&cmd).await?;
-                                    }
+                                    self.run_llm_command(&cmd, sug.interactive).await?;
                                 }
                             }
                             return Ok(());
@@ -562,11 +555,8 @@ impl App {
                 self.llm.suggestion_visible = false;
                 if !cmd.is_empty() {
                     self.command_history.push_back(cmd.clone());
-                    if self.active_tab == 0 {
-                        self.execute_workspace_command(&cmd).await?;
-                    } else {
-                        self.send_to_pty(&cmd).await?;
-                    }
+                    // An edited LLM suggestion runs in its own tab like the original.
+                    self.run_llm_command(&cmd, false).await?;
                 }
             }
             KeyCode::Char(c) => {

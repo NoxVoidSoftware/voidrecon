@@ -45,6 +45,81 @@ impl App {
     }
 
     /// Keep the beginning and end of long text at UTF-8 safe boundaries.
+    /// Command output kept per chat-history message before it is excerpted.
+    pub(crate) const CHAT_OUTPUT_BYTES: usize = 16_000;
+    /// Command output included in the post-execution analysis request.
+    pub(super) const ANALYSIS_OUTPUT_BYTES: usize = 12_000;
+    const SAVED_OUTPUT_PREFIX: &'static str = "[Full output saved: ";
+
+    /// Prefixes long command output with the file holding its full text.
+    pub(crate) fn output_with_saved_path(output: &str, path: &str) -> String {
+        format!(
+            "{}{}; {} lines]\n{}",
+            Self::SAVED_OUTPUT_PREFIX,
+            path,
+            output.lines().count(),
+            output
+        )
+    }
+
+    /// Saved-output path from a header written by [`Self::output_with_saved_path`].
+    pub(super) fn saved_output_path(content: &str) -> Option<&str> {
+        let rest = content.strip_prefix(Self::SAVED_OUTPUT_PREFIX)?;
+        let header = rest.lines().next()?;
+        header.split(';').next().map(str::trim)
+    }
+
+    /// Shortens command output by whole lines, keeping the beginning and the
+    /// (usually more important) end. The marker states exactly which lines are
+    /// missing and, when the full output was saved, how to read them, so the
+    /// model never mistakes an excerpt for the complete output.
+    pub fn output_excerpt(text: &str, max_bytes: usize, full_path: Option<&str>) -> String {
+        if text.len() <= max_bytes {
+            return text.to_string();
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+        let content_budget = max_bytes.saturating_sub(400);
+        let head_budget = content_budget / 3;
+        let tail_budget = content_budget - head_budget;
+
+        let mut head = 0;
+        let mut used = 0;
+        while head < total && used + lines[head].len() < head_budget {
+            used += lines[head].len() + 1;
+            head += 1;
+        }
+        let mut tail = 0;
+        used = 0;
+        while tail < total - head && used + lines[total - 1 - tail].len() < tail_budget {
+            used += lines[total - 1 - tail].len() + 1;
+            tail += 1;
+        }
+        if head + tail == 0 {
+            // A few enormous lines: fall back to a byte cut.
+            return Self::truncate_bytes(text, max_bytes);
+        }
+
+        let omitted_from = head + 1;
+        let omitted_to = total - tail;
+        let hint = match full_path {
+            Some(path) => format!(
+                " Full output: {}. Read the omitted part with read_workspace_file (path, start_line={}) or search it with pattern.",
+                path, omitted_from
+            ),
+            None => String::new(),
+        };
+        format!(
+            "{}\n[... lines {}-{} of {} omitted.{} ...]\n{}",
+            lines[..head].join("\n"),
+            omitted_from,
+            omitted_to,
+            total,
+            hint,
+            lines[total - tail..].join("\n")
+        )
+    }
+
     pub(super) fn truncate_bytes(text: &str, max_bytes: usize) -> String {
         if text.len() <= max_bytes {
             return text.to_string();

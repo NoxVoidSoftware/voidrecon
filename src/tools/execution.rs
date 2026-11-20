@@ -592,39 +592,39 @@ fn execute_tool_call_blocking(
                 }
             };
             let all_lines: Vec<&str> = content.lines().collect();
+            let file_name = file_path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
+                let context_lines = args
+                    .get("context_lines")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2)
+                    .min(10) as usize;
+                return Ok(search_lines(&all_lines, file_name, pattern, context_lines));
+            }
             let total_lines = all_lines.len();
 
-            let offset = start_line.saturating_sub(1).min(total_lines);
-            let end = (offset + max_lines).min(total_lines);
-            let slice = &all_lines[offset..end];
-            let truncated = end < total_lines;
-
-            let display_content = if truncated {
-                format!("{}\n... [truncated, total {} lines, showing {}-{}] ...", slice.join("\n"), total_lines, offset + 1, end)
-            } else {
-                slice.join("\n")
-            };
-
-            let max_bytes = 24_000;
-            let (display_content, byte_truncated) = if display_content.len() > max_bytes {
-                let mut end = max_bytes;
-                while !display_content.is_char_boundary(end) {
-                    end -= 1;
+            // `tail` reads the last N lines; otherwise read from start_line.
+            let (offset, end) = match args.get("tail").and_then(|v| v.as_u64()) {
+                Some(tail) => (total_lines.saturating_sub(tail as usize), total_lines),
+                None => {
+                    let offset = start_line.saturating_sub(1).min(total_lines);
+                    (offset, (offset + max_lines.clamp(1, 500)).min(total_lines))
                 }
-                (
-                    format!("{}\n... [truncated, content exceeds 24KB (total {} bytes)] ...", &display_content[..end], display_content.len()),
-                    true
-                )
-            } else {
-                (display_content, false)
             };
+            let (display_content, last_line) = numbered_lines(&all_lines, offset, end, READ_MAX_BYTES);
+            let truncated = offset > 0 || last_line < total_lines;
+            let next_hint = (last_line < total_lines).then(|| {
+                format!("More lines follow; continue with start_line={}.", last_line + 1)
+            });
 
             Ok(serde_json::json!({
-                "file": file_path.file_name().and_then(|f| f.to_str()).unwrap_or(""),
+                "file": file_name,
                 "total_lines": total_lines,
                 "start_line": offset + 1,
-                "lines_returned": slice.len(),
-                "truncated": truncated || byte_truncated,
+                "end_line": last_line,
+                "lines_returned": last_line.saturating_sub(offset),
+                "truncated": truncated,
+                "next": next_hint,
                 "content": display_content
             }))
         }
@@ -734,4 +734,111 @@ pub fn validate_tool_call(tool_call: &ToolCall) -> Result<()> {
     }
     
     Ok(())
+}
+/// Bytes of file content returned by one `read_workspace_file` call.
+const READ_MAX_BYTES: usize = 24_000;
+/// Matching lines returned by one `read_workspace_file` pattern search.
+const SEARCH_MAX_MATCHES: usize = 60;
+
+/// Lines `offset..end` prefixed with 1-based line numbers, stopping at whole
+/// lines once `max_bytes` is reached. Returns the text and the last line included.
+fn numbered_lines(lines: &[&str], offset: usize, end: usize, max_bytes: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut last = offset;
+    for (index, line) in lines.iter().enumerate().take(end).skip(offset) {
+        let entry = format!("{:>6}| {}\n", index + 1, line);
+        if !out.is_empty() && out.len() + entry.len() > max_bytes {
+            break;
+        }
+        out.push_str(&entry);
+        last = index + 1;
+    }
+    (out, last)
+}
+
+/// Case-insensitive search; `a|b` matches either term. Returns numbered
+/// matches with surrounding context, merged into blocks.
+fn search_lines(lines: &[&str], file_name: &str, pattern: &str, context: usize) -> serde_json::Value {
+    let terms: Vec<String> = pattern
+        .split('|')
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return serde_json::json!({"status": "error", "error": "Empty search pattern"});
+    }
+    let matches: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            let lower = line.to_lowercase();
+            terms.iter().any(|term| lower.contains(term.as_str()))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let total_matches = matches.len();
+
+    let mut blocks = String::new();
+    let mut shown_until = 0; // exclusive end of the last printed range
+    for &index in matches.iter().take(SEARCH_MAX_MATCHES) {
+        let start = index.saturating_sub(context).max(shown_until);
+        let end = (index + context + 1).min(lines.len());
+        if start >= end {
+            continue;
+        }
+        if shown_until > 0 && start > shown_until {
+            blocks.push_str("    --\n");
+        }
+        let (text, _) = numbered_lines(lines, start, end, usize::MAX);
+        if blocks.len() + text.len() > READ_MAX_BYTES {
+            break;
+        }
+        blocks.push_str(&text);
+        shown_until = end;
+    }
+
+    serde_json::json!({
+        "file": file_name,
+        "total_lines": lines.len(),
+        "pattern": pattern,
+        "total_matches": total_matches,
+        "matches_shown": total_matches.min(SEARCH_MAX_MATCHES),
+        "content": blocks
+    })
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    #[test]
+    fn numbered_lines_stop_on_whole_lines() {
+        let lines = ["alpha", "beta", "gamma"];
+        let (text, last) = numbered_lines(&lines, 1, 3, usize::MAX);
+        assert_eq!(text, "     2| beta\n     3| gamma\n");
+        assert_eq!(last, 3);
+        let (text, last) = numbered_lines(&lines, 0, 3, 14);
+        assert_eq!(text, "     1| alpha\n");
+        assert_eq!(last, 1);
+    }
+
+    #[test]
+    fn search_lines_returns_numbered_context_blocks() {
+        let lines: Vec<&str> = vec![
+            "Starting Nmap",
+            "PORT   STATE SERVICE",
+            "22/tcp open  ssh",
+            "noise",
+            "noise",
+            "noise",
+            "80/tcp OPEN  http",
+        ];
+        let result = search_lines(&lines, "scan.txt", "open|nothing", 1);
+        assert_eq!(result["total_matches"], 2);
+        let content = result["content"].as_str().unwrap_or_default();
+        assert!(content.contains("     3| 22/tcp open  ssh"));
+        assert!(content.contains("     7| 80/tcp OPEN  http"));
+        assert!(content.contains("--"), "separate blocks are marked");
+        assert!(!content.contains("     5|"), "lines outside the context are skipped");
+    }
 }

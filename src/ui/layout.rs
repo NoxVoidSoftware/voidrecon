@@ -245,7 +245,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         let label = if i == 0 {
             "Tab 0: Workspace & LLM".to_string()
         } else {
-            format!("Tab {}: {}", i, app.tabs[i - 1].label)
+            format!("Tab {}: {}", app.tabs[i - 1].number, app.tabs[i - 1].label)
         };
         let is_active = i == app.active_tab;
         let style = if is_active {

@@ -5,16 +5,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 use serde_json::{json, Value};
 use std::time::Instant;
 
-use crate::app::state::{App, ApprovalKind, ExploitApproval, InputMode, NotifLevel};
+use crate::app::state::{App, ApprovalKind, ExploitApproval, InputMode, NotifLevel, TabCommandRun};
 use crate::db::{DatabaseQueries, NewFinding};
 use crate::llm::ChatMessage;
 
 /// Tool result sent back to the LLM, plus the banner shown to the user.
 type ActionOutcome = (Value, String, NotifLevel);
-
-/// Lines of exploit output forwarded to the LLM before truncation kicks in.
-const EXPLOIT_OUTPUT_MAX_LINES: usize = 30;
-const EXPLOIT_OUTPUT_KEPT_LINES: usize = 25;
 
 fn error_outcome(message: String, notification: String) -> ActionOutcome {
     (
@@ -22,19 +18,6 @@ fn error_outcome(message: String, notification: String) -> ActionOutcome {
         notification,
         NotifLevel::Error,
     )
-}
-
-fn truncate_exploit_output(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    if lines.len() > EXPLOIT_OUTPUT_MAX_LINES {
-        format!(
-            "{}\n... [truncated {} lines, full output displayed below] ...",
-            lines[..EXPLOIT_OUTPUT_KEPT_LINES].join("\n"),
-            lines.len() - EXPLOIT_OUTPUT_KEPT_LINES
-        )
-    } else {
-        output.to_string()
-    }
 }
 
 fn rejection_message(kind: &ApprovalKind) -> &'static str {
@@ -58,8 +41,12 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 self.pending_exploit_approval = None;
-                self.run_approved_action(approval).await;
-                self.continue_llm_conversation().await
+                if self.run_approved_action(approval).await {
+                    self.continue_llm_conversation().await
+                } else {
+                    // The turn resumes with the post-execution analysis when the tab exits.
+                    Ok(())
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.pending_exploit_approval = None;
@@ -97,7 +84,8 @@ impl App {
     }
 
     /// Performs the approved action and reports its outcome as the tool result.
-    async fn run_approved_action(&mut self, approval: ExploitApproval) {
+    /// Returns `false` when the LLM should wait (an exploit is still running).
+    async fn run_approved_action(&mut self, approval: ExploitApproval) -> bool {
         let ExploitApproval {
             target_id,
             kind,
@@ -108,6 +96,7 @@ impl App {
         // Chat-log entries shown after the tool result. The result must directly
         // follow the assistant's tool call, or the LLM request drops the turn.
         let mut transcript = Vec::new();
+        let mut continue_turn = true;
         let (result, notification, level) = match kind {
             ApprovalKind::ReverseShellListener {
                 lhost,
@@ -121,8 +110,11 @@ impl App {
                 script_name,
                 command_line,
             } => {
-                self.approve_exploit(target_id, &script_name, &command_line, &mut transcript)
-                    .await
+                let outcome = self
+                    .approve_exploit(&script_name, &command_line, &mut transcript)
+                    .await;
+                continue_turn = outcome.2 == NotifLevel::Error;
+                outcome
             }
             ApprovalKind::SaveWorkspaceFile {
                 folder,
@@ -147,6 +139,7 @@ impl App {
             self.append_chat_message(message).await;
         }
         self.add_notification(notification, level);
+        continue_turn
     }
 
     async fn approve_listener(
@@ -176,33 +169,35 @@ impl App {
         }
     }
 
+    /// Starts the exploit in its own terminal tab; its output is recorded and
+    /// analyzed when the process exits.
     async fn approve_exploit(
         &mut self,
-        target_id: i64,
         script_name: &str,
         command_line: &str,
         transcript: &mut Vec<ChatMessage>,
     ) -> ActionOutcome {
-        let start = Instant::now();
-        transcript.push(ChatMessage::user(format!("$ {}", command_line)));
-
-        let output_result = self.run_command_capture(command_line).await;
-        let duration_ms = start.elapsed().as_millis() as i64;
-
-        match output_result {
-            Ok(out) => {
-                transcript.push(ChatMessage::output(out.clone()));
-                self.record_exploit_run(target_id, command_line, &out, duration_ms)
-                    .await;
+        match self.open_command_tab(command_line).await {
+            Ok((id, number)) => {
+                transcript.push(ChatMessage::user(format!("$ {}", command_line)));
+                self.tab_command_runs.insert(
+                    id,
+                    TabCommandRun {
+                        command: command_line.to_string(),
+                        started: Instant::now(),
+                    },
+                );
                 (
                     json!({
-                        "status": "executed",
+                        "status": "started",
                         "script": script_name,
-                        "exit_code": 0,
-                        "duration_ms": duration_ms,
-                        "output": truncate_exploit_output(&out)
+                        "tab_id": number,
+                        "message": format!(
+                            "Running in terminal tab {}. Its output will be provided for analysis when it exits.",
+                            number
+                        )
                     }),
-                    format!("Exploit executed ({})", script_name),
+                    format!("Exploit started in Tab {} ({})", number, script_name),
                     NotifLevel::Info,
                 )
             }
@@ -212,49 +207,10 @@ impl App {
                     "script": script_name,
                     "error": e.to_string()
                 }),
-                format!("Exploit failed: {}", e),
+                format!("Exploit failed to start: {}", e),
                 NotifLevel::Error,
             ),
         }
-    }
-
-    /// Records the exploit command and its output artifact in the database.
-    /// Blocking SQLite + artifact writes run off the event loop.
-    async fn record_exploit_run(
-        &self,
-        target_id: i64,
-        command_line: &str,
-        output: &str,
-        duration_ms: i64,
-    ) {
-        let db = self.db.clone();
-        let session_path = self.session_meta.path();
-        let command_line = command_line.to_string();
-        let output = output.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = DatabaseQueries::add_command(
-                &db.conn(),
-                &session_path,
-                Some(target_id),
-                &command_line,
-                Some(&output),
-                Some(0),
-                Some(duration_ms),
-            );
-            let _ = DatabaseQueries::add_chat_message(
-                &db.conn(),
-                Some(target_id),
-                "user",
-                &format!("$ {}", command_line),
-            );
-            let _ = DatabaseQueries::add_chat_message(
-                &db.conn(),
-                Some(target_id),
-                "assistant",
-                &output,
-            );
-        })
-        .await;
     }
 
     async fn approve_workspace_file(
@@ -337,7 +293,7 @@ impl App {
         input: &str,
         press_enter: bool,
     ) -> ActionOutcome {
-        let sent = match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+        let sent = match self.tabs.iter_mut().find(|tab| tab.number == tab_id) {
             None => Err(anyhow::anyhow!("Terminal tab {} is no longer open", tab_id)),
             Some(tab) if tab.exit_code.is_some() => Err(anyhow::anyhow!(
                 "Terminal tab {} has already exited",

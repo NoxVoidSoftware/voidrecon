@@ -227,7 +227,12 @@ impl App {
         self.command_run.stdin_tx = None;
         self.command_run.output.clear();
         self.command_run.raw.clear();
+        self.finish_command_result(result).await
+    }
 
+    /// Records a finished command (database, chat log, nmap auto-parse) and
+    /// starts the LLM's post-execution analysis of its output.
+    pub async fn finish_command_result(&mut self, result: crate::app::events::CommandResult) -> Result<()> {
         let target_id = self.active_target_id;
         let active_target_id = self.active_target_id;
         let db = self.db.clone();
@@ -238,10 +243,10 @@ impl App {
         let duration_ms = result.duration_ms;
 
         // Save to database with full output artifact (blocking SQLite I/O off the event loop)
-        let parse_result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+        let (parse_result, output_path) = tokio::task::spawn_blocking(move || -> Result<(Option<i64>, Option<String>)> {
             let _ = DatabaseQueries::add_chat_message(&db.conn(), target_id, "user", &cmd);
             let _ = DatabaseQueries::add_chat_message(&db.conn(), target_id, "assistant", &output);
-            let _ = DatabaseQueries::add_command(
+            let output_path = DatabaseQueries::add_command(
                 &db.conn(),
                 &session_path,
                 target_id,
@@ -249,21 +254,31 @@ impl App {
                 Some(&output),
                 Some(exit_code),
                 Some(duration_ms),
-            );
+            )
+            .ok()
+            .and_then(|(_, path)| path);
 
             // Auto-parse scan outputs (e.g. nmap) to update target and open ports immediately
-            DatabaseQueries::parse_nmap_and_update_target(
+            let parse_result = DatabaseQueries::parse_nmap_and_update_target(
                 &db.conn(),
                 &cmd,
                 &output,
                 active_target_id,
-            )
+            )?;
+            Ok((parse_result, output_path))
         })
         .await
         .context("Command completion DB task panicked")??;
 
-        // Add output to chat log
-        self.append_chat_message(ChatMessage::output(result.output.clone())).await;
+        // Add output to chat log. Long output gets a header naming the saved
+        // file, so excerpts sent to the LLM later can point at the full text.
+        let chat_output = match &output_path {
+            Some(path) if result.output.len() > Self::CHAT_OUTPUT_BYTES => {
+                Self::output_with_saved_path(&result.output, path)
+            }
+            _ => result.output.clone(),
+        };
+        self.append_chat_message(ChatMessage::output(chat_output)).await;
         self.ui_state.log_at_bottom = true;
 
         if let Some(discovered_target_id) = parse_result {
@@ -280,7 +295,8 @@ impl App {
 
         // Trigger post-execution analysis
         self.llm.post_exec_mode = true;
-        self.send_post_exec_analysis(&result.cmd, &result.output).await?;
+        self.send_post_exec_analysis(&result.cmd, &result.output, output_path.as_deref())
+            .await?;
 
         Ok(())
     }
@@ -437,43 +453,6 @@ impl App {
         Ok(())
     }
 
-    pub async fn run_command_capture(&self, cmd: &str) -> Result<String> {
-        let ws_path = self.session_meta.workspace_path();
-        let _ = tokio::fs::create_dir_all(&ws_path).await;
-        let (output, _) = Self::run_process_in_dir(cmd, &ws_path).await?;
-        Ok(output)
-    }
-
-    pub async fn run_process_in_dir(cmd: &str, dir: &std::path::Path) -> Result<(String, i32)> {
-    #[cfg(target_os = "windows")]
-    let mut command = tokio::process::Command::new("cmd");
-    #[cfg(target_os = "windows")]
-    command.args(["/C", cmd]);
-
-    #[cfg(not(target_os = "windows"))]
-    let mut command = tokio::process::Command::new("sh");
-    #[cfg(not(target_os = "windows"))]
-    command.args(["-c", cmd]);
-
-    command.current_dir(dir);
-    let output = command.output().await.context("Failed to execute process")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let combined = if stderr.is_empty() {
-        stdout.to_string()
-    } else if stdout.is_empty() {
-        stderr.to_string()
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
-
-    let cleaned = crate::ui::text::sanitize_terminal_output(&combined);
-    let exit_code = output.status.code().unwrap_or(0);
-    Ok((cleaned, exit_code))
-}
-
     pub async fn send_to_pty(&mut self, cmd: &str) -> Result<()> {
         if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
             if let Some(tab) = self.tabs.get_mut(self.active_tab - 1) {
@@ -483,24 +462,60 @@ impl App {
         Ok(())
     }
 
-    pub async fn spawn_command_tab(&mut self, command: &str) -> Result<()> {
+    /// Opens `command` in a new PTY tab and focuses it. Returns (tab id, tab number).
+    pub(super) async fn open_command_tab(&mut self, command: &str) -> Result<(usize, usize)> {
         let workspace = self.session_meta.workspace_path();
         tokio::fs::create_dir_all(&workspace)
             .await
             .with_context(|| format!("Failed to create workspace {}", workspace.display()))?;
+        let id = self.allocate_tab_id();
         let tab = crate::pty::tab::PtyTab::new_command(
-            self.next_tab_id,
+            id,
             command,
             &workspace,
             self.event_tx.clone(),
             self.pty_dimensions(),
         )?;
-        self.append_chat_message(ChatMessage::user(format!("Started interactive command in tab {}: {}", tab.id, command))).await;
-        self.next_tab_id += 1;
         let label = tab.label.clone();
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len();
-        self.add_notification(format!("Started {}", label), NotifLevel::Info);
+        let number = self.add_tab(tab);
+        self.add_notification(format!("Started {} in Tab {}", label, number), NotifLevel::Info);
+        Ok((id, number))
+    }
+
+    /// Interactive command (ssh, nc, REPLs): runs in its own tab until the user
+    /// or the LLM closes it; the LLM reads it with `read_terminal_tab`.
+    pub async fn spawn_command_tab(&mut self, command: &str) -> Result<()> {
+        let (_, number) = self.open_command_tab(command).await?;
+        self.append_chat_message(ChatMessage::user(format!(
+            "Started interactive command in tab {}: {}",
+            number, command
+        )))
+        .await;
+        Ok(())
+    }
+
+    /// Runs a command the LLM asked for in its own terminal tab, so commands
+    /// that need a TTY or block on input never stall the workspace. When it
+    /// exits, the output is recorded and analyzed like a workspace command.
+    pub async fn run_llm_command(&mut self, command: &str, interactive: bool) -> Result<()> {
+        let command = command.trim();
+        if command.is_empty() {
+            return Ok(());
+        }
+        if interactive || Self::is_interactive_command(command) {
+            self.spawn_command_tab(command).await?;
+            return self.continue_llm_conversation().await;
+        }
+        self.append_chat_message(ChatMessage::user(format!("$ {}", command))).await;
+        self.ui_state.log_at_bottom = true;
+        let (id, _) = self.open_command_tab(command).await?;
+        self.tab_command_runs.insert(
+            id,
+            crate::app::state::TabCommandRun {
+                command: command.to_string(),
+                started: Instant::now(),
+            },
+        );
         Ok(())
     }
 

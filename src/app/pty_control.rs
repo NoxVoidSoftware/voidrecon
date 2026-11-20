@@ -16,35 +16,82 @@ impl App {
         Ok(())
     }
     
-    /// A PTY process exited: its tab is closed. Interactive command tabs (nc,
-    /// ssh, ...) keep their last screen in the chat log so the output survives.
+    /// A PTY process exited: its tab is closed. Commands the LLM ran are
+    /// recorded and analyzed; interactive command and listener tabs (ssh, nc,
+    /// ...) save their output to workspace/outputs/ and the chat log.
     pub async fn handle_pty_exited(&mut self, tab_id: usize, exit_code: i32) -> Result<()> {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+        let Some(pos) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return Ok(());
         };
-        let final_screen = (tab.kind == crate::pty::tab::TerminalKind::Command)
-            .then(|| tab.screen_text())
-            .filter(|text| !text.is_empty());
-        let label = self.close_terminal_tab(tab_id)?;
-        if let Some(text) = final_screen {
-            self.append_chat_message(crate::llm::ChatMessage::output(format!(
-                "[{} exited with code {}]\n{}",
-                label, exit_code, text
-            )))
-            .await;
-        }
+        // Command and listener sessions keep their output; plain shells are the user's own.
+        let keep_output = matches!(
+            self.tabs[pos].kind,
+            crate::pty::tab::TerminalKind::Command | crate::pty::tab::TerminalKind::Listener
+        );
+        let transcript = self.tabs[pos].transcript.clone();
+        let was_viewing = self.active_tab == pos + 1;
+        // Dropping the tab joins its reader thread, so the transcript is complete afterwards.
+        let label = self.remove_tab_at(pos);
         self.add_notification(format!("{} closed (exit code {})", label, exit_code), NotifLevel::Info);
+
+        if let Some(run) = self.tab_command_runs.remove(&tab_id) {
+            if was_viewing {
+                self.active_tab = 0;
+                self.ui_state.focus = crate::app::state::WindowFocus::Input;
+            }
+            let output = PtyTab::transcript_text(&transcript);
+            let result = crate::app::events::CommandResult {
+                cmd: run.command,
+                output,
+                exit_code,
+                duration_ms: run.started.elapsed().as_millis() as i64,
+            };
+            return self.finish_command_result(result).await;
+        }
+
+        if keep_output {
+            let output = PtyTab::transcript_text(&transcript);
+            if !output.is_empty() {
+                let output = format!("[{} exited with code {}]\n{}", label, exit_code, output);
+                // Save the full session output so the LLM can read the parts an
+                // excerpt leaves out (file writes run off the event loop).
+                let session_path = self.session_meta.path();
+                let to_save = output.clone();
+                let saved_path = tokio::task::spawn_blocking(move || {
+                    crate::db::DatabaseQueries::save_output_file(&session_path, &to_save)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok);
+                let chat_output = match &saved_path {
+                    Some(path) if output.len() > Self::CHAT_OUTPUT_BYTES => {
+                        Self::output_with_saved_path(&output, path)
+                    }
+                    _ => output,
+                };
+                self.append_chat_message(crate::llm::ChatMessage::output(chat_output))
+                    .await;
+            }
+        }
         Ok(())
     }
 
-    pub fn close_terminal_tab(&mut self, tab_id: usize) -> Result<String> {
+    /// Closes the tab the user or LLM knows as "Tab `number`".
+    pub fn close_terminal_tab(&mut self, number: usize) -> Result<String> {
         let pos = self
             .tabs
             .iter()
-            .position(|tab| tab.id == tab_id)
-            .ok_or_else(|| anyhow::anyhow!("Terminal tab {} is not open", tab_id))?;
-        let label = self.tabs[pos].label.clone();
-        self.tabs.remove(pos);
+            .position(|tab| tab.number == number)
+            .ok_or_else(|| anyhow::anyhow!("Terminal tab {} is not open", number))?;
+        self.tab_command_runs.remove(&self.tabs[pos].id);
+        Ok(self.remove_tab_at(pos))
+    }
+
+    /// Removes the tab at `pos` (index into `tabs`) and keeps the active tab valid.
+    fn remove_tab_at(&mut self, pos: usize) -> String {
+        let tab = self.tabs.remove(pos);
+        let label = tab.label.clone();
+        drop(tab);
         let tab_index = pos + 1;
         if self.active_tab == tab_index {
             self.active_tab = pos;
@@ -55,7 +102,25 @@ impl App {
         if self.active_tab == 0 {
             self.ui_state.focus = crate::app::state::WindowFocus::Input;
         }
-        Ok(label)
+        label
+    }
+
+    /// Adds a new tab with the lowest free number and focuses it. Returns its number.
+    pub(super) fn add_tab(&mut self, mut tab: PtyTab) -> usize {
+        let number = (1..)
+            .find(|n| !self.tabs.iter().any(|t| t.number == *n))
+            .unwrap_or(self.tabs.len() + 1);
+        tab.number = number;
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len();
+        number
+    }
+
+    /// Next internal tab id; ids are never reused so stale PTY events are ignored.
+    pub(super) fn allocate_tab_id(&mut self) -> usize {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        id
     }
     
     pub async fn handle_tick(&mut self) -> bool {
@@ -114,45 +179,31 @@ impl App {
         )
     }
 
-    /// Id of the terminal tab that currently has focus, if any.
+    /// Number of the terminal tab that currently has focus, if any.
     pub fn active_terminal_tab_id(&self) -> Option<usize> {
         self.active_tab
             .checked_sub(1)
             .and_then(|index| self.tabs.get(index))
-            .map(|tab| tab.id)
+            .map(|tab| tab.number)
     }
 
     pub async fn new_shell_tab(&mut self) -> Result<()> {
-        let tab = PtyTab::new_shell(
-            self.next_tab_id,
-            self.event_tx.clone(),
-            self.pty_dimensions(),
-        )?;
-        self.next_tab_id += 1;
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len(); // switch focus to the new shell tab (Tab 1..N)
+        let id = self.allocate_tab_id();
+        let tab = PtyTab::new_shell(id, self.event_tx.clone(), self.pty_dimensions())?;
+        self.add_tab(tab);
         Ok(())
     }
     
     pub async fn spawn_listener_tab(&mut self, lport: u16) -> Result<()> {
-        let tab = PtyTab::new_listener(
-            self.next_tab_id,
-            lport,
-            self.event_tx.clone(),
-            self.pty_dimensions(),
-        )?;
-        self.next_tab_id += 1;
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len(); // switch focus to the listener tab
+        let id = self.allocate_tab_id();
+        let tab = PtyTab::new_listener(id, lport, self.event_tx.clone(), self.pty_dimensions())?;
+        self.add_tab(tab);
         Ok(())
     }
     
     pub async fn close_current_shell(&mut self) -> Result<()> {
-        if self.active_tab > 0 && self.active_tab - 1 < self.tabs.len() {
-            self.tabs.remove(self.active_tab - 1);
-            if self.active_tab > self.tabs.len() {
-                self.active_tab = self.tabs.len();
-            }
+        if let Some(number) = self.active_terminal_tab_id() {
+            self.close_terminal_tab(number)?;
         }
         Ok(())
     }

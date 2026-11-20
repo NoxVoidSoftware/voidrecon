@@ -314,7 +314,7 @@ impl App {
     fn open_tab(&self, tab_id: usize) -> Result<&PtyTab> {
         self.tabs
             .iter()
-            .find(|tab| tab.id == tab_id)
+            .find(|tab| tab.number == tab_id)
             .with_context(|| format!("Terminal tab {} is not open", tab_id))
     }
 
@@ -380,11 +380,11 @@ impl App {
         })];
         tabs.extend(self.tabs.iter().map(|tab| {
             json!({
-                "tab_id": tab.id,
+                "tab_id": tab.number,
                 "label": tab.label,
                 "kind": tab.kind.as_str(),
                 "state": tab.state_label(),
-                "active": active_tab_id == Some(tab.id)
+                "active": active_tab_id == Some(tab.number)
             })
         }));
         json!({"tabs": tabs})
@@ -398,7 +398,14 @@ impl App {
             .and_then(Value::as_u64)
             .unwrap_or(8_000)
             .clamp(1, 12_000) as usize;
-        let screen = tab.screen_text();
+        // Command tabs keep their full output; `scrollback` reads its end
+        // instead of only what currently fits on the screen.
+        let scrollback = args.get("scrollback").and_then(Value::as_bool).unwrap_or(false);
+        let transcript = scrollback
+            .then(|| PtyTab::transcript_text(&tab.transcript))
+            .filter(|text| !text.is_empty());
+        let source = if transcript.is_some() { "scrollback" } else { "screen" };
+        let screen = transcript.unwrap_or_else(|| tab.screen_text());
         let tail = screen
             .char_indices()
             .rev()
@@ -409,6 +416,8 @@ impl App {
             "tab_id": tab_id,
             "label": tab.label,
             "state": tab.state_label(),
+            "source": source,
+            "total_chars": screen.chars().count(),
             "screen": tail
         }))
     }
